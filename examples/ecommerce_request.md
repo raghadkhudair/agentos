@@ -1,0 +1,15 @@
+Build a full ecommerce website with:
+- product catalog
+- search and filtering
+- cart
+- checkout with mocked payment for local MVP
+- user authentication
+- admin product management
+- admin order management
+- backend API
+- frontend UI
+- PostgreSQL database for the generated app
+- Docker local deployment
+- tests
+- security review
+- README and setup documentation

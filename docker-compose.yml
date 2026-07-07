@@ -1,0 +1,46 @@
+services:
+  agentos:
+    build: .
+    container_name: agentos-local
+    shm_size: "2gb"  # Grants 2GB shared memory directly to your application
+    env_file:
+      - .env
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - ./workspace:/workspace
+      - ./data:/data
+      - ./logs:/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - postgres
+      - dragonfly
+    entrypoint: ["tail", "-f", "/dev/null"]
+    command: []
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agentos-postgres
+    environment:
+      POSTGRES_DB: agentos
+      POSTGRES_USER: agentos
+      POSTGRES_PASSWORD: agentos
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgresdata:/var/lib/postgresql/data
+      - ./agentos/storage/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    container_name: agentos-dragonfly
+    ports:
+      - "6379:6379"
+    ulimits:
+      memlock: -1
+    volumes:
+      - dragonflydata:/data
+
+volumes:
+  postgresdata:
+  dragonflydata:

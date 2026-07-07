@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentos-local"
+version = "0.1.0"
+description = "Local-first Ray-powered autonomous software delivery agent platform."
+requires-python = ">=3.11"
+readme = "README.md"
+
+[project.scripts]
+agentos = "agentos.cli.main:app"
+
+[tool.setuptools.packages.find]
+include = ["agentos*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.black]
+line-length = 100
+
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = true
