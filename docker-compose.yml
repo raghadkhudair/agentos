@@ -2,12 +2,15 @@ services:
   agentos:
     build: .
     container_name: agentos-local
-    shm_size: "2gb"  # Grants 2GB shared memory directly to your application
+    shm_size: "2gb"
+    environment:
+      - RAY_ADDRESS=ray-head:6379  # Tell our app to look at the dedicated cluster node
     env_file:
       - .env
     working_dir: /app
     volumes:
       - ./:/app
+      - ./agentos_sandbox:/tmp/agentos_sandbox
       - ./workspace:/workspace
       - ./data:/data
       - ./logs:/logs
@@ -15,9 +18,20 @@ services:
     depends_on:
       - postgres
       - dragonfly
+      - ray-head
     entrypoint: ["tail", "-f", "/dev/null"]
-    command: []
 
+  ray-head:
+    image: rayproject/ray:latest-py311
+    container_name: agentos-ray-head
+    shm_size: "512mb"  # Shrunk from 2gb to keep things safe and small
+    mem_limit: "1gb"   # Strictly limits the total RAM this container can steal from Windows
+    ports:
+      - "8265:8265"
+    environment:
+      - RAY_COLOR_PREFIX=1
+    # We added explicit memory cap limits directly to Ray's startup engine flags here:
+    command: ray start --head --port=6379 --dashboard-host=0.0.0.0 --disable-usage-stats --num-cpus=1 --object-store-memory=200000000
   postgres:
     image: pgvector/pgvector:pg16
     container_name: agentos-postgres
@@ -35,7 +49,7 @@ services:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
     container_name: agentos-dragonfly
     ports:
-      - "6379:6379"
+      - "6380:6379"  # Kept on 6380 so it doesn't conflict with Ray's 6379 port!
     ulimits:
       memlock: -1
     volumes:

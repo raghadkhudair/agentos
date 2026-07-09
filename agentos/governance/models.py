@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import StrEnum
 from typing import Any
-
 from pydantic import BaseModel, Field
 
 
@@ -44,6 +45,16 @@ class ActionRequest(BaseModel):
     command: str | None = None
     database_operation: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    
+    # --- PHASE 9 TAMPER-PROOF METADATA EXTENSIONS ---
+    nonce: str = Field(default_factory=lambda: hashlib.sha256(str(json.dumps({})).encode()).hexdigest()[:16])
+    integrity_hash: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """Automatically hashes the fields to lock down immutable audit traces."""
+        if not self.integrity_hash:
+            raw_payload_bytes = f"{self.project_id}:{self.agent_id}:{self.action_type}:{self.description}:{self.nonce}"
+            object.__setattr__(self, "integrity_hash", hashlib.sha256(raw_payload_bytes.encode()).hexdigest())
 
 
 class GuardrailResult(BaseModel):

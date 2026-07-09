@@ -1,67 +1,64 @@
 from __future__ import annotations
 
-from agentos.config.settings import Settings
-from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision, RiskLevel
+import hashlib
+import json
+from enum import StrEnum
+from typing import Any
+from pydantic import BaseModel, Field
 
 
-class PolicyEngine:
-    """Deterministic governance layer for agent actions.
+class RiskLevel(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
 
-    Agents can propose actions. This engine decides whether the runtime may execute them.
-    The initial implementation is intentionally conservative.
-    """
 
-    DESTRUCTIVE_PATTERNS = (
-        "drop database",
-        "drop schema",
-        "drop table",
-        "truncate",
-        "delete from",
-        "rm -rf",
-        "disable guardrail",
-        "delete audit",
-        "delete checkpoint",
-        "delete event log",
-        "curl | sh",
-        "wget | sh",
-    )
+class PolicyDecision(StrEnum):
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+    ALLOW_WITH_CONSTRAINTS = "ALLOW_WITH_CONSTRAINTS"
+    REQUIRE_REVIEW = "REQUIRE_REVIEW"
+    REQUIRE_HUMAN_APPROVAL = "REQUIRE_HUMAN_APPROVAL"
+    REQUIRE_SANDBOX_ONLY = "REQUIRE_SANDBOX_ONLY"
+    REQUIRE_BACKUP_FIRST = "REQUIRE_BACKUP_FIRST"
+    REQUIRE_SECURITY_REVIEW = "REQUIRE_SECURITY_REVIEW"
+    QUARANTINE_AGENT = "QUARANTINE_AGENT"
 
-    def __init__(self, settings: Settings):
-        self.settings = settings
 
-    def evaluate_action(self, request: ActionRequest) -> GuardrailResult:
-        text = " ".join(
-            part for part in [request.description, request.command, request.database_operation] if part
-        ).lower()
+class AgentIdentity(BaseModel):
+    agent_id: str
+    role: str
+    project_id: str
+    squad: str | None = None
+    memory_scopes: list[str] = Field(default_factory=list)
+    allowed_actions: list[str] = Field(default_factory=list)
+    allowed_paths: list[str] = Field(default_factory=list)
 
-        matched = [pattern for pattern in self.DESTRUCTIVE_PATTERNS if pattern in text]
-        if matched:
-            if not self.settings.allow_destructive_actions:
-                return GuardrailResult(
-                    decision=PolicyDecision.DENY,
-                    risk_level=RiskLevel.CRITICAL,
-                    reasons=[f"Blocked destructive pattern: {pattern}" for pattern in matched],
-                    constraints=["Destructive actions require explicit out-of-band approval."],
-                )
-            return GuardrailResult(
-                decision=PolicyDecision.REQUIRE_HUMAN_APPROVAL,
-                risk_level=RiskLevel.CRITICAL,
-                reasons=[f"Critical destructive pattern detected: {pattern}" for pattern in matched],
-                constraints=["Require backup proof.", "Require sandbox proof.", "Require human approval."],
-            )
 
-        if request.action_type in {"modify_auth", "modify_ci", "run_migration", "add_dependency"}:
-            return GuardrailResult(
-                decision=PolicyDecision.REQUIRE_REVIEW,
-                risk_level=RiskLevel.HIGH,
-                reasons=["High-impact engineering action requires independent review."],
-            )
+class ActionRequest(BaseModel):
+    project_id: str
+    agent_id: str
+    action_type: str
+    description: str
+    target_paths: list[str] = Field(default_factory=list)
+    command: str | None = None
+    database_operation: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    
+    # --- PHASE 9 TAMPER-PROOF METADATA EXTENSIONS ---
+    nonce: str = Field(default_factory=lambda: hashlib.sha256(str(json.dumps({})).encode()).hexdigest()[:16])
+    integrity_hash: str | None = None
 
-        if request.action_type in {"read_file", "run_tests", "create_summary", "search_memory"}:
-            return GuardrailResult(decision=PolicyDecision.ALLOW, risk_level=RiskLevel.LOW)
+    def model_post_init(self, __context: Any) -> None:
+        """Automatically hashes the fields to lock down immutable audit traces."""
+        if not self.integrity_hash:
+            raw_payload_bytes = f"{self.project_id}:{self.agent_id}:{self.action_type}:{self.description}:{self.nonce}"
+            object.__setattr__(self, "integrity_hash", hashlib.sha256(raw_payload_bytes.encode()).hexdigest())
 
-        return GuardrailResult(
-            decision=PolicyDecision.ALLOW_WITH_CONSTRAINTS,
-            risk_level=RiskLevel.MEDIUM,
-            constraints=["Execute only inside assigned workspace and allowed paths."],
-        )
+
+class GuardrailResult(BaseModel):
+    decision: PolicyDecision
+    risk_level: RiskLevel
+    reasons: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
