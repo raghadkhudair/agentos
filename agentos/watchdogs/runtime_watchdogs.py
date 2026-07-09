@@ -3,8 +3,11 @@ from __future__ import annotations
 import uuid
 import json
 from collections import Counter
+import structlog
 from agentos.storage.database import DatabaseManager
 from agentos.dod.evaluator import DoDEvaluator
+
+logger = structlog.get_logger()
 
 
 class DoDWatchdog:
@@ -19,17 +22,14 @@ class DoDWatchdog:
     async def inspect(self, project_id: str, project_dod: list[str]) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        # 1. Query the database to see if any tasks are currently incomplete or in progress
         query_tasks = "SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND status != 'COMPLETED';"
         async with self.db.pool.acquire() as conn:
             incomplete_task_count = await conn.fetchval(query_tasks, safe_project_id)
             
-        # 2. Run the actual Quality Contract Evaluation
         dod_report = await self.evaluator.evaluate(project_id, project_dod)
         
-        # Condition: No active tasks remain, but the Quality Contract is STILL not satisfied!
         if incomplete_task_count == 0 and not dod_report.satisfied:
-            print(f"⚠️ [WATCHDOG ALERT]: Project {project_id} has stalled with 0 active tasks but unfulfilled DoD items!")
+            logger.error("watchdog_dod_stalled", project_id=project_id, gaps=dod_report.gaps)
             return {
                 "action_required": "TRIGGER_REPLANNING",
                 "reason": "Incomplete DoD milestones found with zero outstanding active database tasks.",
@@ -50,7 +50,6 @@ class StagnationWatchdog:
     async def inspect(self, project_id: str) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        # Fetch recent checkpoints to check for repetitive patterns
         query_checkpoints = """
             SELECT summary FROM checkpoints 
             WHERE project_id = $1 
@@ -64,13 +63,11 @@ class StagnationWatchdog:
         if not summaries:
             return {"action_required": "NONE", "status": "STABLE"}
             
-        # Count identical consecutive agent action executions
         counter = Counter(summaries)
         most_common_action, count = counter.most_common(1)[0]
         
-        # Trigger an alert if the same file modification action occurs more than 3 times consecutively
         if count >= 4:
-            print(f"🛑 [STAGNATION ALERT]: Circular execution loop detected on action: {most_common_action}")
+            logger.warning("watchdog_stagnation_loop_detected", project_id=project_id, action=most_common_action, count=count)
             return {
                 "action_required": "FREEZE_STREAM",
                 "reason": f"Agent is stuck repeating the exact same execution step: {most_common_action}",
@@ -91,7 +88,7 @@ class SafetyWatchdog:
     async def inspect(self, project_id: str) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        # SCAN THE ACTUAL AUDIT LOGS FOR EXPLICIT DENY DECISIONS:
+        # FIXED: Changed column 'decision' to match 'policy_decision' database registration layout
         query_audit = """
             SELECT COUNT(*) FROM audit_events 
             WHERE project_id = $1 AND policy_decision IN ('DENY', 'QUARANTINE_AGENT');
@@ -100,7 +97,7 @@ class SafetyWatchdog:
             blocked_call_count = await conn.fetchval(query_audit, safe_project_id)
             
         if blocked_call_count >= 5:
-            print(f"🚨 [SAFETY ALERT]: Excessive policy engine violations found inside audit trail for: {project_id}")
+            logger.critical("watchdog_safety_quarantine_triggered", project_id=project_id, violations=blocked_call_count)
             return {
                 "action_required": "QUARANTINE_AGENT",
                 "reason": f"Agent surpassed maximum safety boundary constraints. Found {blocked_call_count} violations."
@@ -128,7 +125,6 @@ class DeadlockWatchdog:
         async with self.db.pool.acquire() as conn:
             rows = await conn.fetch(query_deps, safe_project_id)
 
-        # Build a standard directed graph to detect cycles
         graph = {}
         for row in rows:
             graph.setdefault(row["task_id"], []).append(row["depends_on_task_id"])
@@ -147,7 +143,7 @@ class DeadlockWatchdog:
             return False
 
         if any(has_cycle(task) for task in graph):
-            print(f"🛑 [DEADLOCK ALERT]: Cyclic dependency loop detected inside task orchestration tree!")
+            logger.critical("watchdog_deadlock_detected", project_id=project_id)
             return {
                 "action_required": "RESOLVE_DEADLOCK",
                 "reason": "Circular task dependencies detected. Tasks are blocking each other indefinitely."

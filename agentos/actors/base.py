@@ -158,8 +158,25 @@ class AgentWorkerActor:
             )
             
             exec_res = await self.supervisor.request_execution(action_req)
-            
-            # 📝 BATCH 4: POPULATE REAL APPEND-ONLY AUDIT RECORDS
+            if action_type in {"write_file", "write_code"} and exec_res.get("executed"):
+                from agentos.actors.reviewer import ReviewerAgentActor
+                
+                reviewer = ReviewerAgentActor.options(namespace="agentos").remote(settings_payload=self.settings.model_dump())
+                review = await reviewer.review_code_patch.remote(payload.get("file_path", ""), payload.get("content", ""))
+                
+                if not review.get("approved", False):
+                    # Code failed validation! Log a blocker checkpoint and skip task completion
+                    await self.checkpoints.create(
+                        Checkpoint(
+                            checkpoint_id=str(uuid4()),
+                            project_id=self.project_id,
+                            agent_id=self.agent_id,
+                            achievement="review_failed",
+                            summary=f"Blocker: Code patch rejected by reviewer. Vulnerabilities: {review.get('vulnerabilities_found')}"
+                        )
+                    )
+                    self.status = "IDLE"
+                    return {"status": "BLOCKED_BY_REVIEW"}
             policy_decision = exec_res.get("guardrail", {}).get("decision", "ALLOW")
             await self.audit_repo.log_audit_event(
                 project_id=self.project_id,
@@ -169,8 +186,8 @@ class AgentWorkerActor:
                 integrity_hash=action_req.integrity_hash
             )
 
+            
             if exec_res.get("executed") and target_task_id:
-                # 📝 BATCH 4: INJECT REAL ARTIFACT RECORD ON WORKSPACE MODIFICATIONS
                 if action_type == "write_file":
                     await self.artifact_repo.create_artifact(
                         project_id=self.project_id,
@@ -180,7 +197,6 @@ class AgentWorkerActor:
                         uri=payload.get("file_path", "")
                     )
                 
-                # 🎯 BATCH 4 REAL LOGIC: Complete the EXACT matched task ID, not a random placeholder
                 await self.task_repo.update_task_status(target_task_id, "COMPLETED")
                 logger.info("task_completed_by_agent", agent_id=self.agent_id, task_id=target_task_id)
 

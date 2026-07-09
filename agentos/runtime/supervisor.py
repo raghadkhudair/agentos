@@ -4,17 +4,20 @@ import asyncio
 from collections.abc import Iterable
 import uuid
 import ray
+import structlog
 
 from agentos.actors.bootstrap import BootstrapAgentActor
 from agentos.config.settings import Settings
-from agentos.runtime.team_plan import AgentSpec, TeamPlan, ValidatedTeamPlan
+from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedTeamPlan
 
 # Infrastructure imports
 from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import ProjectRepository, EventRepository
 from agentos.messaging.dragonfly_bus import DragonflyBus
 from agentos.messaging.events import Event, EventType
-from agentos.messaging.trigger_engine import TriggerEngine
+from agentos.runtime.trigger_engine import TriggerEngine
+
+logger = structlog.get_logger()
 
 
 class RuntimeSupervisor:
@@ -24,7 +27,7 @@ class RuntimeSupervisor:
         self.settings = settings
         self.db_manager = DatabaseManager(settings)
         self.dragonfly = DragonflyBus(settings.dragonfly_url)
-        # WIRED UP: Background Trigger Engine Router Component Integration
+        # Background Trigger Engine Router Component Integration
         self.trigger_engine = TriggerEngine(self.dragonfly)
 
     def connect_ray(self) -> None:
@@ -33,7 +36,7 @@ class RuntimeSupervisor:
         if self.settings.ray_address and self.settings.ray_address.strip():
             ray.init(address=self.settings.ray_address, ignore_reinit_error=True)
         else:
-            print("[Supervisor] Initializing local Ray cluster block...")
+            logger.info("initializing_local_ray_cluster", cpus=2, namespace="agentos")
             ray.init(
                 ignore_reinit_error=True, 
                 num_cpus=2, 
@@ -44,13 +47,15 @@ class RuntimeSupervisor:
             )
 
     async def bootstrap_project(self, user_request: str) -> dict:
-        print("\n[Supervisor] Waking up Runtime Supervisor...")
+        logger.info("runtime_supervisor_waking_up", project_name=self.settings.project_name)
         self.connect_ray()
         
+        logger.info("postgresql_connected", database_url=self.settings.database_url)
         await self.db_manager.connect()
         project_repo = ProjectRepository(self.db_manager)
         event_repo = EventRepository(self.db_manager)
 
+        logger.info("contacting_bootstrap_agent_for_team_blueprint")
         bootstrap = BootstrapAgentActor.options(namespace="agentos").remote(project_id=self.settings.project_name)
         raw_plan = await bootstrap.create_team_plan.remote(
             user_request, self.settings.max_agents_total
@@ -58,15 +63,16 @@ class RuntimeSupervisor:
         plan = TeamPlan.model_validate(raw_plan)
         validated = self.validate_team_plan(plan)
 
+        logger.info("saving_project_metadata_to_postgresql", project=self.settings.project_name)
         db_project_id = await project_repo.create_project(
             name=self.settings.project_name,
             request=user_request,
             dod=validated.original.dod
         )
 
+        logger.info("spawning_ray_agent_actors", total_count=validated.total_agents)
         actors = await self.create_agent_actors(validated.agents)
 
-        # WIRED UP: Stream key topics matching trigger engine pattern streams perfectly
         unified_stream_key = f"project:{db_project_id}:events"
 
         # Dynamically register worker actors into our Trigger Engine routing subscription matrix
@@ -74,7 +80,7 @@ class RuntimeSupervisor:
         for spec in validated.agents:
             for index in range(1, spec.count + 1):
                 agent_id = f"{spec.role.value}-{index}"
-                if spec.role.value == "PM_TECH_LEAD" and not first_pm_identity:
+                if spec.role.value == "pm_tech_lead" and not first_pm_identity:
                     first_pm_identity = agent_id
                 
                 # Bind events subscriptions down to the active agents
@@ -83,7 +89,10 @@ class RuntimeSupervisor:
 
         # Kick off the asynchronous Trigger Engine routing task daemon in the background
         asyncio.create_task(self.trigger_engine.start_routing_loop(db_project_id))
-        print(f"📡 [Supervisor] Trigger Engine Daemon active monitoring channel: {unified_stream_key}")
+        
+        # Kick off background watchdog loop daemon cleanly at class instance level
+        asyncio.create_task(self.watchdog_loop(db_project_id, validated.original.dod))
+        logger.info("background_daemons_activated", active_monitoring_stream=unified_stream_key)
 
         init_event = Event(
             project_id=db_project_id,
@@ -95,16 +104,15 @@ class RuntimeSupervisor:
         await event_repo.save_event(db_project_id, init_event)
         await self.dragonfly.publish_event(unified_stream_key, init_event)
 
-        # DYNAMICALLY RESOLVED: Target the true generated PM string instance instead of hardcoded lookups
-        target_pm_name = first_pm_identity if first_pm_identity else "PM_TECH_LEAD-1"
-        print(f"[Supervisor] Activating resolved Technical Lead Agent instance: {target_pm_name}")
+        target_pm_name = first_pm_identity if first_pm_identity else "pm_tech_lead-1"
+        logger.info("activating_primary_technical_lead_agent", target_pm_name=target_pm_name)
         
         pm_actor = ray.get_actor(target_pm_name, namespace="agentos")
         execution_trigger = await pm_actor.process_next_step.remote(str(init_event.event_id))
 
         await self.db_manager.disconnect()
+        logger.info("project_bootstrap_sequence_completed")
 
-        print("[Supervisor] Project bootstrap sequence completed successfully!\n")
         return {
             "project_id": db_project_id,
             "project_name": self.settings.project_name,
@@ -156,3 +164,29 @@ class RuntimeSupervisor:
                 started = await actor.start.remote()
                 created.append(started)
         return created
+
+    # --- FIXED PLACE: Moved completely out of create_agent_actors to class scope level ---
+    async def watchdog_loop(self, project_id: str, dod: list[str]) -> None:
+        """Background daemon loop that executes runtime health evaluations every 30 seconds."""
+        from agentos.watchdogs.runtime_watchdogs import DoDWatchdog, StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
+        
+        dod_wd = DoDWatchdog(self.db_manager)
+        stag_wd = StagnationWatchdog(self.db_manager)
+        safety_wd = SafetyWatchdog(self.db_manager)
+        deadlock_wd = DeadlockWatchdog(self.db_manager)
+        
+        while True:
+            await asyncio.sleep(30)
+            for wd, args in [(dod_wd, (project_id, dod)), (stag_wd, (project_id,)),
+                            (safety_wd, (project_id,)), (deadlock_wd, (project_id,))]:
+                try:
+                    result = await wd.inspect(*args)
+                    if result.get("action_required") != "NONE":
+                        logger.warning(
+                            "watchdog_alert_triggered", 
+                            watchdog=wd.__class__.__name__, 
+                            action_required=result.get("action_required"),
+                            reason=result.get("reason")
+                        )
+                except Exception as e:
+                    logger.error("watchdog_execution_failed", watchdog=wd.__class__.__name__, error=str(e))

@@ -11,7 +11,6 @@ services:
     volumes:
       - ./:/app
       - ../agentos_sandbox_mirrors:/tmp/agentos_sandbox
-      - ./workspace:/workspace
       - ./data:/data
       - ./logs:/logs
       - /var/run/docker.sock:/var/run/docker.sock

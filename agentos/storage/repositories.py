@@ -150,38 +150,34 @@ class ProviderCallRepository:
             return str(call_id)
 
 
-# =====================================================================
-# --- PHASE 9 WORKSPACE PERSISTENCE ADDITIONS (BATCH 4 REPAIRS) ---
-# =====================================================================
-
 class MemoryRepository:
-    """Manages structural vector-backed semantic long-term agent memory storage."""
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    async def save_memory_item(self, project_id: str, agent_id: str, scope: str, content: str, embedding: list[float]) -> str:
+    async def save_memory_item(self, project_id: str, scope: str, owner_agent_id: str, memory_type: str, title: str, content: str) -> str:
+        # Fixed to map directly to real columns, content hashing is generated automatically
+        import hashlib
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        
         query = """
-            INSERT INTO memory_items (project_id, agent_id, scope, content, embedding)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id;
+            INSERT INTO memory_items (project_id, scope, owner_agent_id, memory_type, title, content, content_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id;
         """
         async with self.db.pool.acquire() as conn:
-            mem_id = await conn.fetchval(query, UUID(project_id), agent_id, scope, content, embedding)
+            mem_id = await conn.fetchval(query, UUID(project_id), scope, owner_agent_id, memory_type, title, content, content_hash)
             return str(mem_id)
 
 class SummaryRepository:
-    """Saves analytical project snapshots for background context compression loops."""
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    async def save_summary(self, project_id: str, agent_id: str, content: str) -> str:
+    async def save_summary(self, project_id: str, scope: str, owner_id: str, summary: str) -> str:
         query = """
-            INSERT INTO summaries (project_id, agent_id, content)
-            VALUES ($1, $2, $3)
-            RETURNING id;
+            INSERT INTO summaries (project_id, scope, owner_id, summary)
+            VALUES ($1, $2, $3, $4) RETURNING id;
         """
         async with self.db.pool.acquire() as conn:
-            summary_id = await conn.fetchval(query, UUID(project_id), agent_id, content)
+            summary_id = await conn.fetchval(query, UUID(project_id), scope, owner_id, summary)
             return str(summary_id)
 
 class AuditEventRepository:
@@ -191,10 +187,13 @@ class AuditEventRepository:
 
     async def log_audit_event(self, project_id: str, agent_id: str, action_type: str, policy_decision: str, integrity_hash: str) -> str:
         query = """
-            INSERT INTO audit_events (project_id, agent_id, action_type, policy_decision, integrity_hash)
+            INSERT INTO audit_events (project_id, agent_id, event_type, decision, details)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id;
         """
         async with self.db.pool.acquire() as conn:
-            audit_id = await conn.fetchval(query, UUID(project_id), agent_id, action_type, policy_decision, integrity_hash)
+            audit_id = await conn.fetchval(
+                query, UUID(project_id), agent_id, action_type, policy_decision,
+                json.dumps({"integrity_hash": integrity_hash})
+            )
             return str(audit_id)

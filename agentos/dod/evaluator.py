@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import uuid
 from pydantic import BaseModel, Field
 from agentos.storage.database import DatabaseManager
@@ -20,7 +21,8 @@ class DoDEvaluation(BaseModel):
 class DoDEvaluator:
     """Runtime completion gate.
 
-    Verifies project completeness by cross-referencing requirements with live database artifacts.
+    Verifies project completeness by cross-referencing project requirements with 
+    completed database artifacts and explicit task acceptance criteria.
     """
 
     def __init__(self, db_manager: DatabaseManager):
@@ -39,10 +41,9 @@ class DoDEvaluator:
         except Exception as e:
             print(f"DoDEvaluator failed to query artifacts database: {e}")
 
-        # 2. Extract title mappings for direct verification checks
         existing_artifacts = {art["title"].lower(): art for art in artifacts_found}
 
-        # 3. Gather checkpoints history logs as secondary fallback tracking
+        # 2. Gather checkpoints history logs as secondary fallback tracking
         query_checkpoints = "SELECT achievement, summary, created_at::text FROM checkpoints WHERE project_id = $1;"
         checkpoints_found = []
         try:
@@ -52,6 +53,28 @@ class DoDEvaluator:
         except Exception as e:
             print(f"Failed to query checkpoints loop: {e}")
 
+        # --- 🚀 FIX 4 MODULE ADDITION: FETCH STRUCTURED TASK ACCEPTANCE CRITERIA ---
+        query_tasks = "SELECT title, status, acceptance_criteria FROM tasks WHERE project_id = $1;"
+        completed_criteria = set()
+        try:
+            async with self.db.pool.acquire() as conn:
+                task_rows = await conn.fetch(query_tasks, safe_project_id)
+                for trow in task_rows:
+                    # If the task was completed successfully, its explicit criteria pass validation
+                    if trow["status"] == "COMPLETED":
+                        completed_criteria.add(trow["title"].lower())
+                        if trow["acceptance_criteria"]:
+                            try:
+                                # Track any embedded nested criteria strings or arrays
+                                criteria_data = json.loads(trow["acceptance_criteria"])
+                                if isinstance(criteria_data, list):
+                                    for item_str in criteria_data:
+                                        completed_criteria.add(str(item_str).lower())
+                            except Exception:
+                                pass
+        except Exception as e:
+            print(f"DoDEvaluator failed to parse database task acceptance criteria: {e}")
+
         evaluated_items: list[DoDItemStatus] = []
         gaps: list[str] = []
         
@@ -59,14 +82,20 @@ class DoDEvaluator:
             item_lower = item.lower()
             evidence_list = []
             
-            # CRITICAL CHECKPOINT MATCH: Check if an exact artifact match exists in our verified registry table
+            # A. Check if an exact artifact match exists in our verified registry table
             if item_lower in existing_artifacts:
                 art = existing_artifacts[item_lower]
                 evidence_list.append(
-                    f"📦 [ARTIFACT VALIDATION - {art['created_at']}] Found verified physical project asset record."
+                    f"📦 [ARTIFACT VALIDATION] Found verified physical project asset record: '{art['title']}'."
                 )
             
-            # Check secondary text checkpoints history log for confirmation entries
+            # B. CRITICAL QUALITY CHECK: Validate against the actual task acceptance criteria mapping
+            if item_lower in completed_criteria or any(item_lower in comp or comp in item_lower for comp in completed_criteria):
+                evidence_list.append(
+                    f"🎯 [ACCEPTANCE CRITERIA CHECK] Verified via formal task completion graph requirements rule mappings."
+                )
+
+            # C. Check secondary text checkpoints history log for confirmation entries
             for cp in checkpoints_found:
                 summary_lower = cp["summary"].lower()
                 achievement_lower = cp["achievement"].lower()

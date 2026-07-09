@@ -15,7 +15,7 @@ class ProviderRequest:
     purpose: str
     messages: list[dict[str, str]]
     budget_key: str  # Maps directly to project_id UUID
-    metadata: dict[str, Any]
+    metadata: dict[str, Any] = None  # Optional additional metadata for logging or auditing
 
 @dataclass(frozen=True)
 class ProviderResponse:
@@ -130,12 +130,8 @@ class ProviderGateway:
     async def get_embedding(self, text: str) -> list[float]:
         """Generates a semantic vector embedding using LiteLLM."""
         try:
-            response = await litellm.aembedding(
-                model="gemini/gemini-embedding-2",
-                input=[text]
-            )
+            response = await litellm.aembedding(model=self.settings.embedding_model, input=[text])
             return response['data'][0]['embedding']
         except Exception as e:
             print(f"Failed to fetch embedding: {e}")
-            # Failsafe fallback: return a blank array matching the expected dimension size
-            return [0.0] * 768
+            return [0.0] * self.settings.embedding_dimension
