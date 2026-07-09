@@ -82,8 +82,8 @@ class StagnationWatchdog:
 
 class SafetyWatchdog:
     """
-    Monitors security and provider call logs for prompt-injection symptoms, 
-    repeated policy engine denials, or budget overflows.
+    Monitors append-only audit tracking logs to isolate malicious or 
+    policy-violating agents from the system workspace.
     """
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
@@ -91,20 +91,66 @@ class SafetyWatchdog:
     async def inspect(self, project_id: str) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        # Query audit logs for recent policy engine governance rejections
+        # SCAN THE ACTUAL AUDIT LOGS FOR EXPLICIT DENY DECISIONS:
         query_audit = """
-            SELECT COUNT(*) FROM provider_calls 
-            WHERE project_id = $1 AND purpose = 'decide_next_action' AND cost_usd = 0.0;
+            SELECT COUNT(*) FROM audit_events 
+            WHERE project_id = $1 AND policy_decision IN ('DENY', 'QUARANTINE_AGENT');
         """
         async with self.db.pool.acquire() as conn:
             blocked_call_count = await conn.fetchval(query_audit, safe_project_id)
             
-        # If policy violations are stacking up, flag the agent worker as a security risk
         if blocked_call_count >= 5:
-            print(f"🚨 [SAFETY ALERT]: Excessive policy violations detected for project context: {project_id}")
+            print(f"🚨 [SAFETY ALERT]: Excessive policy engine violations found inside audit trail for: {project_id}")
             return {
                 "action_required": "QUARANTINE_AGENT",
-                "reason": "Agent has breached corporate security policies or triggered repeated block boundaries."
+                "reason": f"Agent surpassed maximum safety boundary constraints. Found {blocked_call_count} violations."
             }
             
         return {"action_required": "NONE", "status": "SECURE"}
+    
+
+class DeadlockWatchdog:
+    """
+    Scans relational task tables to detect cyclic dependency deadlocks 
+    that prevent agents from progressing.
+    """
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def inspect(self, project_id: str) -> dict:
+        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+        
+        query_deps = """
+            SELECT task_id::text, depends_on_task_id::text 
+            FROM task_dependencies 
+            WHERE task_id IN (SELECT id FROM tasks WHERE project_id = $1 AND status != 'COMPLETED');
+        """
+        async with self.db.pool.acquire() as conn:
+            rows = await conn.fetch(query_deps, safe_project_id)
+
+        # Build a standard directed graph to detect cycles
+        graph = {}
+        for row in rows:
+            graph.setdefault(row["task_id"], []).append(row["depends_on_task_id"])
+
+        visited = set()
+        path = set()
+
+        def has_cycle(node):
+            if node in path: return True
+            if node in visited: return False
+            path.add(node)
+            for neighbor in graph.get(node, []):
+                if has_cycle(neighbor): return True
+            path.remove(node)
+            visited.add(node)
+            return False
+
+        if any(has_cycle(task) for task in graph):
+            print(f"🛑 [DEADLOCK ALERT]: Cyclic dependency loop detected inside task orchestration tree!")
+            return {
+                "action_required": "RESOLVE_DEADLOCK",
+                "reason": "Circular task dependencies detected. Tasks are blocking each other indefinitely."
+            }
+
+        return {"action_required": "NONE", "status": "STABLE"}

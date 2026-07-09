@@ -56,7 +56,6 @@ class TaskRepository:
         parent_task_id: str = None,
         priority: int = 3
     ) -> str:
-        """Creates a high-quality task record supporting hierarchical nesting tree steps."""
         query = """
             INSERT INTO tasks (project_id, title, description, owner_agent_id, parent_task_id, priority)
             VALUES ($1, $2, $3, $4, $5, $6)
@@ -68,7 +67,6 @@ class TaskRepository:
             return str(task_id)
 
     async def add_dependency(self, task_id: str, depends_on_task_id: str) -> None:
-        """Declares a direct dependency relationship baseline link between two tasks."""
         query = """
             INSERT INTO task_dependencies (task_id, depends_on_task_id)
             VALUES ($1, $2)
@@ -78,10 +76,6 @@ class TaskRepository:
             await conn.execute(query, UUID(task_id), UUID(depends_on_task_id))
         
     async def get_active_tasks(self, project_id: str) -> list[dict]:
-        """
-        Fetches all uncompleted tasks for context packaging, including 
-        relational list metadata of blocking ancestor tasks.
-        """
         query = """
             SELECT 
                 t.id::text, 
@@ -107,7 +101,6 @@ class TaskRepository:
             return [dict(row) for row in rows]
 
     async def update_task_status(self, task_id: str, status: str) -> None:
-        """Ticks task tracking metrics forward across state updates."""
         query = "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2"
         async with self.db.pool.acquire() as conn:
             await conn.execute(query, status, UUID(task_id))
@@ -155,3 +148,53 @@ class ProviderCallRepository:
         async with self.db.pool.acquire() as conn:
             call_id = await conn.fetchval(query, UUID(project_id), purpose, provider, model, cost_usd)
             return str(call_id)
+
+
+# =====================================================================
+# --- PHASE 9 WORKSPACE PERSISTENCE ADDITIONS (BATCH 4 REPAIRS) ---
+# =====================================================================
+
+class MemoryRepository:
+    """Manages structural vector-backed semantic long-term agent memory storage."""
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def save_memory_item(self, project_id: str, agent_id: str, scope: str, content: str, embedding: list[float]) -> str:
+        query = """
+            INSERT INTO memory_items (project_id, agent_id, scope, content, embedding)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id;
+        """
+        async with self.db.pool.acquire() as conn:
+            mem_id = await conn.fetchval(query, UUID(project_id), agent_id, scope, content, embedding)
+            return str(mem_id)
+
+class SummaryRepository:
+    """Saves analytical project snapshots for background context compression loops."""
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def save_summary(self, project_id: str, agent_id: str, content: str) -> str:
+        query = """
+            INSERT INTO summaries (project_id, agent_id, content)
+            VALUES ($1, $2, $3)
+            RETURNING id;
+        """
+        async with self.db.pool.acquire() as conn:
+            summary_id = await conn.fetchval(query, UUID(project_id), agent_id, content)
+            return str(summary_id)
+
+class AuditEventRepository:
+    """Maintains an append-only transaction history log for security compliance verification."""
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def log_audit_event(self, project_id: str, agent_id: str, action_type: str, policy_decision: str, integrity_hash: str) -> str:
+        query = """
+            INSERT INTO audit_events (project_id, agent_id, action_type, policy_decision, integrity_hash)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id;
+        """
+        async with self.db.pool.acquire() as conn:
+            audit_id = await conn.fetchval(query, UUID(project_id), agent_id, action_type, policy_decision, integrity_hash)
+            return str(audit_id)

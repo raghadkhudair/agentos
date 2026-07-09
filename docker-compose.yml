@@ -10,7 +10,7 @@ services:
     working_dir: /app
     volumes:
       - ./:/app
-      - ./agentos_sandbox:/tmp/agentos_sandbox
+      - ../agentos_sandbox_mirrors:/tmp/agentos_sandbox
       - ./workspace:/workspace
       - ./data:/data
       - ./logs:/logs

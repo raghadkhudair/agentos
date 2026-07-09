@@ -9,7 +9,6 @@ class Settings(BaseSettings):
 
     project_name: str = Field(default="agentos-project", alias="AGENTOS_PROJECT_NAME")
     
-    # Decouple workspace: Default to an explicit system-level sandbox path outside the repo directory
     workspace: str = Field(
         default_factory=lambda: os.path.abspath(os.path.join(os.path.expanduser("~"), ".agentos_sandbox")),
         alias="AGENTOS_WORKSPACE"
@@ -23,8 +22,9 @@ class Settings(BaseSettings):
     max_active_agents: int = Field(default=12, alias="AGENTOS_MAX_ACTIVE_AGENTS")
     max_parallel_code_tasks: int = Field(default=8, alias="AGENTOS_MAX_PARALLEL_CODE_TASKS")
 
+    # FIXED: Scheme aligned to natively supported 'postgresql://' layout for direct asyncpg.connect compliance
     database_url: str = Field(
-        default="postgresql+asyncpg://agentos:agentos@localhost:5432/agentos", alias="DATABASE_URL"
+        default="postgresql://agentos:agentos@localhost:5432/agentos", alias="DATABASE_URL"
     )
     dragonfly_url: str = Field(default="redis://localhost:6379/0", alias="DRAGONFLY_URL")
 

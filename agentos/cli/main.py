@@ -200,11 +200,11 @@ def test_agent() -> None:
             console.print(f"\n[bold magenta]=== AUTONOMOUS LOOP ITERATION {current_step}/{max_iterations} ===[/bold magenta]")
             console.print(f"[cyan]Evaluating active database task dependencies...[/cyan]")
             
-            result = await agent.handle_event(fake_event_id)
+            # FIXED: Call process_next_step instead of obsolete handle_event
+            result = await agent.process_next_step(fake_event_id)
             
-            proposed_action_dict = result.get("proposed_action", {})
-            action_type = proposed_action_dict.get("action_type", "wait")
-            description = proposed_action_dict.get("description", "")
+            action_type = result.get("action_type", "wait")
+            description = result.get("description", "")
             
             console.print(f"\n[green]Agent Decision: {action_type.upper()}[/green] - [dim]{description}[/dim]")
             
@@ -213,7 +213,15 @@ def test_agent() -> None:
                 break
                 
             console.print("[cyan]Routing action to Execution Supervisor sandbox...[/cyan]")
-            action_request = ActionRequest(**proposed_action_dict)
+            
+            # Reconstruct an ActionRequest payload dynamically from response keys
+            action_request = ActionRequest(
+                project_id=project_id,
+                agent_id="dev-test-1",
+                action_type=action_type,
+                description=description,
+                payload=result
+            )
             execution_result = await supervisor.request_execution(action_request)
             
             console.print("[bold green]Execution Output Logs Returned to Memory Base:[/bold green]")
@@ -221,17 +229,16 @@ def test_agent() -> None:
             
             # Update status maps dynamically based on which file the agent target writes
             if action_type in {"write_file", "write_code"} and execution_result.get("executed"):
-                file_written = proposed_action_dict.get("payload", {}).get("file_path", "")
+                res_data = execution_result.get("result", {})
+                file_written = res_data.get("path", "")
                 if "test" in file_written:
                     await task_repo.update_task_status(task_2_id, "COMPLETED")
                 else:
                     await task_repo.update_task_status(task_1_id, "COMPLETED")
             
-            # --- 🔍 VISIBILITY CHECKPOINT: THE WATCHDOG DECISION MOMENT ---
             console.print("\n[bold yellow]🔍 [SUPERVISOR QUALITY MONITOR]: Running real-time evaluation of checkpoint database states...[/bold yellow]")
             dod_report = await evaluator.evaluate(project_id, project_dod)
             
-            # Display current completion standings live on every turn
             console.print(f"[dim]Current Status -> Satisfied: {dod_report.satisfied} | Remaining Gaps: {dod_report.gaps}[/dim]")
             
             if dod_report.satisfied:
@@ -249,7 +256,6 @@ def test_agent() -> None:
             current_step += 1
             await asyncio.sleep(1.0)
 
-        # 5. Final Dynamic Closure Watchdog Report Validation Gating
         console.print("\n[bold cyan]=== RUNTIME CLOSURE GATING: FINAL STATUS EVALUATION ===[/bold cyan]")
         final_report = await evaluator.evaluate(project_id, project_dod)
         
