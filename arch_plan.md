@@ -117,6 +117,66 @@ Checkpoints + Summaries + Audit Logs
  ↓
 Continue until DoD is satisfied
 ```
+1.settings.py (The Blueprint Configurator): Wakes up first to read the .env file, load your database strings, credentials, and configuration choices.
+
+2.models.py (The zero-trust Rules Registry): Initializes your structural data objects and schemas so the system knows what valid requests look like.
+
+3.supervisor.py (The Main Conductor): Instantiates your database connections, spins up your standalone Ray cluster, and bootstraps the project lifecycle records in PostgreSQL.
+
+4.dragonfly_bus.py & trigger_engine.py (The Communication Array): Turn on simultaneously in the background to handle asynchronous message queuing and routing streams.
+
+5.base.py & broker.py (The Agent Team Lifecycle): Woken up by the trigger engine to catch up on recent memories and begin running LLM decision steps.
+
+6.runtime_watchdogs.py & evaluator.py (The Security Patrol & Quality Inspectors): Turn on last, looping every 30 seconds to audit the database logs, check task graphs, and verify completed goals.
+
+Act I: The Awakening and The Blueprinting
+settings.py parses the system configurations and confirms your daily token budget limits.
+
+supervisor.py boots the system. It fires up your local compute memory partitions, connects to the PostgreSQL database registry, and initializes an external AI architect agent to analyze your request.
+
+The AI architect designs a master team roster and a list of structural goals (the Definition of Done) containing things like: ["posts_db.py", "comments_api.py", "verify inputs"].
+
+supervisor.py reads this plan, makes sure it doesn't break team resource caps via validation structures in team_plan.py, registers the project inside your database tables using repositories.py, and launches your permanent agent workers (like pm_tech_lead-1 and backend_developer-1) into memory.
+
+Act II: The First Event and The Briefcase
+To kick off the project, supervisor.py creates a master PROJECT_CREATED event data payload defined by events.py, logs it to PostgreSQL, and broadcasts it over the real-time cache channels via dragonfly_bus.py.
+
+The background trigger_engine.py intercepts that streaming message. It checks its subscription tables, notices that pm_tech_lead-1 is listening for project creation events, pushes the payload into its private inbox queue, and fires a wakeup signal.
+
+pm_tech_lead-1 wakes up inside base.py! It instantly calls broker.py to build its context briefcase.
+
+broker.py scans the database for past project histories using pgvector math. It finds nothing because the project is new, gathers the open project requirements, and hands the agent a pristine context brief.
+
+The PM agent calls Gemini through the gateway.py provider wrapper. The gateway verifies the project hasn't exceeded its budget cap and scrubs the incoming inputs for malicious prompt injections. The LLM returns a structured JSON payload mapping out the very first database developer assignment:
+
+Task ID 101: "Create posts_db.py schema with validation rules"
+
+Act III: The Developer Sandbox and the Security Interception
+The trigger engine routes this newly created task down into the inbox list for backend_developer-1.
+
+The developer wakes up in base.py, loads its memory briefcase from broker.py, and generates a code patch containing the Python database source files.
+
+The developer doesn't write this code straight to your machine; it packages the request into an ActionRequest wrapped in an unalterable SHA-256 fingerprint from models.py and sends it to the supervisor.
+
+execution/supervisor.py catches the package and pushes it through the zero-trust filters inside policy_engine.py. The policy engine reads the code text line-by-line. If it registers any banned keywords (like an agent trying to run rm -rf or clear out audit trails), it immediately halts execution and locks the agent into a permanent blacklist quarantine zone.
+
+Since our developer is behaving nicely, the engine returns an outright ALLOW verdict. The supervisor opens an isolated Git sandbox folder branch matched to that specific task, writes the new posts_db.py file inside it, and registers a permanent asset tracker inside the artifacts table using repositories.py.
+
+Act IV: The Quality Checkers and The Report Card
+Every 30 seconds, runtime_watchdogs.py walks the virtual factory floor in the background.
+
+DeadlockWatchdog checks the task_dependencies database table using a recursive cycle-search pattern to ensure developer tasks aren't blocking each other in an infinite circle.
+
+Simultaneously, DoDWatchdog queries the database task counts. It fires up evaluator.py to check if the team is meeting the client's goals.
+
+evaluator.py queries your physical artifacts table and reads the structured acceptance_criteria JSON details attached to your completed database rows. It notes that posts_db.py physically exists and its validation criteria match the first item on your high-level project goals list.
+
+It checks off that specific box as "SATISFIED" inside the DoDItemStatus Pydantic record and compiles the master DoDEvaluation report card.
+
+Act V: Project Graduation
+The event loop repeats across the team. Developers continue writing code, reviewers audit the patches, and the database clerks log the progress. Finally, evaluator.py finds that the gaps list is completely empty and every single required milestone has passed multi-layered validation.
+
+The background watchdogs report an absolute COMPLIANT status, the main supervisor saves the completion state to the database vault, cleans up the container memory pools, and prints a success notification to your console terminal! The simple blog platform is complete.
 
 ## 7. Application stack
 

@@ -46,7 +46,6 @@ class ActionRequest(BaseModel):
     database_operation: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     
-    # --- PHASE 9 TAMPER-PROOF METADATA EXTENSIONS ---
     nonce: str = Field(default_factory=lambda: hashlib.sha256(str(json.dumps({})).encode()).hexdigest()[:16])
     integrity_hash: str | None = None
 

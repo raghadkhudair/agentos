@@ -1,0 +1,14 @@
+
+
+available_rules:
+  - name: "agentos"
+    description: "AgentOS is a framework for building autonomous agents that can perform complex tasks by interacting with the environment and other agents."
+    members:
+      - name: "Alice"
+        role: "Lead Developer"
+
+availble_roles:
+
+
+max_num_actors:
+

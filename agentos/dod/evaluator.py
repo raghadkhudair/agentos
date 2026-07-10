@@ -53,7 +53,6 @@ class DoDEvaluator:
         except Exception as e:
             print(f"Failed to query checkpoints loop: {e}")
 
-        # --- 🚀 FIX 4 MODULE ADDITION: FETCH STRUCTURED TASK ACCEPTANCE CRITERIA ---
         query_tasks = "SELECT title, status, acceptance_criteria FROM tasks WHERE project_id = $1;"
         completed_criteria = set()
         try:

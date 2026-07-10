@@ -9,8 +9,7 @@ logger = structlog.get_logger()
 
 @ray.remote
 class ReviewerAgentActor:
-    """Phase 7 Validation Agent that inspects isolated sandbox workspaces for engineering code quality."""
-
+    """A specialized Ray actor for reviewing code patches and enforcing security guardrails."""
     def __init__(self, settings_payload: dict):
         self.settings = Settings(**settings_payload)
         self.provider = ProviderGateway(self.settings)

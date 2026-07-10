@@ -21,7 +21,6 @@ from agentos.storage.repositories import (
 )
 from agentos.provider.gateway import ProviderGateway, ProviderRequest
 
-# Configure Phase 9 Structured Logging Engine
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),

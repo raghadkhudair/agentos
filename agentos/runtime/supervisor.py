@@ -33,10 +33,10 @@ class RuntimeSupervisor:
     def connect_ray(self) -> None:
         if ray.is_initialized():
             return
-        if self.settings.ray_address and self.settings.ray_address.strip():
-            ray.init(address=self.settings.ray_address, ignore_reinit_error=True)
-        else:
-            logger.info("initializing_local_ray_cluster", cpus=2, namespace="agentos")
+            
+        # FORCE LOCAL BYPASS: Ignore external network bridge lookups on Windows local dev environments
+        if self.settings.environment == "local":
+            logger.info("forcing_local_standalone_ray_bypass")
             ray.init(
                 ignore_reinit_error=True, 
                 num_cpus=2, 
@@ -45,6 +45,11 @@ class RuntimeSupervisor:
                 object_store_memory=250_000_000,   
                 _system_config={"gcs_rpc_server_reconnect_timeout_s": 60}
             )
+        elif self.settings.ray_address and self.settings.ray_address.strip():
+            ray.init(address=self.settings.ray_address, ignore_reinit_error=True)
+        else:
+            logger.info("initializing_fallback_local_ray_cluster")
+            ray.init(ignore_reinit_error=True, num_cpus=2, namespace="agentos")
 
     async def bootstrap_project(self, user_request: str) -> dict:
         logger.info("runtime_supervisor_waking_up", project_name=self.settings.project_name)
@@ -165,7 +170,6 @@ class RuntimeSupervisor:
                 created.append(started)
         return created
 
-    # --- FIXED PLACE: Moved completely out of create_agent_actors to class scope level ---
     async def watchdog_loop(self, project_id: str, dod: list[str]) -> None:
         """Background daemon loop that executes runtime health evaluations every 30 seconds."""
         from agentos.watchdogs.runtime_watchdogs import DoDWatchdog, StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
