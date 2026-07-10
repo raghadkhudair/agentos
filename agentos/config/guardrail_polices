@@ -1,0 +1,59 @@
+# Governance/security configuration used by:
+#   - governance/policy_engine.py  -> PolicyEngine.DESTRUCTIVE_PATTERNS + action_type risk sets
+#   - provider/gateway.py          -> ProviderGateway._sanitize_prompt_input patterns
+#   - execution/supervisor.py      -> git identity + shell timeout
+
+destructive_patterns:
+  - "drop database"
+  - "drop schema"
+  - "drop table"
+  - "truncate"
+  - "delete from"
+  - "rm -rf"
+  - "disable guardrail"
+  - "delete audit"
+  - "delete checkpoint"
+  - "delete event log"
+  - "curl | sh"
+  - "wget | sh"
+
+# action_type values that always require independent human/reviewer sign-off
+require_review_action_types:
+  - "modify_auth"
+  - "modify_ci"
+  - "run_migration"
+  - "add_dependency"
+
+# action_type values considered low risk (auto-allowed)
+low_risk_action_types:
+  - "read_file"
+  - "write_file"
+  - "write_code"
+  - "run_tests"
+  - "create_summary"
+  - "search_memory"
+
+# action_type values considered medium risk (allowed with constraints)
+medium_risk_shell_action_types:
+  - "shell_command"
+  - "run_command"
+
+safety_watchdog:
+  blocked_call_quarantine_threshold: 5   # violations before agent gets quarantined
+
+stagnation_watchdog:
+  checkpoint_history_lookback: 10        # how many recent checkpoints to inspect
+  repeated_action_threshold: 4           # identical repeats before flagging a loop
+
+# Prompt-injection / malicious-instruction patterns scrubbed from every LLM prompt
+prompt_sanitization_patterns:
+  - '\.env'
+  - 'ignore\s+previous\s+instructions'
+  - 'disable\s+guardrails'
+  - 'system_policies'
+
+execution_sandbox:
+  git_author_name: "AgentOS"
+  git_author_email: "runtime@agentos.local"
+  default_branch: "main"
+  shell_command_timeout_seconds: 30.0

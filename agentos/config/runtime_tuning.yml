@@ -1,0 +1,16 @@
+# Infra tuning used by:
+#   - runtime/supervisor.py  -> connect_ray(), watchdog_loop()
+#   - actors/base.py         -> _inbox_listening_loop()
+
+ray:
+  num_cpus: 2
+  object_store_memory: 250000000
+  gcs_rpc_server_reconnect_timeout_s: 60
+
+watchdog_loop:
+  interval_seconds: 30
+
+agent_inbox_loop:
+  pubsub_poll_timeout_seconds: 1.0
+  empty_inbox_sleep_seconds: 0.1
+  error_backoff_sleep_seconds: 1.0

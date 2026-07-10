@@ -17,6 +17,9 @@ from agentos.messaging.dragonfly_bus import DragonflyBus
 from agentos.messaging.events import Event, EventType
 from agentos.runtime.trigger_engine import TriggerEngine
 
+from agentos.config.loader import runtime_tuning
+cfg = runtime_tuning()["ray"]
+
 logger = structlog.get_logger()
 
 
@@ -39,10 +42,10 @@ class RuntimeSupervisor:
             logger.info("forcing_local_standalone_ray_bypass")
             ray.init(
                 ignore_reinit_error=True, 
-                num_cpus=2, 
+                num_cpus=cfg["num_cpus"], 
                 namespace="agentos",
                 include_dashboard=False,          
-                object_store_memory=250_000_000,   
+                object_store_memory=cfg["object_store_memory"],   
                 _system_config={"gcs_rpc_server_reconnect_timeout_s": 60}
             )
         elif self.settings.ray_address and self.settings.ray_address.strip():
@@ -180,7 +183,7 @@ class RuntimeSupervisor:
         deadlock_wd = DeadlockWatchdog(self.db_manager)
         
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(runtime_tuning()["watchdog_loop"]["interval_seconds"])
             for wd, args in [(dod_wd, (project_id, dod)), (stag_wd, (project_id,)),
                             (safety_wd, (project_id,)), (deadlock_wd, (project_id,))]:
                 try:

@@ -6,6 +6,7 @@ import structlog
 
 from agentos.config.settings import Settings
 from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision
+from agentos.config.loader import guardrail_policies
 
 logger = structlog.get_logger()
 
@@ -38,14 +39,14 @@ class ExecutionSupervisor:
         if not os.path.exists(git_dir):
             try:
                 os.system(f"git init {shlex.quote(self.workspace_path)} > /dev/null 2>&1")
-                os.system(f"git -C {shlex.quote(self.workspace_path)} checkout -b main > /dev/null 2>&1")
+                os.system(f"git -C {shlex.quote(self.workspace_path)} checkout -b {self._sandbox_cfg['default_branch']} > /dev/null 2>&1")
                 
                 init_file = os.path.join(self.workspace_path, ".agentos_keep")
                 with open(init_file, "w") as f:
                     f.write("AgentOS Initializer Pointer State File.")
                 
                 os.system(f"git -C {shlex.quote(self.workspace_path)} add .agentos_keep > /dev/null 2>&1")
-                os.system(f"git -C {shlex.quote(self.workspace_path)} -c user.name='AgentOS' -c user.email='runtime@agentos.local' commit -m 'Initial asset repository bootstrap commit.' > /dev/null 2>&1")
+                os.system(f"git -C {shlex.quote(self.workspace_path)} -c user.name='{self._sandbox_cfg['git_author_name']}' -c user.email='{self._sandbox_cfg['git_author_email']}' commit -m 'Initial asset repository bootstrap commit.' > /dev/null 2>&1")
                 logger.info("sandbox_git_repository_initialized", workspace_path=self.workspace_path)
             except Exception as e:
                 logger.error("sandbox_git_initialization_failed", error=str(e))
@@ -126,7 +127,7 @@ class ExecutionSupervisor:
         try:
             cmd = (
                 "git add . && "
-                f"git -c user.name='AgentOS' -c user.email='runtime@agentos.local' commit -m {shlex.quote(commit_msg)}"
+                f"git -c user.name='self._sandbox_cfg['git_author_name']' -c user.email='self._sandbox_cfg['git_author_email']' commit -m {shlex.quote(commit_msg)}"
             )
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -192,7 +193,7 @@ class ExecutionSupervisor:
                 cwd=self.workspace_path
             )
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=30.0)
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), self._sandbox_cfg["shell_command_timeout_seconds"])
             
             return {
                 "success": True,
@@ -202,6 +203,6 @@ class ExecutionSupervisor:
             }
         except asyncio.TimeoutError:
             logger.error("process_execution_timeout", command=command_str)
-            return {"error": "Execution timed out after 30.0 seconds."}
+            return {"error": f"Execution timed out after {self._sandbox_cfg['shell_command_timeout_seconds']} seconds."}
         except Exception as e:
             return {"error": f"Failed to execute process shell environment: {str(e)}"}

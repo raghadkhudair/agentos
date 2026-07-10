@@ -7,7 +7,7 @@ import ray
 from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan
 from agentos.provider.gateway import ProviderGateway, ProviderRequest
 from agentos.config.settings import load_settings
-
+from agentos.config.loader import team_roles
 
 @ray.remote(max_restarts=-1, max_task_retries=3)
 class BootstrapAgentActor:
@@ -27,6 +27,11 @@ class BootstrapAgentActor:
         Queries the provider gateway with the raw user request to synthesize 
         a dynamic, custom-fitted team plan and task graph.
         """
+        roles_cfg = team_roles()
+        role_bullets = "\n".join(f'- {r["role"]}: {r["description"]}' for r in roles_cfg["roles"])
+        role_names = " | ".join(f'"{r["role"]}"' for r in roles_cfg["roles"])
+
+
         system_prompt = (
             "You are the Lead Project Manager and Principal Architect for AgentOS.\n"
             "Your task is to analyze a user's IT/software request and output a structured project blueprint.\n\n"
@@ -34,14 +39,7 @@ class BootstrapAgentActor:
             "1. Only request specialized roles that are absolutely necessary for the task.\n"
             "2. If the request is backend-only or CLI-only, DO NOT include FRONTEND_DEVELOPER.\n"
             "3. Ensure the sum of agent counts does not exceed the provided max_agents limit.\n\n"
-            "Available Agent Roles:\n"
-            "- PM_TECH_LEAD: Owns planning, coordination, and overall delivery gating.\n"
-            "- SOLUTION_ARCHITECT: Designs API contracts, system components, and architectural records.\n"
-            "- BACKEND_DEVELOPER: Writes backend logic, code modules, databases, and structural asserts.\n"
-            "- FRONTEND_DEVELOPER: Crafts client application elements, layout systems, and views.\n"
-            "- PLATFORM_ENGINEER: Builds Docker wrappers, sandboxes, and integration lifecycles.\n"
-            "- QA_ENGINEER: Asserts acceptance criteria and collects delivery execution proof.\n"
-            "- SECURITY_REVIEWER: Inspects logic paths for vulnerabilities or safety boundary violations.\n\n"
+            f"Available Agent Roles:\n{role_bullets}\n\n"
             "You MUST respond with a single un-wrapped valid JSON object matching this schema exactly:\n"
             "{\n"
             "  \"project_name\": \"string-identifier\",\n"
@@ -49,7 +47,7 @@ class BootstrapAgentActor:
             "  \"assumptions\": [\"explicit boundary assumptions matching context limits\"],\n"
             "  \"agents\": [\n"
             "     {\n"
-            "       \"role\": \"PM_TECH_LEAD\" | \"SOLUTION_ARCHITECT\" | \"BACKEND_DEVELOPER\" | \"FRONTEND_DEVELOPER\" | \"PLATFORM_ENGINEER\" | \"QA_ENGINEER\" | \"SECURITY_REVIEWER\",\n"
+            f"       \"role\": {role_names},\n"
             "       \"count\": 1,\n"
             "       \"description\": \"custom focus explanation for this project\"\n"
             "     }\n"

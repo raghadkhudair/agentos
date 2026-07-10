@@ -20,6 +20,8 @@ from agentos.storage.repositories import (
     ArtifactRepository
 )
 from agentos.provider.gateway import ProviderGateway, ProviderRequest
+from agentos.config.loader import runtime_tuning
+cfg = runtime_tuning()["agent_inbox_loop"]
 
 structlog.configure(
     processors=[
@@ -87,17 +89,17 @@ class AgentWorkerActor:
             try:
                 raw_event_data = await redis_client.lpop(inbox_key)
                 if not raw_event_data:
-                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=cfg["pubsub_poll_timeout_seconds"])
                     if message and message["data"] == "NEW_EVENT":
                         continue
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(cfg["empty_inbox_sleep_seconds"])
                     continue
 
                 event_dict = json.loads(raw_event_data)
                 await self.process_next_step(event_dict.get("event_id"))
             except Exception as e:
                 logger.error("inbox_loop_error", agent_id=self.agent_id, error=str(e))
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(cfg["error_backoff_sleep_seconds"])
 
     async def process_next_step(self, event_id: str) -> dict:
         self.status = "DECIDE_NEXT_ACTION"

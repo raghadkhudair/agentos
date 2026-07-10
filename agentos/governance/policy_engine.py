@@ -3,6 +3,7 @@ from __future__ import annotations
 from agentos.config.settings import Settings
 from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision, RiskLevel
 
+from agentos.config.loader import guardrail_policies
 
 class PolicyEngine:
     """Deterministic governance layer for agent actions.
@@ -11,24 +12,15 @@ class PolicyEngine:
     quarantine boundaries to isolate compromised agents.
     """
 
-    DESTRUCTIVE_PATTERNS = (
-        "drop database",
-        "drop schema",
-        "drop table",
-        "truncate",
-        "delete from",
-        "rm -rf",
-        "disable guardrail",
-        "delete audit",
-        "delete checkpoint",
-        "delete event log",
-        "curl | sh",
-        "wget | sh",
-    )
-
     def __init__(self, settings: Settings):
         self.settings = settings
         self._quarantined_agents: set[str] = set()
+        cfg = guardrail_policies()
+        self.DESTRUCTIVE_PATTERNS = tuple(cfg["destructive_patterns"])
+        self._review_types = set(cfg["require_review_action_types"])
+        self._low_risk_types = set(cfg["low_risk_action_types"])
+        self._medium_risk_types = set(cfg["medium_risk_shell_action_types"])
+        self._quarantine_threshold = cfg["safety_watchdog"]["blocked_call_quarantine_threshold"]
 
     def quarantine_agent(self, agent_id: str) -> None:
         """Forcibly isolates an agent worker and blocks all future execution permissions."""

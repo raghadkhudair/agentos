@@ -9,6 +9,8 @@ import litellm
 from agentos.config.settings import Settings
 from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import ProviderCallRepository
+from agentos.config.loader import guardrail_policies
+
 
 @dataclass(frozen=True)
 class ProviderRequest:
@@ -33,19 +35,9 @@ class ProviderGateway:
         self.call_repo = ProviderCallRepository(db_manager) if db_manager else None
 
     def _sanitize_prompt_input(self, text: str) -> str:
-        """
-        Scans and sanitizes inputs to block malicious structural instructions, 
-        system policy modifications, or environment file access attempts.
-        """
-        # Block attempts to target core configuration or environment profiles
-        malicious_patterns = [
-            r"\.env", 
-            r"ignore\s+previous\s+instructions", 
-            r"disable\s+guardrails",
-            r"system_policies"
-        ]
+        patterns = guardrail_policies()["prompt_sanitization_patterns"]
         sanitized = text
-        for pattern in malicious_patterns:
+        for pattern in patterns:
             sanitized = re.sub(pattern, "[REDACTED_SECURITY_VIOLATION]", sanitized, flags=re.IGNORECASE)
         return sanitized
 
