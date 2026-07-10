@@ -23,6 +23,7 @@ class ExecutionSupervisor:
 
         self.settings = settings
         self.policy_engine = PolicyEngine(settings)
+        self._sandbox_cfg = guardrail_policies()["execution_sandbox"]
         self.workspace_path = os.path.abspath(settings.workspace)
         
         if not os.path.exists(self.workspace_path):
@@ -127,7 +128,7 @@ class ExecutionSupervisor:
         try:
             cmd = (
                 "git add . && "
-                f"git -c user.name='self._sandbox_cfg['git_author_name']' -c user.email='self._sandbox_cfg['git_author_email']' commit -m {shlex.quote(commit_msg)}"
+                f"git -c user.name='{self._sandbox_cfg['git_author_name']}' -c user.email='{self._sandbox_cfg['git_author_email']}' commit -m {shlex.quote(commit_msg)}"
             )
             proc = await asyncio.create_subprocess_shell(
                 cmd,

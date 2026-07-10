@@ -10,7 +10,7 @@ from agentos.config.settings import Settings
 from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import ProviderCallRepository
 from agentos.config.loader import guardrail_policies
-
+from agentos.config.loader import runtime_tuning
 
 @dataclass(frozen=True)
 class ProviderRequest:
@@ -33,7 +33,12 @@ class ProviderGateway:
         self.fallback_model = self.settings.provider_fallback_model
         self.db_manager = db_manager
         self.call_repo = ProviderCallRepository(db_manager) if db_manager else None
-
+        tuning = runtime_tuning()
+        model_cfg = tuning.get("models", {})
+        
+        self.default_model = model_cfg.get("primary", "gemini/gemini-1.5-pro")
+        self.fallback_model = model_cfg.get("fallback", "gemini/gemini-1.5-flash")
+        self.embedding_model = model_cfg.get("embedding", "gemini/text-embedding-004")
     def _sanitize_prompt_input(self, text: str) -> str:
         patterns = guardrail_policies()["prompt_sanitization_patterns"]
         sanitized = text
@@ -81,11 +86,7 @@ class ProviderGateway:
         except Exception as e:
             print(f"Primary model ({self.default_model}) failed. Fallback triggered... Error: {e}")
             
-            fallback = self.fallback_model
-            if fallback == "gemini/gemini-2.5-flash" or fallback.endswith("gemini-2.5-flash"):
-                used_model = "gemini/gemini-2.5-flash"
-            else:
-                used_model = fallback
+            used_model = self.fallback_model
                 
             response = await litellm.acompletion(
                 model=used_model,
@@ -122,7 +123,7 @@ class ProviderGateway:
     async def get_embedding(self, text: str) -> list[float]:
         """Generates a semantic vector embedding using LiteLLM."""
         try:
-            response = await litellm.aembedding(model=self.settings.embedding_model, input=[text])
+            response = await litellm.aembedding(model=self.embedding_model, input=[text])
             return response['data'][0]['embedding']
         except Exception as e:
             print(f"Failed to fetch embedding: {e}")

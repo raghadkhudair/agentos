@@ -14,3 +14,9 @@ agent_inbox_loop:
   pubsub_poll_timeout_seconds: 1.0
   empty_inbox_sleep_seconds: 0.1
   error_backoff_sleep_seconds: 1.0
+
+
+models:
+  primary: "gemini/gemini-3.1-flash-live-preview"  
+  fallback: "gemini/gemini-pro-latest"           
+  embedding: "gemini/gemini-embedding-001"

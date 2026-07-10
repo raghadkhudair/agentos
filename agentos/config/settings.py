@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql://agentos:agentos@localhost:5432/agentos", alias="DATABASE_URL"
     )
-    dragonfly_url: str = Field(default="redis://localhost:6379/0", alias="DRAGONFLY_URL")
+    dragonfly_url: str = Field(default="redis://dragonfly:6379/0", alias="DRAGONFLY_URL")
 
     provider_default_model: str = Field(
         default="gemini/gemini-2.5-pro", alias="AGENTOS_PROVIDER_DEFAULT_MODEL"

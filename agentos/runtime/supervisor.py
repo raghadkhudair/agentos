@@ -5,7 +5,7 @@ from collections.abc import Iterable
 import uuid
 import ray
 import structlog
-
+import os
 from agentos.actors.bootstrap import BootstrapAgentActor
 from agentos.config.settings import Settings
 from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedTeamPlan
@@ -36,23 +36,17 @@ class RuntimeSupervisor:
     def connect_ray(self) -> None:
         if ray.is_initialized():
             return
-            
-        # FORCE LOCAL BYPASS: Ignore external network bridge lookups on Windows local dev environments
-        if self.settings.environment == "local":
-            logger.info("forcing_local_standalone_ray_bypass")
-            ray.init(
-                ignore_reinit_error=True, 
-                num_cpus=cfg["num_cpus"], 
-                namespace="agentos",
-                include_dashboard=False,          
-                object_store_memory=cfg["object_store_memory"],   
-                _system_config={"gcs_rpc_server_reconnect_timeout_s": 60}
-            )
-        elif self.settings.ray_address and self.settings.ray_address.strip():
-            ray.init(address=self.settings.ray_address, ignore_reinit_error=True)
-        else:
-            logger.info("initializing_fallback_local_ray_cluster")
-            ray.init(ignore_reinit_error=True, num_cpus=2, namespace="agentos")
+
+        logger.info("initializing_standalone_local_ray_cluster")
+        ray.init(
+            address="local",
+            ignore_reinit_error=True,
+            num_cpus=cfg["num_cpus"],
+            namespace="agentos",
+            include_dashboard=False,
+            object_store_memory=cfg["object_store_memory"],
+            _system_config={"gcs_rpc_server_reconnect_timeout_s": 60}
+        )
 
     async def bootstrap_project(self, user_request: str) -> dict:
         logger.info("runtime_supervisor_waking_up", project_name=self.settings.project_name)

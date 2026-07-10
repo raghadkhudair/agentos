@@ -63,7 +63,7 @@ class PolicyEngine:
                 constraints=["Require backup proof.", "Require sandbox proof.", "Require human approval."],
             )
 
-        if request.action_type in {"modify_auth", "modify_ci", "run_migration", "add_dependency"}:
+        if request.action_type in self._review_types:
             return GuardrailResult(
                 decision=PolicyDecision.REQUIRE_REVIEW,
                 risk_level=RiskLevel.HIGH,
@@ -71,11 +71,11 @@ class PolicyEngine:
             )
 
         # 3. Low Risk: Static, passive read/write actions
-        if request.action_type in {"read_file", "write_file", "write_code", "run_tests", "create_summary", "search_memory"}:
+        if request.action_type in self._low_risk_types:
             return GuardrailResult(decision=PolicyDecision.ALLOW, risk_level=RiskLevel.LOW)
         
         # 4. Medium Risk: Shell execution commands
-        if request.action_type in {"shell_command", "run_command"}:
+        if request.action_type in self._medium_risk_types:
             return GuardrailResult(
                 decision=PolicyDecision.ALLOW_WITH_CONSTRAINTS,
                 risk_level=RiskLevel.MEDIUM,
