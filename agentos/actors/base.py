@@ -66,7 +66,7 @@ class AgentWorkerActor:
         self.status = "IDLE"
         self.is_running = True
         
-        asyncio.create_task(self._inbox_listening_loop())
+        self._inbox_task = asyncio.create_task(self._inbox_listening_loop())
         
         logger.info("agent_started", agent_id=self.agent_id, role=self.role, project_id=self.project_id)
         return {

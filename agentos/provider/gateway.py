@@ -127,4 +127,4 @@ class ProviderGateway:
             return response['data'][0]['embedding']
         except Exception as e:
             print(f"Failed to fetch embedding: {e}")
-            return [0.0] * self.settings.embedding_dimension
+            return [0.0] * runtime_tuning()["embedding"]["dimension"]

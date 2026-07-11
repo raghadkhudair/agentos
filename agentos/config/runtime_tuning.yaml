@@ -15,8 +15,15 @@ agent_inbox_loop:
   empty_inbox_sleep_seconds: 0.1
   error_backoff_sleep_seconds: 1.0
 
-
 models:
-  primary: "gemini/gemini-3.1-flash-live-preview"  
-  fallback: "gemini/gemini-pro-latest"           
+  primary: "gemini/gemini-2.5-pro"
+  fallback: "gemini/gemini-2.5-flash"
   embedding: "gemini/gemini-embedding-001"
+
+agent_limits:
+  max_agents_total: 20
+  max_active_agents: 12
+  max_parallel_code_tasks: 8
+
+embedding:
+  dimension: 768

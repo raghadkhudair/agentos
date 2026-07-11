@@ -60,12 +60,13 @@ class RuntimeSupervisor:
         logger.info("contacting_bootstrap_agent_for_team_blueprint")
         bootstrap = BootstrapAgentActor.options(namespace="agentos").remote(project_id=self.settings.project_name)
         raw_plan = await bootstrap.create_team_plan.remote(
-            user_request, self.settings.max_agents_total
+            user_request, runtime_tuning()["agent_limits"]["max_agents_total"]
         )
         plan = TeamPlan.model_validate(raw_plan)
         validated = self.validate_team_plan(plan)
+        actual_project_name = plan.project_name  # use the AI's generated name from here on
 
-        logger.info("saving_project_metadata_to_postgresql", project=self.settings.project_name)
+        logger.info("saving_project_metadata_to_postgresql", project=actual_project_name)
         db_project_id = await project_repo.create_project(
             name=self.settings.project_name,
             request=user_request,
@@ -124,7 +125,7 @@ class RuntimeSupervisor:
         }
 
     def validate_team_plan(self, plan: TeamPlan) -> ValidatedTeamPlan:
-        if plan.total_agents <= self.settings.max_agents_total:
+        if plan.total_agents <= runtime_tuning()["agent_limits"]["max_agents_total"]:
             return ValidatedTeamPlan(
                 original=plan,
                 agents=plan.agents,
@@ -133,7 +134,7 @@ class RuntimeSupervisor:
             )
 
         reduced_agents: list[AgentSpec] = []
-        remaining = self.settings.max_agents_total
+        remaining = runtime_tuning()["agent_limits"]["max_agents_total"]
         for spec in plan.agents:
             if remaining <= 0:
                 break

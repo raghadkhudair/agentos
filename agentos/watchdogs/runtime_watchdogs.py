@@ -90,7 +90,6 @@ class SafetyWatchdog:
     async def inspect(self, project_id: str) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        # FIXED: Changed column 'decision' to match 'policy_decision' database registration layout
         query_audit = """
             SELECT COUNT(*) FROM audit_events 
             WHERE project_id = $1 AND decision IN ('DENY', 'QUARANTINE_AGENT');

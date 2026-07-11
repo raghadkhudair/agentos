@@ -13,6 +13,7 @@ from agentos.dod.evaluator import DoDEvaluator
 from agentos.config.settings import load_settings
 from agentos.runtime.supervisor import RuntimeSupervisor
 from agentos.storage.database import DatabaseManager
+from agentos.config.loader import runtime_tuning
 
 app = typer.Typer(no_args_is_help=True, help="AgentOS Local CLI")
 console = Console()
@@ -75,8 +76,9 @@ def status() -> None:
     table.add_row("Ray address", str(settings.ray_address))
     table.add_row("Database", settings.database_url)
     table.add_row("Dragonfly", settings.dragonfly_url)
-    table.add_row("Max agents", str(settings.max_agents_total))
-    table.add_row("Max active agents", str(settings.max_active_agents))
+    limits = runtime_tuning()["agent_limits"]
+    table.add_row("Max agents", str(limits["max_agents_total"]))
+    table.add_row("Max active agents", str(limits["max_active_agents"]))
     table.add_row("Destructive actions allowed", str(settings.allow_destructive_actions))
     console.print(table)
 
