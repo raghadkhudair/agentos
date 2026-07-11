@@ -66,6 +66,14 @@ class AgentWorkerActor:
         self.status = "IDLE"
         self.is_running = True
         
+        from redis.asyncio import Redis
+        self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
+        self.pubsub = self.redis_client.pubsub()
+        
+        wakeup_channel = f"agent:{self.agent_id}:wakeup"
+        await self.pubsub.subscribe(wakeup_channel) 
+        
+        # Now pass execution down to the polling engine safely
         self._inbox_task = asyncio.create_task(self._inbox_listening_loop())
         
         logger.info("agent_started", agent_id=self.agent_id, role=self.role, project_id=self.project_id)
@@ -77,19 +85,17 @@ class AgentWorkerActor:
         }
 
     async def _inbox_listening_loop(self) -> None:
-        from redis.asyncio import Redis
-        redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
-        pubsub = redis_client.pubsub()
-        
-        wakeup_channel = f"agent:{self.agent_id}:wakeup"
         inbox_key = f"agent:{self.agent_id}:inbox"
-        await pubsub.subscribe(wakeup_channel)
 
         while self.is_running:
             try:
-                raw_event_data = await redis_client.lpop(inbox_key)
+                raw_event_data = await self.redis_client.lpop(inbox_key)
                 if not raw_event_data:
-                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=cfg["pubsub_poll_timeout_seconds"])
+                    # Reuse our established pubsub client handler safely
+                    message = await self.pubsub.get_message(
+                        ignore_subscribe_messages=True, 
+                        timeout=cfg["pubsub_poll_timeout_seconds"]
+                    )
                     if message and message["data"] == "NEW_EVENT":
                         continue
                     await asyncio.sleep(cfg["empty_inbox_sleep_seconds"])
@@ -98,6 +104,13 @@ class AgentWorkerActor:
                 event_dict = json.loads(raw_event_data)
                 await self.process_next_step(event_dict.get("event_id"))
             except Exception as e:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    logger.info("actor_loop_terminating_stopping_inbox", agent_id=self.agent_id)
+                    self.is_running = False
+                    break
+
                 logger.error("inbox_loop_error", agent_id=self.agent_id, error=str(e))
                 await asyncio.sleep(cfg["error_backoff_sleep_seconds"])
 

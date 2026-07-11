@@ -1,10 +1,6 @@
-# Infra tuning used by:
-#   - runtime/supervisor.py  -> connect_ray(), watchdog_loop()
-#   - actors/base.py         -> _inbox_listening_loop()
-
 ray:
-  num_cpus: 2
-  object_store_memory: 250000000
+  num_cpus: 1                                # Dynamically limits cores to protect memory
+  object_store_memory:   100000000           
   gcs_rpc_server_reconnect_timeout_s: 60
 
 watchdog_loop:
@@ -16,14 +12,14 @@ agent_inbox_loop:
   error_backoff_sleep_seconds: 1.0
 
 models:
-  primary: "gemini/gemini-2.5-pro"
-  fallback: "gemini/gemini-2.5-flash"
+  primary: "gemini/gemini-3.5-flash"
+  fallback: "gemini/gemini-pro-latest"
   embedding: "gemini/gemini-embedding-001"
 
 agent_limits:
-  max_agents_total: 20
-  max_active_agents: 12
-  max_parallel_code_tasks: 8
+  max_agents_total: 2                        # Safely set to 2 to protect local container memory
+  max_active_agents: 2
+  max_parallel_code_tasks: 1
 
 embedding:
   dimension: 768
