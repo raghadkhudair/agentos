@@ -91,7 +91,6 @@ class AgentWorkerActor:
             try:
                 raw_event_data = await self.redis_client.lpop(inbox_key)
                 if not raw_event_data:
-                    # Reuse our established pubsub client handler safely
                     message = await self.pubsub.get_message(
                         ignore_subscribe_messages=True, 
                         timeout=cfg["pubsub_poll_timeout_seconds"]

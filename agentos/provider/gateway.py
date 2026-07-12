@@ -36,8 +36,8 @@ class ProviderGateway:
         tuning = runtime_tuning()
         model_cfg = tuning.get("models", {})
         
-        self.default_model = model_cfg.get("primary", "gemini/gemini-1.5-pro")
-        self.fallback_model = model_cfg.get("fallback", "gemini/gemini-1.5-flash")
+        self.default_model = model_cfg.get("primary", "gemini/gemini-2.5-pro")
+        self.fallback_model = model_cfg.get("fallback", "gemini/gemini-2.5-flash")
         self.embedding_model = model_cfg.get("embedding", "gemini/text-embedding-004")
     def _sanitize_prompt_input(self, text: str) -> str:
         patterns = guardrail_policies()["prompt_sanitization_patterns"]

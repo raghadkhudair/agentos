@@ -33,7 +33,7 @@ class RuntimeSupervisor:
         self.dragonfly = DragonflyBus(settings.dragonfly_url)
         self.trigger_engine = TriggerEngine(self.dragonfly)
         self._project_complete = asyncio.Event()
-
+        self._actor_handles: list = []
     def connect_ray(self) -> None:
         if ray.is_initialized():
             return
@@ -132,7 +132,6 @@ class RuntimeSupervisor:
         }
 
     def validate_team_plan(self, plan: TeamPlan) -> ValidatedTeamPlan:
-        # 🔑 Pulled dynamically from configuration variables layout
         max_allowed = tuning_cfg["agent_limits"]["max_agents_total"]
         if plan.total_agents <= max_allowed:
             return ValidatedTeamPlan(
@@ -175,6 +174,7 @@ class RuntimeSupervisor:
                     settings=settings_payload,
                 )
                 started = await actor.start.remote()
+                self._actor_handles.append(actor)
                 created.append(started)
         return created
 

@@ -17,19 +17,12 @@ class Settings(BaseSettings):
     environment: str = Field(default="local", alias="AGENTOS_ENV")
     log_level: str = Field(default="INFO", alias="AGENTOS_LOG_LEVEL")
 
-    ray_address: str | None = Field(default=None, alias="RAY_ADDRESS")
     
     database_url: str = Field(
         default="postgresql://agentos:agentos@localhost:5432/agentos", alias="DATABASE_URL"
     )
     dragonfly_url: str = Field(default="redis://dragonfly:6379/0", alias="DRAGONFLY_URL")
 
-    provider_default_model: str = Field(
-        default="gemini/gemini-2.5-pro", alias="AGENTOS_PROVIDER_DEFAULT_MODEL"
-    )
-    provider_fallback_model: str = Field(
-        default="gemini/gemini-2.5-flash", alias="AGENTOS_PROVIDER_FALLBACK_MODEL"
-    )
 
     daily_budget_usd: float = Field(default=100.0, alias="AGENTOS_DAILY_BUDGET_USD")
     monthly_budget_usd: float = Field(default=1000.0, alias="AGENTOS_MONTHLY_BUDGET_USD")
