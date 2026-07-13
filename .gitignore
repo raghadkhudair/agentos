@@ -15,3 +15,11 @@ logs/
 artifacts/
 .ray/
 .DS_Store
+.env.local
+.env.*.local
+*.log
+.vscode/
+.idea/
+htmlcov/
+.python-version
+node_modules/

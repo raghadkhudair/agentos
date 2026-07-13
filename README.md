@@ -178,7 +178,7 @@ Edit `.env` and add any required external provider keys. Do not commit `.env`.
 Start the supporting services:
 
 ```bash
-docker compose up -d postgres dragonfly ray-head
+docker compose up -d postgres dragonfly
 ```
 
 Build the application image:
@@ -242,6 +242,24 @@ workspace/ecommerce-demo/
 ├── checkpoints/
 └── .agentos/project.json
 ```
+## Running tests
+
+```bash
+pytest
+```
+## Known limitations
+
+This is a starter scaffold. A few things are defined but not fully wired up yet:
+
+- `StagnationWatchdog` currently fails silently every cycle due to a query
+  string bug (missing `f`-string prefix), so loop/stagnation detection does
+  not actually run yet.
+- `REQUIRE_HUMAN_APPROVAL` / `REQUIRE_REVIEW` policy decisions are returned
+  by the guardrail engine, but nothing yet routes these to an actual human
+  reviewer — they currently just block the action for that round.
+- `TRIGGER_REPLANNING` (from `DoDWatchdog`) is detected but no automatic
+  replanning logic consumes it yet.
+- `AgentIdentity` model is defined but not yet constructed/used anywhere.
 
 ### Preview the bootstrap plan
 
