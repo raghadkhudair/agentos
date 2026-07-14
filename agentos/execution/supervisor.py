@@ -6,38 +6,43 @@ import shlex
 import uuid
 import ray
 import structlog
+import json
 
 from agentos.config.settings import Settings
-from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision
+from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision, RiskLevel
 from agentos.config.loader import guardrail_policies
+from agentos.storage.database import DatabaseManager
 
 logger = structlog.get_logger()
 
 
 @ray.remote(namespace="agentos")
 class ExecutionSupervisorActor:
-    """The absolute execution boundary for all agents.
-
-    Applies governance guardrail matrices first, manages parallel branch isolation 
-    via Git-per-task worktree workflows, and executes commands inside isolated Docker environments.
-    """
 
     def __init__(self, settings_payload: dict):
         from agentos.governance.policy_engine import PolicyEngine
+        from redis.asyncio import Redis
 
         self.settings = Settings(**settings_payload) if settings_payload else Settings()
         self.policy_engine = PolicyEngine(self.settings)
         self._sandbox_cfg = guardrail_policies()["execution_sandbox"]
         self.workspace_path = os.path.abspath(self.settings.workspace)
         self.worktrees_dir = os.path.join(self.workspace_path, ".agentos_worktrees")
+        self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)        
+        self.db_manager = DatabaseManager(self.settings)
+        self._connected = False
         
         os.makedirs(self.workspace_path, exist_ok=True)
         os.makedirs(self.worktrees_dir, exist_ok=True)
         
         self._initialize_git_workspace_safely()
 
+    async def _ensure_connected(self) -> None:
+        if not self._connected:
+            await self.db_manager.connect()
+            self._connected = True
+
     def _initialize_git_workspace_safely(self) -> None:
-        """Ensures the sandbox workspace is an initialized repository tracking baseline branches."""
         git_dir = os.path.join(self.workspace_path, ".git")
         if not os.path.exists(git_dir):
             try:
@@ -54,9 +59,58 @@ class ExecutionSupervisorActor:
             except Exception as e:
                 logger.error("sandbox_git_initialization_failed", error=str(e))
 
+    async def _verify_decision_conflict(self, action: ActionRequest) -> bool:
+        await self._ensure_connected()
+        safe_project_id = uuid.UUID(action.project_id) if isinstance(action.project_id, str) else action.project_id
+        
+        query = "SELECT title, content FROM memory_items WHERE project_id = $1 AND scope = 'decision';"
+        try:
+            async with self.db_manager.pool.acquire() as conn:
+                rows = await conn.fetch(query, safe_project_id)
+                if not rows:
+                    return False
+                
+                provider_gateway = ray.get_actor("provider_gateway", namespace="agentos")
+                
+                decisions_context = "\n".join([f"- Title: {r['title']} | Rule: {r['content']}" for r in rows])
+                
+                system_prompt = (
+                    "You are the Decision Conflict Gatekeeper for AgentOS.\n"
+                    "Your single job is to compare a proposed agent Action Description against established, "
+                    "unchangeable project decisions to detect logical contradictions or violations.\n\n"
+                    f"ESTABLISHED PROJECT DECISIONS:\n{decisions_context}\n\n"
+                    "Respond with a single raw JSON object matching this schema shape exactly:\n"
+                    "{\n"
+                    "  \"conflict_detected\": true | false,\n"
+                    "  \"reason\": \"Detailed reason explaining why there is a conflict, or empty string if allowed\"\n"
+                    "}"
+                )
+                
+                user_prompt = f"Proposed Action Type: {action.action_type}\nDescription: {action.description}"
+                
+                from agentos.provider.gateway import ProviderRequest
+                req = ProviderRequest(
+                    purpose="decision_conflict_check",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    budget_key=action.project_id
+                )
+                
+                res = await provider_gateway.get_completion.remote(req, response_format={"type": "json_object"})
+                parsed_res = json.loads(res["content"])
+                
+                if parsed_res.get("conflict_detected", False):
+                    logger.warning("decision_conflict_blocked", agent_id=action.agent_id, reason=parsed_res.get("reason"))
+                    return True
+                    
+        except Exception as e:
+            logger.error("decision_conflict_check_failed_failing_safe", error=str(e))
+            
+        return False
+
     async def request_execution(self, action: dict) -> dict:
-        """Receives serialized dictionary payloads from remote agent workers."""
-        # Restore dict payload into valid ActionRequest model object
         action_obj = ActionRequest(**action)
         result: GuardrailResult = self.policy_engine.evaluate_action(action_obj)
         
@@ -72,6 +126,14 @@ class ExecutionSupervisorActor:
             logger.warning("policy_execution_blocked", agent_id=action_obj.agent_id, decision=result.decision, reasons=result.reasons)
             return {"executed": False, "guardrail": result.model_dump(), "error": "Action blocked by policy."}
             
+        if await self._verify_decision_conflict(action_obj):
+            conflict_result = GuardrailResult(
+                decision=PolicyDecision.DENY,
+                risk_level=RiskLevel.HIGH,
+                reasons=["Action conflicts with prior accepted project or architectural decisions."]
+            )
+            return {"executed": False, "guardrail": conflict_result.model_dump(), "error": "Action blocked due to established decision conflict."}
+
         if result.decision in {
             PolicyDecision.REQUIRE_HUMAN_APPROVAL,
             PolicyDecision.REQUIRE_REVIEW,
@@ -89,11 +151,9 @@ class ExecutionSupervisorActor:
         }
 
     async def _route_and_execute(self, action: ActionRequest) -> dict:
-        """Routes approved tasks to their targeted worktree isolation folders."""
         action_type = action.action_type
         payload = action.payload or {}
         
-        # Isolated, safe directory per agent and task
         task_branch_id = f"task-branch-{action.agent_id}"
         worktree_path = os.path.join(self.worktrees_dir, action.agent_id)
         
@@ -101,8 +161,12 @@ class ExecutionSupervisorActor:
         
         if action_type in {"write_file", "write_code"}:
             actual_payload = payload.get("payload", payload) if "payload" in payload else payload
+            
+            # Extract target task ID passed in by the worker's decision payload
+            task_id = payload.get("target_task_id") or actual_payload.get("target_task_id")
+            
             await self._ensure_worktree_context(task_branch_id, worktree_path)
-            res = self._write_file_safely(actual_payload, worktree_path)
+            res = await self._write_file_safely(actual_payload, worktree_path, action.agent_id, action.project_id, task_id)
             if "success" in res:
                 await self._commit_worktree_changes(worktree_path, f"Agent {action.agent_id} modification commit.")
             return res
@@ -110,7 +174,7 @@ class ExecutionSupervisorActor:
         elif action_type == "read_file":
             actual_payload = payload.get("payload", payload) if "payload" in payload else payload
             await self._ensure_worktree_context(task_branch_id, worktree_path)
-            return self._read_file_safely(actual_payload, worktree_path)
+            return await self._read_file_safely(actual_payload, worktree_path)
             
         elif action_type in {"shell_command", "run_command"}:
             actual_payload = payload.get("payload", payload) if "payload" in payload else payload
@@ -120,12 +184,10 @@ class ExecutionSupervisorActor:
             return {"output": f"Action type '{action_type}' processed successfully, no internal driver assigned."}
 
     async def _ensure_worktree_context(self, branch_name: str, worktree_path: str) -> None:
-        """Guarantees a dedicated Git worktree exists for this agent workspace."""
         if os.path.exists(worktree_path):
-            return  # Already configured and isolated
+            return
 
         try:
-            # Check if branch already exists
             check_branch = await asyncio.create_subprocess_shell(
                 f"git rev-parse --verify {shlex.quote(branch_name)}",
                 stdout=asyncio.subprocess.PIPE,
@@ -135,10 +197,8 @@ class ExecutionSupervisorActor:
             stdout, _ = await check_branch.communicate()
             
             if check_branch.returncode == 0:
-                # Branch exists, append worktree directly to it
                 cmd = f"git worktree add {shlex.quote(worktree_path)} {shlex.quote(branch_name)}"
             else:
-                # Branch doesn't exist, create branch and map worktree
                 cmd = f"git worktree add -b {shlex.quote(branch_name)} {shlex.quote(worktree_path)}"
 
             proc = await asyncio.create_subprocess_shell(
@@ -152,7 +212,6 @@ class ExecutionSupervisorActor:
             logger.error("failed_to_initialize_worktree", error=str(e))
 
     async def _commit_worktree_changes(self, worktree_path: str, commit_msg: str) -> None:
-        """Saves file additions into the active Git worktree branch repository."""
         try:
             cmd = (
                 "git add . && "
@@ -168,7 +227,7 @@ class ExecutionSupervisorActor:
         except Exception:
             pass
 
-    def _write_file_safely(self, payload: dict, worktree_path: str) -> dict:
+    async def _write_file_safely(self, payload: dict, worktree_path: str, agent_id: str, project_id: str, task_id: str | None = None) -> dict:
         file_path = payload.get("file_path")
         content = payload.get("content", "")
         if not file_path:
@@ -178,7 +237,60 @@ class ExecutionSupervisorActor:
         if not full_path.startswith(worktree_path):
             logger.error("path_traversal_attack_blocked", attempted_path=file_path)
             return {"error": "Path traversal detected. Write blocked for safety."}
-            
+
+        # --- Task Path-Safety Guardrails ---
+        if task_id:
+            await self._ensure_connected()
+            try:
+                task_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
+                query = "SELECT allowed_paths, blocked_paths FROM tasks WHERE id = $1;"
+                async with self.db_manager.pool.acquire() as conn:
+                    task_record = await conn.fetchrow(query, task_uuid)
+                    
+                    if task_record:
+                        allowed_patterns = task_record["allowed_paths"] or []
+                        blocked_patterns = task_record["blocked_paths"] or []
+                        
+                        # Normalize target file path for exact pattern checking
+                        normalized_target = file_path.replace("\\", "/").strip("/")
+
+                        # Rule 1: Check Blocked Paths (Explicit Blacklist)
+                        for pattern in blocked_patterns:
+                            clean_pattern = pattern.replace("\\", "/").strip("/")
+                            if normalized_target.startswith(clean_pattern) or clean_pattern in normalized_target:
+                                logger.critical("security_escalation_blocked_path_violation", agent_id=agent_id, file=file_path)
+                                return {"error": f"Security boundary violation: Edits to '{file_path}' are explicitly BLOCKED for this task."}
+
+                        # Rule 2: Check Allowed Paths (Explicit Whitelist, if defined)
+                        if allowed_patterns:
+                            is_allowed = False
+                            for pattern in allowed_patterns:
+                                clean_pattern = pattern.replace("\\", "/").strip("/")
+                                if normalized_target.startswith(clean_pattern) or clean_pattern in normalized_target:
+                                    is_allowed = True
+                                    break
+                            
+                            if not is_allowed:
+                                logger.critical("security_escalation_allowed_path_violation", agent_id=agent_id, file=file_path)
+                                return {"error": f"Security boundary violation: Edits to '{file_path}' fall outside allowed task paths {allowed_patterns}."}
+
+            except Exception as e:
+                logger.error("failed_to_enforce_task_path_safety_failing_closed", error=str(e))
+                return {"error": "Internal security guardrail failure. Write aborted."}
+
+        # Dynamic File-Path Distributed Lock
+        file_lock_key = f"project:{project_id}:file_lock:{file_path}"
+        try:
+            lock_owner = await self.redis_client.get(file_lock_key)
+            if lock_owner and lock_owner != agent_id:
+                logger.warning("file_locked_by_another_agent", file_path=file_path, locked_by=lock_owner, attempted_by=agent_id)
+                return {"error": f"Conflict detected: File '{file_path}' is currently locked by active agent '{lock_owner}'."}
+                
+            await self.redis_client.set(file_lock_key, agent_id, ex=120)
+        except Exception as e:
+            logger.error("file_lock_infrastructure_error", error=str(e))
+            return {"error": "Lock database error during path verification."}
+
         target_dir = os.path.dirname(full_path)
         os.makedirs(target_dir, exist_ok=True)
             
@@ -206,7 +318,6 @@ class ExecutionSupervisorActor:
         return {"success": True, "content": content}
 
     async def _execute_sandboxed_docker_command(self, payload: dict, worktree_path: str) -> dict:
-        """Executes shell utilities isolated inside a Docker sandbox container."""
         command_str = payload.get("command")
         if not command_str:
             return {"error": "Missing 'command' string key inside execution payload."}
@@ -238,7 +349,6 @@ class ExecutionSupervisorActor:
                 "stderr": stderr_bytes.decode("utf-8", errors="replace")
             }
         except asyncio.TimeoutError:
-            
             kill_proc = await asyncio.create_subprocess_shell(f"docker kill {container_name}")
             await kill_proc.communicate()
             
@@ -248,10 +358,14 @@ class ExecutionSupervisorActor:
             return {"error": f"Failed to execute process inside sandbox container: {str(e)}"}
 
     async def prune_worktree_resources(self, agent_id: str) -> None:
-        """Cleans up disk workspace allocations once tasks complete."""
         worktree_path = os.path.join(self.worktrees_dir, agent_id)
         if os.path.exists(worktree_path):
             try:
+                async for key in self.redis_client.scan_iter(f"project:*:file_lock:*"):
+                    owner = await self.redis_client.get(key)
+                    if owner == agent_id:
+                        await self.redis_client.delete(key)
+                        
                 proc = await asyncio.create_subprocess_shell(
                     f"git worktree prune && rm -rf {shlex.quote(worktree_path)}",
                     cwd=self.workspace_path
@@ -261,10 +375,6 @@ class ExecutionSupervisorActor:
                 logger.error("worktree_cleanup_failed", agent_id=agent_id, error=str(e))
 
     async def merge_and_finalize_branch(self, agent_id: str, commit_msg: str | None = None) -> dict:
-        """
-        Safely merges an approved agent's task branch back into the main branch,
-        runs integration verification inside Docker, and prunes the worktree.
-        """
         branch_name = f"task-branch-{agent_id}"
         worktree_path = os.path.join(self.worktrees_dir, agent_id)
         default_branch = self._sandbox_cfg['default_branch']
@@ -275,10 +385,8 @@ class ExecutionSupervisorActor:
             return {"success": False, "error": f"No active worktree found for agent {agent_id}."}
 
         try:
-            # Step 1: Ensure all files in the worktree are committed first
             await self._commit_worktree_changes(worktree_path, commit_msg or f"Final checkout commit before merging {agent_id}.")
 
-            # Step 2: Switch the main workspace folder to the default branch (e.g., 'main')
             switch_main = await asyncio.create_subprocess_shell(
                 f"git checkout {shlex.quote(default_branch)}",
                 stdout=asyncio.subprocess.PIPE,
@@ -287,8 +395,6 @@ class ExecutionSupervisorActor:
             )
             await switch_main.communicate()
 
-            # Step 3: Perform the merge operation into 'main'
-            # We use --no-ff (no-fast-forward) to preserve the history of who did what task
             merge_cmd = f"git merge {shlex.quote(branch_name)} --no-ff -m 'Merge task branch {branch_name} into {default_branch}'"
             merge_proc = await asyncio.create_subprocess_shell(
                 merge_cmd,
@@ -301,28 +407,21 @@ class ExecutionSupervisorActor:
             if merge_proc.returncode != 0:
                 err_msg = stderr.decode().strip()
                 logger.error("merge_conflict_detected", branch=branch_name, error=err_msg)
-                # If a merge conflict happens, we abort the merge to keep the main branch clean!
                 abort_proc = await asyncio.create_subprocess_shell("git merge --abort", cwd=self.workspace_path)
                 await abort_proc.communicate()
                 return {"success": False, "error": f"Merge conflict occurred: {err_msg}. Merge aborted."}
 
-            # Step 4: Run a full suite integration check inside a Docker Sandbox
-            # This ensures that combining this developer's code with the main branch didn't break anything!
             integration_cmd = "pytest tests/ || echo 'No integration tests configured.'"
             integration_res = await self._execute_sandboxed_docker_command({"command": integration_cmd}, self.workspace_path)
             
             if integration_res.get("exit_code", 0) != 0:
                 logger.error("integration_tests_failed_after_merge", output=integration_res.get("stderr"))
-                # Hard Rollback to the commit before merge
                 rollback_proc = await asyncio.create_subprocess_shell(f"git reset --hard HEAD~1", cwd=self.workspace_path)
                 await rollback_proc.communicate()
                 return {"success": False, "error": "Integration tests failed after merging. Rolled back changes."}
 
-            # Step 5: Prune the worktree and clean up disk space
-            # This removes the temporary worktree link and safely deletes the folder
             await self.prune_worktree_resources(agent_id)
 
-            # Step 6: Delete the local task branch now that it has been safely merged
             delete_branch_proc = await asyncio.create_subprocess_shell(
                 f"git branch -d {shlex.quote(branch_name)}",
                 cwd=self.workspace_path

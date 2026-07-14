@@ -13,11 +13,6 @@ logger = structlog.get_logger()
 
 @ray.remote(namespace="agentos")
 class TriggerEngineActor:
-    """The guarded, asynchronous event routing actor for AgentOS.
-
-    Listens to Dragonfly streams and safely handles interrupt levels, avoids 
-    unnecessary wakeups, detects squad handoffs, and maps artifact consumers.
-    """
 
     def __init__(self, dragonfly_url: str):
         self.bus = DragonflyBus(dragonfly_url)
@@ -25,32 +20,52 @@ class TriggerEngineActor:
         self.is_running = False
 
     async def register_subscription(self, event_type: str, agent_id: str) -> None:
-        """Registers an agent's explicit interest in a specific type of event."""
         if event_type not in self.subscriptions:
             self.subscriptions[event_type] = set()
         self.subscriptions[event_type].add(agent_id)
         logger.info("subscription_registered", event_type=event_type, agent_id=agent_id)
 
     async def start_routing_loop(self, project_id: str) -> None:
-        """Starts the background listening daemon using Dragonfly consumer streams."""
         self.is_running = True
-        stream_key = f"project:{project_id}:events"
+        
+        # Define all mandated architectural topic categories
+        topics = [
+            f"project.{project_id}.events",
+            f"project.{project_id}.tasks",
+            f"project.{project_id}.contracts",
+            f"project.{project_id}.reviews",
+            f"project.{project_id}.tests",
+            f"project.{project_id}.blockers",
+            f"project.{project_id}.checkpoints",
+            f"project.{project_id}.summaries",
+            "squad.backend.events",
+            "squad.frontend.events",
+            "squad.platform.events",
+            "squad.qa.events"
+        ]
+        
         group_name = "trigger_engine_group"
         consumer_name = f"engine_processor_{ray.get_runtime_context().get_actor_id()}"
 
-        try:
-            await self.bus.redis.xgroup_create(stream_key, group_name, mkstream=True)
-        except Exception:
-            pass
+        # Safe multi-stream group registration
+        for topic in topics:
+            try:
+                await self.bus.redis.xgroup_create(topic, group_name, mkstream=True)
+            except Exception:
+                pass
 
-        logger.info("trigger_engine_loop_activated", project_id=project_id, stream=stream_key)
+        logger.info("trigger_engine_multi_topic_loop_activated", project_id=project_id, active_topics=topics)
 
         while self.is_running:
             try:
+                # Read across all registered streams simultaneously using XREADGROUP
+                # Passing ">" reads only new messages for our group
+                streams_to_read = {topic: ">" for topic in topics}
+                
                 response = await self.bus.redis.xreadgroup(
                     groupname=group_name,
                     consumername=consumer_name,
-                    streams={stream_key: ">"},
+                    streams=streams_to_read,
                     count=5,
                     block=1000
                 )
@@ -59,7 +74,7 @@ class TriggerEngineActor:
                     await asyncio.sleep(0.1)
                     continue
 
-                for _, items in response:
+                for stream_key, items in response:
                     for message_id, fields in items:
                         raw_event = fields.get("event")
                         if not raw_event:
@@ -70,6 +85,7 @@ class TriggerEngineActor:
                         
                         await self._route_event(event)
                         
+                        # Acknowledge the message was safely processed on this specific stream
                         await self.bus.redis.xack(stream_key, group_name, message_id)
 
             except asyncio.CancelledError:
@@ -80,7 +96,6 @@ class TriggerEngineActor:
                 await asyncio.sleep(1.0)
 
     async def _route_event(self, event: Event) -> None:
-        """Evaluates guardrails, interrupt level, consumers, and dispatches events."""
         event_type_str = event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type)
         subscribers = set(self.subscriptions.get(event_type_str, set()))
         
@@ -96,9 +111,8 @@ class TriggerEngineActor:
                 subscribers = subscribers.union(review_subs)
                 logger.info("agent_handoff_opportunity_detected", routing_to=list(review_subs))
 
-       
         interrupt_level = "NORMAL"
-        if event_type_str in {"SECURITY_ALERT", "BLOCKER_CREATED"}:
+        if event_type_str in {"SECURITY_ALERT", "BLOCKER_CREATED", "BLOCKER"}:
             interrupt_level = "CRITICAL_INTERRUPT"
             logger.warning("high_priority_interrupt_detected", event_type=event_type_str)
 
@@ -108,14 +122,12 @@ class TriggerEngineActor:
 
             is_busy = await self.bus.redis.exists(busy_lock_key)
             
-     
             await self.bus.redis.rpush(inbox_key, event.model_dump_json())
 
             if is_busy and interrupt_level == "NORMAL":
                 logger.info("skipping_unnecessary_wakeup_agent_busy", agent_id=agent_id)
                 continue
 
-          
             wakeup_payload = {
                 "signal": "NEW_EVENT",
                 "interrupt_level": interrupt_level,
@@ -125,5 +137,4 @@ class TriggerEngineActor:
             logger.info("📡 event_dispatched_to_inbox", agent_id=agent_id, event_type=event_type_str)
 
     def stop(self) -> None:
-        """Gracefully halts the subscription dispatcher loop."""
         self.is_running = False

@@ -1,3 +1,11 @@
+team_constraints:
+  role_caps:
+    PM_TECH_LEAD: 1
+    SOLUTION_ARCHITECT: 2
+  mandatory_safety_additions:
+    if_roles_present: ["BACKEND_DEVELOPER", "FRONTEND_DEVELOPER"]
+    inject_roles: ["PM_TECH_LEAD", "SECURITY_REVIEWER"]
+    
 roles:
   - role: PM_TECH_LEAD
     description: "Owns planning, coordination, and overall delivery gating."

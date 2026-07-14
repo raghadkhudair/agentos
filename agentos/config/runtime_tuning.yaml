@@ -1,5 +1,5 @@
 ray:
-  num_cpus: 1                                # Dynamically limits cores to protect memory
+  num_cpus: 1                                
   object_store_memory:   100000000           
   gcs_rpc_server_reconnect_timeout_s: 60
 
@@ -20,6 +20,7 @@ agent_limits:
   max_agents_total: 2                       
   max_active_agents: 2
   max_threads_per_agent: 2  
+  max_parallel_code_tasks: 2
 
 embedding:
   dimension: 768

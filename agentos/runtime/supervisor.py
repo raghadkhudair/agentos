@@ -8,7 +8,7 @@ import structlog
 
 from agentos.actors.bootstrap import BootstrapAgentActor
 from agentos.config.settings import Settings
-from agentos.runtime.team_plan import AgentSpec, TeamPlan, ValidatedTeamPlan
+from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedTeamPlan
 from agentos.watchdogs.runtime_watchdogs import StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
 
 # Infrastructure imports
@@ -153,12 +153,14 @@ class RuntimeSupervisorActor:
         init_event = Event(
             project_id=db_project_id,
             event_type=EventType.PROJECT_CREATED,
-            topic=unified_stream_key,
+            topic=f"project.{db_project_id}.events", 
             payload={"user_request": user_request, "dod": validated.original.dod}
         )
         
+        target_stream_key = init_event.get_target_topic() 
+        
         await event_repo.save_event(db_project_id, init_event)
-        await self.dragonfly.publish_event(unified_stream_key, init_event)
+        await self.dragonfly.publish_event(target_stream_key, init_event)
 
         target_pm_name = first_pm_identity if first_pm_identity else f"{validated.agents[0].role.value}-1"
         logger.info("activating_primary_technical_lead_agent", target_pm_name=target_pm_name)
@@ -186,29 +188,95 @@ class RuntimeSupervisorActor:
         return {"status": "resumed", "project_id": project_id}
 
     def validate_team_plan(self, plan: TeamPlan) -> ValidatedTeamPlan:
-        """Enforces limits on maximum total agents."""
-        max_allowed = tuning_cfg["agent_limits"]["max_agents_total"]
-        if plan.total_agents <= max_allowed:
-            return ValidatedTeamPlan(
-                original=plan, agents=plan.agents, total_agents=plan.total_agents, reduced=False,
-            )
-
-        reduced_agents: list[AgentSpec] = []
-        remaining = max_allowed
+        """Enforces robust safety rules and strict agent limits derived dynamically from yaml configuration assets."""
+        import copy
+        from agentos.config.loader import team_roles, runtime_tuning
+        
+        # Load the configuration data maps dynamically
+        roles_cfg = team_roles()
+        tuning_cfg = runtime_tuning()
+        
+        constraints = roles_cfg.get("team_constraints", {})
+        role_caps = constraints.get("role_caps", {})
+        safety_rules = constraints.get("mandatory_safety_additions", {})
+        
+        max_total = tuning_cfg["agent_limits"]["max_agents_total"]
+        max_active = tuning_cfg["agent_limits"]["max_active_agents"]
+        max_parallel_tasks = tuning_cfg.get("agent_limits", {}).get("max_parallel_code_tasks", 2)
+        
+        reasons = []
+        validated_agents: list[AgentSpec] = []
+        
+        present_role_strings = {spec.role.value.upper() for spec in plan.agents}
+        
+        # Phase A: Enforce Dynamic Role-Specific Caps from Config File
         for spec in plan.agents:
-            if remaining <= 0:
-                break
-            count = min(spec.count, remaining)
-            reduced_agents.append(spec.model_copy(update={"count": count}))
-            remaining -= count
+            spec_copy = spec.model_copy()
+            role_enum_str = spec_copy.role.value.upper()
+            
+            if role_enum_str in role_caps:
+                allowed_cap = int(role_caps[role_enum_str])
+                if spec_copy.count > allowed_cap:
+                    spec_copy.count = allowed_cap
+                    reasons.append(f"Capped role {role_enum_str} to configuration file maximum count of {allowed_cap}.")
+                    
+            validated_agents.append(spec_copy)
+
+        # Phase B: Enforce Dynamic Required Safety Roles from Config File
+        trigger_roles = safety_rules.get("if_roles_present", [])
+        inject_roles = safety_rules.get("inject_roles", [])
+        
+        # Check if any trigger roles (like BACKEND_DEVELOPER) are currently on the proposed roster
+        if any(tr.upper() in present_role_strings for tr in trigger_roles):
+            for role_to_inject in inject_roles:
+                role_to_inject_upper = role_to_inject.upper()
+                
+                if role_to_inject_upper not in present_role_strings:
+                    # Look up standard template mapping defaults defined in roles array block
+                    template = next((r for r in roles_cfg.get("roles", []) if r["role"].upper() == role_to_inject_upper), {})
+                    
+                    validated_agents.append(
+                        AgentSpec(
+                            role=AgentRole[role_to_inject_upper] if hasattr(AgentRole, role_to_inject_upper) else AgentRole.PM_TECH_LEAD,
+                            count=1,
+                            description=f"Automatically injected via compliance configurations.",
+                            memory_scopes=template.get("default_memory_scopes", ["project"]),
+                            allowed_action_categories=template.get("allowed_action_categories", ["implement"]),
+                            ownership_domains=[role_to_inject_lower := role_to_inject.lower()],
+                            event_subscriptions=template.get("default_event_subscriptions", ["PROJECT_CREATED"])
+                        )
+                    )
+                    reasons.append(f"Injected mandatory safety role compliance asset: {role_to_inject_upper}.")
+                    present_role_strings.add(role_to_inject_upper)
+
+        # Phase C: Enforce Maximum Total Agent limits from tuning yaml
+        running_total = sum(a.count for a in validated_agents)
+        if running_total > max_total:
+            reasons.append(f"Enforced tuning block limit: reduced total team sizing from {running_total} to cap boundary {max_total}.")
+            final_agents: list[AgentSpec] = []
+            remaining = max_total
+            
+            for spec in validated_agents:
+                if remaining <= 0:
+                    break
+                count = min(spec.count, remaining)
+                final_agents.append(spec.model_copy(update={"count": count}))
+                remaining -= count
+            validated_agents = final_agents
+            running_total = sum(a.count for a in validated_agents)
+
+        reduction_reason = "; ".join(reasons) if reasons else None
+        
         return ValidatedTeamPlan(
             original=plan,
-            agents=reduced_agents,
-            total_agents=sum(agent.count for agent in reduced_agents),
-            reduced=True,
-            reduction_reason="Configured max_agents_total constraint enforced.",
+            agents=validated_agents,
+            total_agents=running_total,
+            max_active_agents=max_active,
+            max_parallel_code_tasks=max_parallel_tasks,
+            reduced=len(reasons) > 0,
+            reduction_reason=reduction_reason
         )
-
+    
     async def create_agent_actors(self, specs: Iterable[AgentSpec], project_id: str) -> list[dict]:
         """Spawns Ray agent actors and registers them for health monitoring."""
         from agentos.actors.base import AgentWorkerActor

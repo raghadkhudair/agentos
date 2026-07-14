@@ -24,7 +24,6 @@ class AgentSpec(BaseModel):
     allowed_action_categories: list[str] = Field(default_factory=list)
     ownership_domains: list[str] = Field(default_factory=list)
     event_subscriptions: list[str] = Field(default_factory=list) 
-    
 
 
 class TeamPlan(BaseModel):
@@ -44,5 +43,7 @@ class ValidatedTeamPlan(BaseModel):
     original: TeamPlan
     agents: list[AgentSpec]
     total_agents: int
+    max_active_agents: int
+    max_parallel_code_tasks: int
     reduced: bool
     reduction_reason: str | None = None

@@ -2,15 +2,10 @@ from __future__ import annotations
 
 from agentos.config.settings import Settings
 from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision, RiskLevel
-
 from agentos.config.loader import guardrail_policies
 
-class PolicyEngine:
-    """Deterministic governance layer for agent actions.
 
-    Enforces immutable zero-trust filters and tracks stateful 
-    quarantine boundaries to isolate compromised agents.
-    """
+class PolicyEngine:
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -23,16 +18,13 @@ class PolicyEngine:
         self._quarantine_threshold = cfg["safety_watchdog"]["blocked_call_quarantine_threshold"]
 
     def quarantine_agent(self, agent_id: str) -> None:
-        """Forcibly isolates an agent worker and blocks all future execution permissions."""
         self._quarantined_agents.add(agent_id)
         print(f"🚨 [POLICY SECURITY BLACKLIST]: Agent '{agent_id}' has been moved to QUARANTINE.")
 
     def lift_quarantine(self, agent_id: str) -> None:
-        """Manually releases an agent from quarantine following out-of-band remediation."""
         self._quarantined_agents.discard(agent_id)
 
     def evaluate_action(self, request: ActionRequest) -> GuardrailResult:
-        # 1. Stateful Quarantine Interception Gate
         if request.agent_id in self._quarantined_agents:
             return GuardrailResult(
                 decision=PolicyDecision.QUARANTINE_AGENT,
@@ -41,7 +33,6 @@ class PolicyEngine:
                 constraints=["Revoke all filesystem access.", "Block outbound provider gateway calls immediately."]
             )
 
-        # 2. Destructive Command Extraction Filter Scanning
         text = " ".join(
             part for part in [request.description, request.command, request.database_operation] if part
         ).lower()
@@ -70,11 +61,9 @@ class PolicyEngine:
                 reasons=["High-impact engineering action requires independent review."],
             )
 
-        # 3. Low Risk: Static, passive read/write actions
         if request.action_type in self._low_risk_types:
             return GuardrailResult(decision=PolicyDecision.ALLOW, risk_level=RiskLevel.LOW)
         
-        # 4. Medium Risk: Shell execution commands
         if request.action_type in self._medium_risk_types:
             return GuardrailResult(
                 decision=PolicyDecision.ALLOW_WITH_CONSTRAINTS,

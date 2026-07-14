@@ -10,13 +10,9 @@ from agentos.config.settings import load_settings
 from agentos.config.loader import team_roles
 from agentos.messaging.events import EventType
 
+
 @ray.remote(max_restarts=-1, max_task_retries=3)
 class BootstrapAgentActor:
-    """The first-run PM/Tech Lead agent.
-
-    Analyzes the user's request against the strict role definitions provided in the 
-    actor_team configuration file, choosing the optimized squad composition.
-    """
 
     def __init__(self, project_id: str):
         self.project_id = project_id
@@ -24,14 +20,8 @@ class BootstrapAgentActor:
         self.provider = ProviderGateway(self.settings)
 
     async def create_team_plan(self, user_request: str, max_agents_total: int) -> dict:
-        """
-        Queries the provider gateway with the available configuration profiles to select
-        the optimized team structure, definitions, and milestones.
-        """
-        # Load the configuration source of truth
         roles_cfg = team_roles()
         
-        # Build clear profile documentation dynamically for the LLM prompt context
         role_profiles = []
         role_names_list = []
         for r in roles_cfg.get("roles", []):
@@ -119,10 +109,8 @@ class BootstrapAgentActor:
             
             running_count += count
             
-            # Look up the strict role configuration matching the AI's selection
             role_template = next((r for r in roles_cfg.get("roles", []) if r["role"].upper() == role_str), {})
             
-            # Map the variables directly from the YAML definition file
             validated_agents.append(
                 AgentSpec(
                     role=AgentRole[role_str] if hasattr(AgentRole, role_str) else AgentRole.PM_TECH_LEAD,

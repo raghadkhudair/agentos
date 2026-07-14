@@ -54,16 +54,37 @@ class TaskRepository:
         description: str, 
         owner_agent_id: str = None,
         parent_task_id: str = None,
-        priority: int = 3
+        priority: int = 3,
+        allowed_paths: list[str] = None,
+        blocked_paths: list[str] = None,
+        required_reviewers: list[str] = None,
+        affected_contracts: list[str] = None,
+        risk_level: str = "LOW"
     ) -> str:
         query = """
-            INSERT INTO tasks (project_id, title, description, owner_agent_id, parent_task_id, priority)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO tasks (
+                project_id, title, description, owner_agent_id, parent_task_id, priority, 
+                allowed_paths, blocked_paths, required_reviewers, affected_contracts, risk_level
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id;
         """
         p_uuid = UUID(parent_task_id) if parent_task_id else None
         async with self.db.pool.acquire() as conn:
-            task_id = await conn.fetchval(query, UUID(project_id), title, description, owner_agent_id, p_uuid, priority)
+            task_id = await conn.fetchval(
+                query, 
+                UUID(project_id) if isinstance(project_id, str) else project_id, 
+                title, 
+                description, 
+                owner_agent_id, 
+                p_uuid, 
+                priority,
+                allowed_paths or [],
+                blocked_paths or [],
+                required_reviewers or [],
+                affected_contracts or [],
+                risk_level
+            )
             return str(task_id)
 
     async def add_dependency(self, task_id: str, depends_on_task_id: str) -> None:
@@ -85,6 +106,11 @@ class TaskRepository:
                 t.owner_agent_id,
                 t.priority,
                 t.parent_task_id::text,
+                t.allowed_paths,
+                t.blocked_paths,
+                t.required_reviewers,
+                t.affected_contracts,
+                t.risk_level,
                 COALESCE(
                     ARRAY_AGG(td.depends_on_task_id::text) FILTER (WHERE td.depends_on_task_id IS NOT NULL), 
                     '{}'::text[]
@@ -99,17 +125,6 @@ class TaskRepository:
         async with self.db.pool.acquire() as conn:
             rows = await conn.fetch(query, safe_id)
             return [dict(row) for row in rows]
-
-    async def update_task_status(self, task_id: str, status: str) -> None:
-        try:
-            safe_task_uuid = UUID(task_id)
-        except ValueError:
-            print(f" [WARNING]: Agent provided an invalid task ID for status update: {task_id}")
-            return
-            
-        query = "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2"
-        async with self.db.pool.acquire() as conn:
-            await conn.execute(query, status, safe_task_uuid)
 
 class ArtifactRepository:
     def __init__(self, db_manager: DatabaseManager):
