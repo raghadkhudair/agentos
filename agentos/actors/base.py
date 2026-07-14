@@ -36,30 +36,40 @@ logger = structlog.get_logger()
 class AgentWorkerActor:
     """Long-running Ray actor representing an asynchronous, event-driven specialized developer."""
 
-    def __init__(self, agent_id: str, role: str, project_id: str, settings: dict):
+    def __init__(self, agent_id: str, role: str, project_id: str, settings: dict, spec_payload: dict):
         self.agent_id = agent_id
         self.role = role
         self.project_id = project_id
         self.settings = Settings(**settings) if settings else Settings()
         
+        self.squad = spec_payload.get("squad", "engineering")
+        self.permissions = spec_payload.get("permissions", ["low_risk"])
+        self.memory_scopes = spec_payload.get("memory_scopes", ["project"])
+        self.allowed_actions = spec_payload.get("allowed_actions", ["implement"])
+        self.ownership_domains = spec_payload.get("ownership_domains", [])
+        self.event_subscriptions = spec_payload.get("event_subscriptions", [])
+        self.last_checkpoint_pointer = spec_payload.get("last_checkpoint_pointer", None)
+        
+        # Operational variables
         self.db_manager = DatabaseManager(self.settings)
         self.provider = ProviderGateway(self.settings)
-        self.checkpoints = CheckpointManager(self.db_manager)
+        
         
         self.status = "STARTING"
-        self.current_task_id: str | None = None
+        self.current_task_id = None
         self.is_running = False
 
     async def start(self) -> dict:
         from agentos.execution.supervisor import ExecutionSupervisor
 
         await self.db_manager.connect()
-        self.memory_broker = MemoryBroker(self.db_manager)
+        self.memory_broker = ray.get_actor("memory_broker", namespace="agentos")
+        self.supervisor = ray.get_actor("execution_supervisor", namespace="agentos")
+        self.checkpoints = ray.get_actor("checkpoint_manager", namespace="agentos") 
+
         self.task_repo = TaskRepository(self.db_manager)
         self.audit_repo = AuditEventRepository(self.db_manager)
         self.artifact_repo = ArtifactRepository(self.db_manager)
-        self.supervisor = ExecutionSupervisor(self.settings)
-
         self.provider.db_manager = self.db_manager
         self.provider.call_repo = ProviderCallRepository(self.db_manager)
         
@@ -73,7 +83,6 @@ class AgentWorkerActor:
         wakeup_channel = f"agent:{self.agent_id}:wakeup"
         await self.pubsub.subscribe(wakeup_channel) 
         
-        # Now pass execution down to the polling engine safely
         self._inbox_task = asyncio.create_task(self._inbox_listening_loop())
         
         logger.info("agent_started", agent_id=self.agent_id, role=self.role, project_id=self.project_id)
@@ -82,6 +91,7 @@ class AgentWorkerActor:
             "role": self.role,
             "project_id": self.project_id,
             "status": self.status,
+            "squad": self.squad
         }
 
     async def _inbox_listening_loop(self) -> None:
@@ -101,7 +111,7 @@ class AgentWorkerActor:
                     continue
 
                 event_dict = json.loads(raw_event_data)
-                await self.process_next_step(event_dict.get("event_id"))
+                asyncio.create_task(self.process_next_step(event_dict.get("event_id")))
             except Exception as e:
                 try:
                     asyncio.get_running_loop()
@@ -116,17 +126,25 @@ class AgentWorkerActor:
     async def process_next_step(self, event_id: str) -> dict:
         self.status = "DECIDE_NEXT_ACTION"
         
-        packet = await self.memory_broker.build_catchup_packet(
-            project_id=self.project_id, agent_id=self.agent_id, trigger_event_id=event_id, provider_gateway=self.provider  
+        # Scoped memory limits applied here during retrieval pipelines
+        # Inside AgentWorkerActor process_next_step:
+        packet = await self.memory_broker.build_catchup_packet.remote(
+            project_id=self.project_id,
+            agent_id=self.agent_id,
+            trigger_event_id=event_id,
+            agent_allowed_scopes=self.memory_scopes,
+            provider_gateway=self.provider
         )
 
-        # Build dynamic context mapping list
         active_tasks = await self.task_repo.get_active_tasks(self.project_id)
         
+        # Inform the LLM of its explicit operational limits and assigned domains
         system_prompt = (
-            f"You are {self.agent_id}, a {self.role}.\n"
+            f"You are {self.agent_id}, a {self.role} in the {self.squad} squad.\n"
+            f"Your ownership domains are: {json.dumps(self.ownership_domains)}.\n"
+            f"Your allowed action capabilities are: {json.dumps(self.allowed_actions)}.\n"
             f"Here are the ongoing uncompleted tasks for this project:\n{json.dumps(active_tasks)}\n"
-            "Choose the most critical task from the list above that matches your role.\n"
+            "Choose the most critical task from the list above that matches your role boundaries.\n"
             "CRITICAL: You must return the exact 'task_id' you are working on in your JSON response.\n\n"
             "SCHEMA LAYOUT:\n"
             "{\n"
@@ -143,16 +161,15 @@ class AgentWorkerActor:
             budget_key=self.project_id
         )
         
-        # 1. Fetch completion payload from gateway provider
-        response = await self.provider.get_completion(request, response_format={"type": "json_object"})
-        
-        # 2. EXTRACT AND CLEAN STRINGS (This defines clean_content!)
-        clean_content = response.content.strip()
+        response_dict = await self.provider.get_completion.remote(
+            request, 
+            response_format={"type": "json_object"}
+        )
+        clean_content = response_dict.content.strip()
         if clean_content.startswith("```"):
             clean_content = re.sub(r"^```json\s*|^```\s*", "", clean_content, flags=re.MULTILINE)
             clean_content = re.sub(r"\s*```$", "", clean_content, flags=re.MULTILINE).strip()
 
-        # 3. Parse JSON from the cleaned string payload safely
         try:
             decision = json.loads(clean_content)
             target_task_id = decision.get("target_task_id")
@@ -170,7 +187,7 @@ class AgentWorkerActor:
                 project_id=self.project_id, agent_id=self.agent_id, action_type=action_type, description=description, payload=payload
             )
             
-            exec_res = await self.supervisor.request_execution(action_req)
+            exec_res = await self.supervisor.request_execution.remote(action_req.model_dump())
             if action_type in {"write_file", "write_code"} and exec_res.get("executed"):
                 from agentos.actors.reviewer import ReviewerAgentActor
                 
@@ -178,18 +195,21 @@ class AgentWorkerActor:
                 review = await reviewer.review_code_patch.remote(payload.get("file_path", ""), payload.get("content", ""))
                 
                 if not review.get("approved", False):
-                    # Code failed validation! Log a blocker checkpoint and skip task completion
-                    await self.checkpoints.create(
-                        Checkpoint(
-                            checkpoint_id=str(uuid4()),
-                            project_id=self.project_id,
-                            agent_id=self.agent_id,
-                            achievement="review_failed",
-                            summary=f"Blocker: Code patch rejected by reviewer. Vulnerabilities: {review.get('vulnerabilities_found')}"
-                        )
-                    )
+                    error_checkpoint_data = Checkpoint(
+                        checkpoint_id=str(uuid4()),
+                        project_id=self.project_id,
+                        agent_id=self.agent_id,
+                        achievement="review_failed",
+                        summary=f"Blocker: Code patch rejected. Vulnerabilities: {review.get('vulnerabilities_found')}",
+                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
+                    ).model_dump() 
+
+                    checkpoint_res = await self.checkpoints.create.remote(error_checkpoint_data)
+                    
+                    self.last_checkpoint_pointer = checkpoint_res["checkpoint_id"]
                     self.status = "IDLE"
                     return {"status": "BLOCKED_BY_REVIEW"}
+
             policy_decision = exec_res.get("guardrail", {}).get("decision", "ALLOW")
             await self.audit_repo.log_audit_event(
                 project_id=self.project_id,
@@ -199,7 +219,6 @@ class AgentWorkerActor:
                 integrity_hash=action_req.integrity_hash
             )
 
-            
             if exec_res.get("executed") and target_task_id:
                 if action_type == "write_file":
                     await self.artifact_repo.create_artifact(
@@ -213,15 +232,17 @@ class AgentWorkerActor:
                 await self.task_repo.update_task_status(target_task_id, "COMPLETED")
                 logger.info("task_completed_by_agent", agent_id=self.agent_id, task_id=target_task_id)
 
-        checkpoint = await self.checkpoints.create(
-            Checkpoint(
-                checkpoint_id=str(uuid4()),
-                project_id=self.project_id,
-                agent_id=self.agent_id,
-                achievement="action_processed",
-                summary=description
-            )
-        )
         
+        success_checkpoint_data = Checkpoint(
+            checkpoint_id=str(uuid4()),
+            project_id=self.project_id,
+            agent_id=self.agent_id,
+            achievement="action_processed",
+            summary=description,
+            agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
+        ).model_dump() 
+        checkpoint_res = await self.checkpoints.create.remote(success_checkpoint_data)
+        
+        self.last_checkpoint_pointer = checkpoint_res["checkpoint_id"]
         self.status = "IDLE"
-        return {"status": "SUCCESS", "checkpoint_id": checkpoint.checkpoint_id}
+        return {"status": "SUCCESS", "checkpoint_id": checkpoint_res["checkpoint_id"]}

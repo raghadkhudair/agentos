@@ -23,6 +23,8 @@ class AgentSpec(BaseModel):
     memory_scopes: list[str] = Field(default_factory=list)
     allowed_action_categories: list[str] = Field(default_factory=list)
     ownership_domains: list[str] = Field(default_factory=list)
+    event_subscriptions: list[str] = Field(default_factory=list) 
+    
 
 
 class TeamPlan(BaseModel):

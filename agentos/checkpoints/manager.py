@@ -1,34 +1,58 @@
 from __future__ import annotations
 
+import json
+import uuid
+import ray
+import structlog
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
-# We import the database and repository layers we built earlier
 from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import CheckpointRepository
+from agentos.provider.gateway import ProviderRequest
 
+logger = structlog.get_logger()
 
 class Checkpoint(BaseModel):
-    checkpoint_id: str
+    checkpoint_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     project_id: str
     agent_id: str
     achievement: str
     summary: str
-    task_id: str | None = None  # Adding this so we can link checkpoints to specific tasks
+    task_id: str | None = None
     artifacts: list[str] = Field(default_factory=list)
+    agent_state_snapshot: dict = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class CheckpointManager:
-    """Creates durable progress markers after achievements and saves them to Postgres."""
+@ray.remote(namespace="agentos")
+class CheckpointManagerActor:
+    """Creates durable progress markers after achievements, links artifacts, and restores agent state pointers."""
 
-    def __init__(self, db_manager: DatabaseManager):
-        # Store the DB manager and initialize our repository
-        self.db = db_manager
+    def __init__(self, settings_payload: dict):
+        from agentos.config.settings import Settings
+        self.settings = Settings(**settings_payload) if settings_payload else Settings()
+        self.db = DatabaseManager(self.settings)
         self.repo = CheckpointRepository(self.db)
+        self._connected = False
 
-    async def create(self, checkpoint: Checkpoint) -> Checkpoint:
-        # Actually save the checkpoint to the database!
+    async def _ensure_connected(self):
+        if not self._connected:
+            await self.db.connect()
+            self._connected = True
+
+    async def create(self, checkpoint_dict: dict) -> dict:
+        """Saves a checkpoint and links associated artifacts and agent state to Postgres."""
+        await self._ensure_connected()
+        checkpoint = Checkpoint(**checkpoint_dict)
+        
+        logger.info(
+            "creating_checkpoint", 
+            agent_id=checkpoint.agent_id, 
+            achievement=checkpoint.achievement, 
+            checkpoint_id=checkpoint.checkpoint_id
+        )
+
         await self.repo.save_checkpoint(
             project_id=checkpoint.project_id,
             agent_id=checkpoint.agent_id,
@@ -36,4 +60,218 @@ class CheckpointManager:
             summary=checkpoint.summary,
             task_id=checkpoint.task_id
         )
-        return checkpoint
+
+        async with self.db.pool.acquire() as conn:
+            update_query = """
+                UPDATE checkpoints 
+                SET agent_state_snapshot = $2, artifacts = $3
+                WHERE checkpoint_id = $1;
+            """
+            try:
+                state_json = json.dumps(checkpoint.agent_state_snapshot)
+                await conn.execute(
+                    update_query, 
+                    uuid.UUID(checkpoint.checkpoint_id), 
+                    state_json, 
+                    checkpoint.artifacts
+                )
+            except Exception as e:
+                logger.warning("failed_to_write_extended_checkpoint_data", error=str(e))
+
+        return checkpoint.model_dump()
+
+    async def recover_agent_state(self, project_id: str, agent_id: str) -> dict | None:
+        """Retrieves the latest checkpoint snapshot to support recovery and resume on crashes."""
+        await self._ensure_connected()
+        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+        
+        query = """
+            SELECT checkpoint_id, achievement, summary, task_id, agent_state_snapshot, artifacts
+            FROM checkpoints
+            WHERE project_id = $1 AND agent_id = $2
+            ORDER BY created_at DESC
+            LIMIT 1;
+        """
+        try:
+            async with self.db.pool.acquire() as conn:
+                row = await conn.fetchrow(query, safe_project_id, agent_id)
+                if not row:
+                    return None
+
+                state_snapshot = {}
+                if row["agent_state_snapshot"]:
+                    state_snapshot = json.loads(row["agent_state_snapshot"]) if isinstance(row["agent_state_snapshot"], str) else row["agent_state_snapshot"]
+
+                return {
+                    "checkpoint_id": str(row["checkpoint_id"]),
+                    "achievement": row["achievement"],
+                    "summary": row["summary"],
+                    "task_id": str(row["task_id"]) if row["task_id"] else None,
+                    "agent_state_snapshot": state_snapshot,
+                    "artifacts": row["artifacts"] or []
+                }
+        except Exception as e:
+            logger.error("failed_to_recover_agent_state", error=str(e))
+            return None
+
+
+@ray.remote(namespace="agentos")
+class SummaryManagerActor:
+    """Compresses verbose agent histories and checkpoint databases into clean semantic memory buffers."""
+
+    def __init__(self, settings_payload: dict):
+        from agentos.config.settings import Settings
+        self.settings = Settings(**settings_payload)
+        self.db = DatabaseManager(self.settings)
+        self._connected = False
+
+    async def _ensure_connected(self):
+        if not self._connected:
+            await self.db.connect()
+            self._connected = True
+
+    async def generate_local_agent_summary(self, project_id: str, agent_id: str, provider_gateway: any) -> str:
+        """Compresses all recent checkpoints created by a specific agent into a personal progress summary."""
+        await self._ensure_connected()
+        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+
+        query = """
+            SELECT achievement, summary, created_at 
+            FROM checkpoints 
+            WHERE project_id = $1 AND agent_id = $2 
+            ORDER BY created_at DESC 
+            LIMIT 10;
+        """
+        async with self.db.pool.acquire() as conn:
+            rows = await conn.fetch(query, safe_project_id, agent_id)
+            if not rows:
+                return f"No recent checkpoints found for agent {agent_id}."
+
+            history_lines = [f"- [{r['created_at'].isoformat()}] Achievement: {r['achievement']} | Summary: {r['summary']}" for r in rows]
+            raw_history = "\n".join(history_lines)
+
+        prompt = (
+            f"You are the Summary Manager for AgentOS. Your task is to compress the following raw activity timeline "
+            f"for agent '{agent_id}' into a concise, 3-sentence performance update. Describe exactly what tasks "
+            f"they made progress on, what succeeded, and if anything failed.\n\n"
+            f"RAW TIMELINE:\n{raw_history}"
+        )
+
+        req = ProviderRequest(
+            purpose="generate_local_agent_summary",
+            messages=[{"role": "user", "content": prompt}],
+            budget_key=project_id
+        )
+        # Fetch compiled summary from provider
+        response = await provider_gateway.get_completion.remote(req.model_dump())
+        return response["content"].strip()
+
+    async def generate_squad_summary(self, project_id: str, squad_name: str, provider_gateway: any) -> str:
+        """Aggregates checkpoints from all agents in a specific squad (e.g., backend) into a domain status report."""
+        await self._ensure_connected()
+        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+
+        # We query checkpoints where the agent_id matches the squad prefix (e.g., 'backend_developer-1')
+        squad_pattern = f"{squad_name}%"
+        query = """
+            SELECT agent_id, achievement, summary 
+            FROM checkpoints 
+            WHERE project_id = $1 AND agent_id LIKE $2
+            ORDER BY created_at DESC 
+            LIMIT 15;
+        """
+        async with self.db.pool.acquire() as conn:
+            rows = await conn.fetch(query, safe_project_id, squad_pattern)
+            if not rows:
+                return f"No recent checkpoints found for squad '{squad_name}'."
+
+            history_lines = [f"- Agent: {r['agent_id']} | Did: {r['achievement']} | Details: {r['summary']}" for r in rows]
+            raw_history = "\n".join(history_lines)
+
+        prompt = (
+            f"You are the Summary Manager. Aggregate and summarize the following squad activity "
+            f"for the '{squad_name}' squad into a high-density, bulleted status report. Highlight joint team achievements "
+            f"and identify any shared bottlenecks.\n\n"
+            f"SQUAD LOGS:\n{raw_history}"
+        )
+
+        req = ProviderRequest(
+            purpose="generate_squad_summary",
+            messages=[{"role": "user", "content": prompt}],
+            budget_key=project_id
+        )
+        response = await provider_gateway.get_completion.remote(req.model_dump())
+        return response["content"].strip()
+
+    async def generate_project_summary(self, project_id: str, provider_gateway: any) -> str:
+        """Creates an executive, project-wide status briefing comparing progress to the master Definition of Done."""
+        await self._ensure_connected()
+        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+
+        # Pull overall task statistics
+        task_query = """
+            SELECT status, COUNT(*) as cnt 
+            FROM tasks 
+            WHERE project_id = $1 
+            GROUP BY status;
+        """
+        # Pull latest major achievements
+        checkpoint_query = """
+            SELECT agent_id, achievement, summary 
+            FROM checkpoints 
+            WHERE project_id = $1 
+            ORDER BY created_at DESC 
+            LIMIT 5;
+        """
+
+        async with self.db.pool.acquire() as conn:
+            task_rows = await conn.fetch(task_query, safe_project_id)
+            checkpoint_rows = await conn.fetch(checkpoint_query, safe_project_id)
+
+            task_summary = ", ".join([f"{r['status']}: {r['cnt']}" for r in task_rows]) if task_rows else "No tasks scheduled."
+            achievements = "\n".join([f"- {r['agent_id']}: {r['summary']}" for r in checkpoint_rows]) if checkpoint_rows else "No checkpoints recorded."
+
+        prompt = (
+            f"You are the Lead Summary Manager. Write a high-level executive project status briefing. "
+            f"Keep it under 150 words. Focus on the progression toward the final Definition of Done.\n\n"
+            f"TASK PROFILE STATS: {task_summary}\n"
+            f"LATEST MAJOR ACHIEVEMENTS:\n{achievements}"
+        )
+
+        req = ProviderRequest(
+            purpose="generate_project_summary",
+            messages=[{"role": "user", "content": prompt}],
+            budget_key=project_id
+        )
+        response = await provider_gateway.get_completion.remote(req.model_dump())
+        return response["content"].strip()
+    
+
+    async def compress_event_history(self, raw_events: list[str], project_id: str, provider_gateway: any) -> str:
+        """
+        Takes a raw event stream list and compresses it into a high-density,
+        bulleted briefing. Used by the Memory Broker to prevent prompt pollution.
+        """
+        if not raw_events or raw_events == ["No recent events found. Project is initializing."]:
+            return "Project is initializing. No previous event history to report."
+
+        prompt = (
+            "You are the Core Summary Manager for AgentOS. Your job is to compress the following "
+            "raw timeline of recent system events into a highly concise, bulleted context briefing.\n"
+            "Identify key milestones, blockages, or changes. Strip out metadata, raw JSON brackets, "
+            "and duplicate records.\n\n"
+            f"RAW EVENT STREAM:\n" + "\n".join(raw_events)
+        )
+
+        req = ProviderRequest(
+            purpose="compress_event_history",
+            messages=[{"role": "user", "content": prompt}],
+            budget_key=project_id
+        )
+
+        try:
+            response = await provider_gateway.get_completion.remote(req.model_dump())
+            return response["content"].strip()
+        except Exception as e:
+            logger.error("failed_to_compress_event_history", error=str(e))
+            return "Fallback raw event stream:\n" + "\n".join(raw_events[:3])

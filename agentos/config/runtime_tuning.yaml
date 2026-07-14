@@ -17,9 +17,9 @@ models:
   embedding: "gemini/gemini-embedding-001"
 
 agent_limits:
-  max_agents_total: 2                        # Safely set to 2 to protect local container memory
+  max_agents_total: 2                       
   max_active_agents: 2
-  max_parallel_code_tasks: 1
+  max_threads_per_agent: 2  
 
 embedding:
   dimension: 768

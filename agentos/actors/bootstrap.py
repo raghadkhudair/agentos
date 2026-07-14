@@ -8,13 +8,14 @@ from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan
 from agentos.provider.gateway import ProviderGateway, ProviderRequest
 from agentos.config.settings import load_settings
 from agentos.config.loader import team_roles
+from agentos.messaging.events import EventType
 
 @ray.remote(max_restarts=-1, max_task_retries=3)
 class BootstrapAgentActor:
     """The first-run PM/Tech Lead agent.
 
-    Evaluates the incoming user request via LLM reasoning to dynamically form a tailored team plan,
-    define explicit assumptions, and determine project-specific Definition of Done (DoD) milestones.
+    Analyzes the user's request against the strict role definitions provided in the 
+    actor_team configuration file, choosing the optimized squad composition.
     """
 
     def __init__(self, project_id: str):
@@ -24,32 +25,52 @@ class BootstrapAgentActor:
 
     async def create_team_plan(self, user_request: str, max_agents_total: int) -> dict:
         """
-        Queries the provider gateway with the raw user request to synthesize 
-        a dynamic, custom-fitted team plan and task graph.
+        Queries the provider gateway with the available configuration profiles to select
+        the optimized team structure, definitions, and milestones.
         """
+        # Load the configuration source of truth
         roles_cfg = team_roles()
-        role_bullets = "\n".join(f'- {r["role"]}: {r["description"]}' for r in roles_cfg["roles"])
-        role_names = " | ".join(f'"{r["role"]}"' for r in roles_cfg["roles"])
+        
+        # Build clear profile documentation dynamically for the LLM prompt context
+        role_profiles = []
+        role_names_list = []
+        for r in roles_cfg.get("roles", []):
+            role_name = r["role"].upper()
+            role_names_list.append(f'"{role_name}"')
+            
+            profile = (
+                f"- Role: {role_name}\n"
+                f"  Description: {r.get('description', '')}\n"
+                f"  Default Memory Scopes: {r.get('default_memory_scopes', [])}\n"
+                f"  Allowed Action Categories: {r.get('allowed_action_categories', [])}\n"
+                f"  Default Event Subscriptions: {r.get('default_event_subscriptions', [])}\n"
+            )
+            role_profiles.append(profile)
 
+        role_bullets = "\n".join(role_profiles)
+        role_enum_string = " | ".join(role_names_list)
 
         system_prompt = (
             "You are the Lead Project Manager and Principal Architect for AgentOS.\n"
-            "Your task is to analyze a user's IT/software request and output a structured project blueprint.\n\n"
-            "Rules for team sizing and composition:\n"
+            "Your task is to analyze a user's IT/software request and choose the optimal team roster "
+            "using ONLY the predefined configuration templates listed below.\n\n"
+            "Rules for team selection:\n"
             "1. Only request specialized roles that are absolutely necessary for the task.\n"
             "2. If the request is backend-only or CLI-only, DO NOT include FRONTEND_DEVELOPER.\n"
-            "3. Ensure the sum of agent counts does not exceed the provided max_agents limit.\n\n"
-            f"Available Agent Roles:\n{role_bullets}\n\n"
+            "3. Ensure the sum of agent counts does not exceed the provided max_agents limit.\n"
+            "4. Do not invent variables or scopes. Simply choose the role names.\n\n"
+            f"Predefined Agent Registry Templates:\n{role_bullets}\n\n"
             "You MUST respond with a single un-wrapped valid JSON object matching this schema exactly:\n"
             "{\n"
             "  \"project_name\": \"string-identifier\",\n"
+            "  \"high_level_architecture\": \"Summary of technical approach and system architecture\",\n"
             "  \"dod\": [\"clear, measurable completion milestones matching requirement scopes\"],\n"
             "  \"assumptions\": [\"explicit boundary assumptions matching context limits\"],\n"
             "  \"agents\": [\n"
             "     {\n"
-            f"       \"role\": {role_names},\n"
+            f"       \"role\": {role_enum_string},\n"
             "       \"count\": 1,\n"
-            "       \"description\": \"custom focus explanation for this project\"\n"
+            "       \"description\": \"Specific purpose/assignment for this role on this project\"\n"
             "     }\n"
             "  ]\n"
             "}"
@@ -58,7 +79,7 @@ class BootstrapAgentActor:
         user_prompt = (
             f"USER SOFTWARE REQUEST: \"{user_request}\"\n"
             f"MAXIMUM TOTAL ALLOWED AGENTS BOUNDARY: {max_agents_total}\n\n"
-            "Generate the optimized JSON team plan configuration."
+            "Select the ideal team configuration matching the allowed registry profiles."
         )
 
         request = ProviderRequest(
@@ -71,7 +92,6 @@ class BootstrapAgentActor:
             metadata={}
         )
 
-        # Execute structured generation through the provider gateway
         response = await self.provider.get_completion(request, response_format={"type": "json_object"})
         
         clean_content = response.content.strip()
@@ -83,23 +103,15 @@ class BootstrapAgentActor:
             plan_data = json.loads(clean_content)
         except Exception as e:
             print(f"Failed to parse dynamically generated team plan, falling back to basic skeleton setup: {e}")
-            # Dynamic safety fallback structure to avoid breaking the runtime initialization sequence
-            plan_data = {
-                "project_name": "emergency-fallback-project",
-                "dod": ["Code base executes", "Verify output standards"],
-                "assumptions": ["Fallback mode active"],
-                "agents": [{"role": "PM_TECH_LEAD", "count": 1, "description": "Fallback coordinator"}]
-            }
+            plan_data = roles_cfg.get("fallback_team", {})
 
-        # Format and validate agent payload specifications array
         validated_agents = []
         running_count = 0
         
         for a in plan_data.get("agents", []):
-            role_str = a.get("role", "PM_TECH_LEAD")
+            role_str = a.get("role", "PM_TECH_LEAD").upper()
             count = int(a.get("count", 1))
             
-            # Prevent overflow past our system's max worker ceiling thresholds
             if running_count + count > max_agents_total:
                 count = max(1, max_agents_total - running_count)
                 if running_count >= max_agents_total:
@@ -107,19 +119,22 @@ class BootstrapAgentActor:
             
             running_count += count
             
-            # Match metadata profiles dynamically
+            # Look up the strict role configuration matching the AI's selection
+            role_template = next((r for r in roles_cfg.get("roles", []) if r["role"].upper() == role_str), {})
+            
+            # Map the variables directly from the YAML definition file
             validated_agents.append(
                 AgentSpec(
-                    role=AgentRole[role_str],
+                    role=AgentRole[role_str] if hasattr(AgentRole, role_str) else AgentRole.PM_TECH_LEAD,
                     count=count,
-                    description=a.get("description", "Assigned software engineer worker instance."),
-                    memory_scopes=["project", role_str.lower(), "decision"],
-                    allowed_action_categories=["implement", "test", "review"],
-                    ownership_domains=[role_str.lower()]
+                    description=a.get("description", role_template.get("description", "Assigned worker worker instance.")),
+                    memory_scopes=role_template.get("default_memory_scopes", ["project"]),
+                    allowed_action_categories=role_template.get("allowed_action_categories", ["implement"]),
+                    ownership_domains=[role_str.lower()],
+                    event_subscriptions=role_template.get("default_event_subscriptions", ["PROJECT_CREATED", "TASK_CREATED"])
                 )
             )
 
-        # Enforce clean schema building
         final_plan = TeamPlan(
             project_name=plan_data.get("project_name", "agentos-autonomous-project"),
             user_request=user_request,

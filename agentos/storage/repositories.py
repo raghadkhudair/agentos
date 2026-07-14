@@ -101,9 +101,15 @@ class TaskRepository:
             return [dict(row) for row in rows]
 
     async def update_task_status(self, task_id: str, status: str) -> None:
+        try:
+            safe_task_uuid = UUID(task_id)
+        except ValueError:
+            print(f" [WARNING]: Agent provided an invalid task ID for status update: {task_id}")
+            return
+            
         query = "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2"
         async with self.db.pool.acquire() as conn:
-            await conn.execute(query, status, UUID(task_id))
+            await conn.execute(query, status, safe_task_uuid)
 
 class ArtifactRepository:
     def __init__(self, db_manager: DatabaseManager):
