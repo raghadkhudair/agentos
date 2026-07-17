@@ -5,7 +5,6 @@ import json
 from collections import Counter
 import structlog
 from agentos.storage.database import DatabaseManager
-from agentos.dod.evaluator import DoDEvaluator
 from agentos.config.loader import guardrail_policies
 cfg = guardrail_policies()
 
@@ -14,33 +13,35 @@ logger = structlog.get_logger()
 
 class DoDWatchdog:
     """
-    Detects incomplete Definition of Done criteria when no active database 
-    tasks are currently running, and automatically triggers a replanning sequence.
+    Detects incomplete Definition of Done criteria when no active database
+    tasks are currently running — i.e. the project is STUCK, not just unfinished.
+
+    This is intentionally different from DoDEvaluatorActor: the evaluator answers
+    "is the project done?"; this watchdog answers the narrower question
+    "are we stuck with nothing left to do, even though we're not done?"
+    It relies on an already-computed evaluation result rather than re-evaluating,
+    to avoid duplicating the DB/LLM work DoDEvaluatorActor already just did.
     """
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
-        self.evaluator = DoDEvaluator(db_manager)
 
-    async def inspect(self, project_id: str, project_dod: list[str]) -> dict:
+    async def inspect(self, project_id: str, dod_satisfied: bool, dod_gaps: list[str]) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
-        
+
         query_tasks = "SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND status != 'COMPLETED';"
         async with self.db.pool.acquire() as conn:
             incomplete_task_count = await conn.fetchval(query_tasks, safe_project_id)
-            
-        dod_report = await self.evaluator.evaluate(project_id, project_dod)
-        
-        if incomplete_task_count == 0 and not dod_report.satisfied:
-            logger.error("watchdog_dod_stalled", project_id=project_id, gaps=dod_report.gaps)
+
+        if incomplete_task_count == 0 and not dod_satisfied:
+            logger.error("watchdog_dod_stalled", project_id=project_id, gaps=dod_gaps)
             return {
                 "action_required": "TRIGGER_REPLANNING",
                 "reason": "Incomplete DoD milestones found with zero outstanding active database tasks.",
-                "gaps": dod_report.gaps
+                "gaps": dod_gaps
             }
-            
+
         return {"action_required": "NONE", "status": "COMPLIANT"}
-
-
+    
 class StagnationWatchdog:
     """
     Analyzes historical database checkpoints to identify loops, repeated 
@@ -52,7 +53,7 @@ class StagnationWatchdog:
     async def inspect(self, project_id: str) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        query_checkpoints = """
+        query_checkpoints = f"""
             SELECT summary FROM checkpoints 
             WHERE project_id = $1 
             ORDER BY created_at DESC 
@@ -89,21 +90,20 @@ class SafetyWatchdog:
 
     async def inspect(self, project_id: str) -> dict:
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
-        
         query_audit = """
-            SELECT COUNT(*) FROM audit_events 
-            WHERE project_id = $1 AND decision IN ('DENY', 'QUARANTINE_AGENT');
+            SELECT agent_id, COUNT(*) as violation_count FROM audit_events 
+            WHERE project_id = $1 AND decision IN ('DENY', 'QUARANTINE_AGENT')
+            GROUP BY agent_id
+            ORDER BY violation_count DESC
+            LIMIT 1;
         """
         async with self.db.pool.acquire() as conn:
-            blocked_call_count = await conn.fetchval(query_audit, safe_project_id)
-            
-        if blocked_call_count >= cfg['safety_watchdog']['blocked_call_quarantine_threshold']:
-            logger.critical("watchdog_safety_quarantine_triggered", project_id=project_id, violations=blocked_call_count)
-            return {
-                "action_required": "QUARANTINE_AGENT",
-                "reason": f"Agent surpassed maximum safety boundary constraints. Found {blocked_call_count} violations."
-            }
-            
+            row = await conn.fetchrow(query_audit, safe_project_id)
+
+        if row and row["violation_count"] >= cfg['safety_watchdog']['blocked_call_quarantine_threshold']:
+            logger.critical("watchdog_safety_quarantine_triggered", project_id=project_id, agent_id=row["agent_id"], violations=row["violation_count"])
+            return {"action_required": "QUARANTINE_AGENT", "agent_id": row["agent_id"], "reason": f"Agent surpassed maximum safety boundary constraints. Found {row['violation_count']} violations."}
+
         return {"action_required": "NONE", "status": "SECURE"}
     
 

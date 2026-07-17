@@ -9,9 +9,8 @@ import structlog
 from agentos.actors.bootstrap import BootstrapAgentActor
 from agentos.config.settings import Settings
 from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedTeamPlan
-from agentos.watchdogs.runtime_watchdogs import StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
+from agentos.watchdogs.runtime_watchdogs import DoDWatchdog, StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
 
-# Infrastructure imports
 from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import ProjectRepository, EventRepository
 from agentos.messaging.dragonfly_bus import DragonflyBus
@@ -23,7 +22,6 @@ from agentos.execution.supervisor import ExecutionSupervisorActor
 from agentos.checkpoints.manager import CheckpointManagerActor, SummaryManagerActor
 from agentos.dod.evaluator import DoDEvaluatorActor
 
-# Dynamic configuration injection
 from agentos.config.loader import runtime_tuning
 tuning_cfg = runtime_tuning()
 
@@ -39,7 +37,7 @@ class RuntimeSupervisorActor:
         self.db_manager = DatabaseManager(self.settings)
         self.dragonfly = DragonflyBus(self.settings.dragonfly_url)
         
-        # 1. Initialize Ray Actors with remote options and serializable settings payloads
+        # Initialize Ray Actors with remote options and serializable settings payloads
         self.trigger_engine = TriggerEngineActor.options(
             name="trigger_engine",
             namespace="agentos"
@@ -137,13 +135,12 @@ class RuntimeSupervisorActor:
                 
                 for e_type_str in spec.event_subscriptions:
                     try:
-                        # 2. Extract Enum value as a raw string to match TriggerEngineActor expectations
+                        # Extract Enum value as a raw string to match TriggerEngineActor expectations
                         e_type = EventType(e_type_str.upper())
                         await self.trigger_engine.register_subscription.remote(e_type.value, agent_id)
                     except ValueError:
                         logger.warning("invalid_event_type_proposed", event_type=e_type_str)
 
-        # 3. Use `.remote()` when invoking async tasks on Ray Actors
         asyncio.create_task(self.trigger_engine.start_routing_loop.remote(db_project_id))
         asyncio.create_task(self.watchdog_loop(db_project_id, validated.original.dod))
         asyncio.create_task(self._supervise_health_loop(db_project_id))
@@ -157,7 +154,7 @@ class RuntimeSupervisorActor:
             payload={"user_request": user_request, "dod": validated.original.dod}
         )
         
-        target_stream_key = init_event.get_target_topic() 
+        target_stream_key = unified_stream_key
         
         await event_repo.save_event(db_project_id, init_event)
         await self.dragonfly.publish_event(target_stream_key, init_event)
@@ -209,7 +206,6 @@ class RuntimeSupervisorActor:
         
         present_role_strings = {spec.role.value.upper() for spec in plan.agents}
         
-        # Phase A: Enforce Dynamic Role-Specific Caps from Config File
         for spec in plan.agents:
             spec_copy = spec.model_copy()
             role_enum_str = spec_copy.role.value.upper()
@@ -222,7 +218,6 @@ class RuntimeSupervisorActor:
                     
             validated_agents.append(spec_copy)
 
-        # Phase B: Enforce Dynamic Required Safety Roles from Config File
         trigger_roles = safety_rules.get("if_roles_present", [])
         inject_roles = safety_rules.get("inject_roles", [])
         
@@ -249,7 +244,7 @@ class RuntimeSupervisorActor:
                     reasons.append(f"Injected mandatory safety role compliance asset: {role_to_inject_upper}.")
                     present_role_strings.add(role_to_inject_upper)
 
-        # Phase C: Enforce Maximum Total Agent limits from tuning yaml
+        # Enforce Maximum Total Agent limits from tuning yaml
         running_total = sum(a.count for a in validated_agents)
         if running_total > max_total:
             reasons.append(f"Enforced tuning block limit: reduced total team sizing from {running_total} to cap boundary {max_total}.")
@@ -358,7 +353,7 @@ class RuntimeSupervisorActor:
 
     async def watchdog_loop(self, project_id: str, dod: list[str]) -> None:
         """Monitors system states, delegating DoD validation to the dedicated DoDEvaluatorActor."""
-        # 4. Swap local watchdog for the robust, remote Ray DoDEvaluatorActor
+        dod_wd = DoDWatchdog(self.db_manager)
         stag_wd = StagnationWatchdog(self.db_manager)
         safety_wd = SafetyWatchdog(self.db_manager)
         deadlock_wd = DeadlockWatchdog(self.db_manager)
@@ -366,24 +361,62 @@ class RuntimeSupervisorActor:
         while self.is_running:
             await asyncio.sleep(tuning_cfg["watchdog_loop"]["interval_seconds"])
             
-            # A. Evaluate the Definition of Done (DoD) remotely on the dedicated Ray Actor
+            # Evaluate the Definition of Done (DoD) remotely on the dedicated Ray Actor
             try:
                 evaluation_result = await self.dod_evaluator.evaluate.remote(project_id, dod)
                 if evaluation_result.get("satisfied", False):
                     logger.info("[WATCHDOG]: All Definition of Done (DoD) criteria successfully met!")
                     self._project_complete.set()
                     return
+                stall_result = await dod_wd.inspect(
+                    project_id,
+                    evaluation_result.get("satisfied", False),
+                    evaluation_result.get("gaps", [])
+                )
+                if stall_result.get("action_required") == "TRIGGER_REPLANNING":
+                    logger.warning("dod_stall_detected", reason=stall_result["reason"], gaps=stall_result["gaps"])
+                    unified_stream_key = f"project:{project_id}:events"
+                    stall_event = Event(
+                        project_id=project_id,
+                        event_type=EventType.TASK_CREATED,
+                        topic=unified_stream_key,
+                        payload={
+                            "message": f"STALLED: No active tasks but DoD unsatisfied. Gaps: {', '.join(stall_result['gaps'])}",
+                            "missing_dod_items": stall_result["gaps"]
+                        }
+                    )
+                    await self.dragonfly.publish_event(unified_stream_key, stall_event)
+                    self._watchdog_cycle_count = getattr(self, "_watchdog_cycle_count", 0) + 1
+                    if self._watchdog_cycle_count % 3 == 0:
+                        try:
+                            project_summary = await self.summary_manager.generate_project_summary.remote(project_id, self.provider_gateway)
+                            from agentos.storage.repositories import SummaryRepository
+                            summary_repo = SummaryRepository(self.db_manager)
+                            await summary_repo.save_summary(project_id, "project", project_id, project_summary)
+
+                            squads = {data["spec_payload"]["squad"] for data in self._actor_registry.values()}
+                            for squad_name in squads:
+                                squad_summary = await self.summary_manager.generate_squad_summary.remote(project_id, squad_name, self.provider_gateway)
+                                await summary_repo.save_summary(project_id, "squad", squad_name, squad_summary)
+                        except Exception as e:
+                            logger.error("periodic_summary_generation_failed", error=str(e))
+                            
             except Exception as e:
                 logger.error("watchdog_dod_evaluation_failed", error=str(e))
 
-            # B. Inspect other local behavioral watchdogs
-            for wd, args in [
-                (stag_wd, (project_id,)),
-                (safety_wd, (project_id,)), 
-                (deadlock_wd, (project_id,))
-            ]:
+            for wd, args in [(stag_wd, (project_id,)), (safety_wd, (project_id,)), (deadlock_wd, (project_id,))]:
                 try:
-                    await wd.inspect(*args)
+                    result = await wd.inspect(*args)
+                    action = result.get("action_required")
+                    if action == "QUARANTINE_AGENT" and result.get("agent_id"):
+                        from agentos.governance.policy_engine import PolicyEngine
+                        policy_engine = PolicyEngine(self.settings)
+                        policy_engine.quarantine_agent(result["agent_id"])
+                        logger.critical("agent_quarantined_by_watchdog", agent_id=result["agent_id"], reason=result.get("reason"))
+                    elif action == "FREEZE_STREAM":
+                        logger.warning("stagnation_detected_manual_review_needed", reason=result.get("reason"))
+                    elif action == "RESOLVE_DEADLOCK":
+                        logger.critical("deadlock_detected_manual_review_needed", reason=result.get("reason"))
                 except Exception as e:
                     logger.error("watchdog_inspection_failed", watchdog=wd.__class__.__name__, error=str(e))
 
@@ -392,7 +425,6 @@ class RuntimeSupervisorActor:
         logger.info("initiating_supervisor_shutdown")
         self.is_running = False
         
-        # Stop background loops on the Ray Actor trigger engine
         await self.trigger_engine.stop.remote()
         
         for agent_id, data in self._actor_registry.items():

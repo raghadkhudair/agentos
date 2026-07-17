@@ -42,7 +42,7 @@ class CheckpointManagerActor:
             self._connected = True
 
     async def create(self, checkpoint_dict: dict) -> dict:
-        """Saves a checkpoint and links associated artifacts and agent state to Postgres."""
+        """Saves a comprehensive checkpoint linking artifacts and agent state to Postgres in a single hit."""
         await self._ensure_connected()
         checkpoint = Checkpoint(**checkpoint_dict)
         
@@ -53,30 +53,16 @@ class CheckpointManagerActor:
             checkpoint_id=checkpoint.checkpoint_id
         )
 
+        # Call the unified, all-in-one repository driver
         await self.repo.save_checkpoint(
             project_id=checkpoint.project_id,
             agent_id=checkpoint.agent_id,
             achievement=checkpoint.achievement,
             summary=checkpoint.summary,
-            task_id=checkpoint.task_id
+            task_id=checkpoint.task_id,
+            agent_state_snapshot=checkpoint.agent_state_snapshot,
+            artifacts=checkpoint.artifacts
         )
-
-        async with self.db.pool.acquire() as conn:
-            update_query = """
-                UPDATE checkpoints 
-                SET agent_state_snapshot = $2, artifacts = $3
-                WHERE checkpoint_id = $1;
-            """
-            try:
-                state_json = json.dumps(checkpoint.agent_state_snapshot)
-                await conn.execute(
-                    update_query, 
-                    uuid.UUID(checkpoint.checkpoint_id), 
-                    state_json, 
-                    checkpoint.artifacts
-                )
-            except Exception as e:
-                logger.warning("failed_to_write_extended_checkpoint_data", error=str(e))
 
         return checkpoint.model_dump()
 
@@ -163,7 +149,7 @@ class SummaryManagerActor:
             budget_key=project_id
         )
         # Fetch compiled summary from provider
-        response = await provider_gateway.get_completion.remote(req.model_dump())
+        response = await provider_gateway.get_completion.remote(req)
         return response["content"].strip()
 
     async def generate_squad_summary(self, project_id: str, squad_name: str, provider_gateway: any) -> str:
@@ -174,9 +160,10 @@ class SummaryManagerActor:
         # We query checkpoints where the agent_id matches the squad prefix (e.g., 'backend_developer-1')
         squad_pattern = f"{squad_name}%"
         query = """
-            SELECT agent_id, achievement, summary 
-            FROM checkpoints 
-            WHERE project_id = $1 AND agent_id LIKE $2
+            SELECT c.agent_id, c.achievement, c.summary 
+            FROM checkpoints c
+            JOIN agents a ON c.agent_id = a.id
+            WHERE c.project_id = $1 AND a.squad = $2;
             ORDER BY created_at DESC 
             LIMIT 15;
         """
@@ -200,7 +187,7 @@ class SummaryManagerActor:
             messages=[{"role": "user", "content": prompt}],
             budget_key=project_id
         )
-        response = await provider_gateway.get_completion.remote(req.model_dump())
+        response = await provider_gateway.get_completion.remote(req)
         return response["content"].strip()
 
     async def generate_project_summary(self, project_id: str, provider_gateway: any) -> str:
@@ -243,7 +230,7 @@ class SummaryManagerActor:
             messages=[{"role": "user", "content": prompt}],
             budget_key=project_id
         )
-        response = await provider_gateway.get_completion.remote(req.model_dump())
+        response = await provider_gateway.get_completion.remote(req)
         return response["content"].strip()
     
 
@@ -270,7 +257,7 @@ class SummaryManagerActor:
         )
 
         try:
-            response = await provider_gateway.get_completion.remote(req.model_dump())
+            response = await provider_gateway.get_completion.remote(req)
             return response["content"].strip()
         except Exception as e:
             logger.error("failed_to_compress_event_history", error=str(e))

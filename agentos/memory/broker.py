@@ -62,7 +62,7 @@ class MemoryBrokerActor:
         
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
         
-        # 1. Enforce Memory Access Control (ACL)
+        # Enforce Memory Access Control (ACL)
         resolved_scopes = []
         if requested_scopes:
             resolved_scopes = [s for s in requested_scopes if s in agent_allowed_scopes]
@@ -74,7 +74,7 @@ class MemoryBrokerActor:
 
         logger.info("enforcing_memory_access_control", agent_id=agent_id, effective=resolved_scopes)
         
-        # 2. Fetch Live Historical Events Stream
+        # Fetch Live Historical Events Stream
         query_events = """
             SELECT event_type, topic, payload 
             FROM events
@@ -104,14 +104,14 @@ class MemoryBrokerActor:
         if not raw_events:
             raw_events = ["No recent events found. Project is initializing."]
 
-        # --- 3. DELEGATED SUMMARIZATION (No more duplication!) ---
+        # DELEGATED SUMMARIZATION (No more duplication!) 
         summarized_briefing = "No history to summarize."
         if provider_gateway and raw_events:
             try:
-                # 1. Locate the remote Summary Manager Actor
+                # Locate the remote Summary Manager Actor
                 summary_manager = ray.get_actor("summary_manager", namespace="agentos")
                 
-                # 2. Delegate the compression task
+                #  Delegate the compression task
                 summarized_briefing = await summary_manager.compress_event_history.remote(
                     raw_events=raw_events,
                     project_id=str(project_id),
@@ -122,7 +122,7 @@ class MemoryBrokerActor:
                 # Fallback directly to the scrubbed events if lookup/call fails
                 summarized_briefing = "Fallback raw timeline:\n" + "\n".join(raw_events[:3])
 
-        # 4. Fetch Live Task Graph
+        # Fetch Live Task Graph
         live_tasks = await self.task_repo.get_active_tasks(str(project_id))
         formatted_tasks = []
         for t in live_tasks:
@@ -138,7 +138,7 @@ class MemoryBrokerActor:
         if not formatted_tasks:
             formatted_tasks = ["No active tasks currently assigned."]
 
-        # 5. Semantic Memory Lookup (pgvector)
+        # Semantic Memory Lookup (pgvector)
         relevant_memories = []
         if provider_gateway and trigger_message:
             try:

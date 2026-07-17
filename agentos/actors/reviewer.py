@@ -12,7 +12,7 @@ class ReviewerAgentActor:
     """A specialized Ray actor for reviewing code patches and enforcing security guardrails."""
     def __init__(self, settings_payload: dict):
         self.settings = Settings(**settings_payload)
-        self.provider = ProviderGateway(self.settings)
+        self.provider = ray.get_actor("provider_gateway", namespace="agentos")
 
     async def review_code_patch(self, file_path: str, code_content: str) -> dict:
         """Evaluates structural patches against security boundaries and prompt injection indicators."""
@@ -37,10 +37,10 @@ class ReviewerAgentActor:
             budget_key="global-governance"
         )
 
-        response = await self.provider.get_completion(request, response_format={"type": "json_object"})
+        response = await self.provider.get_completion.remote(request, response_format={"type": "json_object"})
         
         try:
-            result = json.loads(response.content)
+            result = json.loads(response["content"])
             logger.info("review_completed", file=file_path, approved=result.get("approved"))
             return result
         except Exception:

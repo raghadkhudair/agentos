@@ -1,5 +1,6 @@
 import json
 from uuid import UUID
+from agentos.cli.main import status
 from agentos.storage.database import DatabaseManager
 from agentos.messaging.events import Event
 
@@ -125,6 +126,17 @@ class TaskRepository:
         async with self.db.pool.acquire() as conn:
             rows = await conn.fetch(query, safe_id)
             return [dict(row) for row in rows]
+        
+    async def update_task_status(self, task_id: str, status: str) -> None:
+        try:
+            safe_task_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
+        except ValueError:
+            print(f" [WARNING]: Agent provided an invalid task ID for status update: {task_id}")
+            return
+
+        query = "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2"
+        async with self.db.pool.acquire() as conn:
+            await conn.execute(query, status, safe_task_uuid)
 
 class ArtifactRepository:
     def __init__(self, db_manager: DatabaseManager):
@@ -145,15 +157,39 @@ class CheckpointRepository:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    async def save_checkpoint(self, project_id: str, agent_id: str, achievement: str, summary: str, task_id: str = None) -> str:
+    async def save_checkpoint(
+        self, 
+        project_id: str, 
+        agent_id: str, 
+        achievement: str, 
+        summary: str, 
+        task_id: str = None,
+        agent_state_snapshot: dict = None,
+        artifacts: list[str] = None
+    ) -> str:
         query = """
-            INSERT INTO checkpoints (project_id, agent_id, task_id, achievement, summary)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO checkpoints (
+                project_id, agent_id, task_id, achievement, summary, agent_state_snapshot, artifacts
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id;
         """
         task_uuid = UUID(task_id) if task_id else None
+        
+        # Serialize the state snapshot dictionary to a JSON string for the JSONB column
+        state_json = json.dumps(agent_state_snapshot or {})
+        
         async with self.db.pool.acquire() as conn:
-            cp_id = await conn.fetchval(query, UUID(project_id), agent_id, task_uuid, achievement, summary)
+            cp_id = await conn.fetchval(
+                query, 
+                UUID(project_id) if isinstance(project_id, str) else project_id, 
+                agent_id, 
+                task_uuid, 
+                achievement, 
+                summary,
+                state_json,
+                artifacts or []
+            )
             return str(cp_id)
 
 class ProviderCallRepository:

@@ -57,7 +57,6 @@ class Event(BaseModel):
         t_type = self.event_type
         p_id = self.project_id
 
-        # 1. Project sub-topics
         if t_type in {EventType.TASK_CREATED, EventType.TASK_CLAIMED, EventType.TASK_COMPLETED, EventType.TASK_PROPOSAL, EventType.TASK_UPDATE}:
             return f"project.{p_id}.tasks"
         elif t_type in {EventType.CONTRACT_PUBLISHED, EventType.CONTRACT_CHANGE}:
@@ -73,7 +72,6 @@ class Event(BaseModel):
         elif t_type in {EventType.SUMMARY_CREATED, EventType.SUMMARY}:
             return f"project.{p_id}.summaries"
 
-        # 2. Squad-specific channels
         if self.producer_agent_id:
             role = self.producer_agent_id.lower()
             if "backend" in role:
@@ -85,5 +83,4 @@ class Event(BaseModel):
             elif "qa" in role:
                 return f"squad.qa.events"
 
-        # 3. Fallback to general project events stream
         return f"project.{p_id}.events"

@@ -54,7 +54,7 @@ class DoDEvaluatorActor:
         
         logger.info("evaluating_definition_of_done_compliance", project_id=project_id)
 
-        # 1. Fetch live artifacts
+        # Fetch live artifacts
         query_artifacts = "SELECT title, artifact_type, created_at::text FROM artifacts WHERE project_id = $1;"
         artifacts_found = []
         try:
@@ -66,7 +66,7 @@ class DoDEvaluatorActor:
 
         existing_artifacts = {art["title"].lower(): art for art in artifacts_found}
 
-        # 2. Fetch checkpoint history logs (for audit failure checking)
+        # Fetch checkpoint history logs (for audit failure checking)
         query_checkpoints = "SELECT achievement, summary, created_at::text FROM checkpoints WHERE project_id = $1;"
         checkpoints_found = []
         try:
@@ -82,7 +82,7 @@ class DoDEvaluatorActor:
             if cp["achievement"].lower() in {"review_failed", "verification_failed"}
         }
 
-        # 3. Gather completed tasks criteria mappings
+        # Gather completed tasks criteria mappings
         query_tasks = "SELECT title, status, acceptance_criteria FROM tasks WHERE project_id = $1;"
         completed_criteria = set()
         try:
@@ -128,20 +128,20 @@ class DoDEvaluatorActor:
                 gaps.append(item)
                 continue
 
-            # A. Verify physical project assets
+            #  Verify physical project assets
             if item_lower in existing_artifacts:
                 art = existing_artifacts[item_lower]
                 evidence_list.append(
                     f"📦 [ARTIFACT VALIDATION] Found verified physical asset: '{art['title']}'."
                 )
             
-            # B. Validate task acceptance criteria mappings
+            # Validate task acceptance criteria mappings
             if item_lower in completed_criteria or any(item_lower in comp or comp in item_lower for comp in completed_criteria):
                 evidence_list.append(
                     f"🎯 [ACCEPTANCE CRITERIA CHECK] Verified via formal task completion graph mappings."
                 )
 
-            # C. Parse checkpoint history entries
+            # Parse checkpoint history entries
             for cp in checkpoints_found:
                 summary_lower = cp["summary"].lower()
                 achievement_lower = cp["achievement"].lower()

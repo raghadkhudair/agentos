@@ -5,7 +5,7 @@ import re
 import ray
 
 from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan
-from agentos.provider.gateway import ProviderGateway, ProviderRequest
+from agentos.provider.gateway import ProviderRequest
 from agentos.config.settings import load_settings
 from agentos.config.loader import team_roles
 from agentos.messaging.events import EventType
@@ -17,7 +17,7 @@ class BootstrapAgentActor:
     def __init__(self, project_id: str):
         self.project_id = project_id
         self.settings = load_settings()
-        self.provider = ProviderGateway(self.settings)
+        self.provider = ray.get_actor("provider_gateway", namespace="agentos")
 
     async def create_team_plan(self, user_request: str, max_agents_total: int) -> dict:
         roles_cfg = team_roles()
@@ -82,9 +82,9 @@ class BootstrapAgentActor:
             metadata={}
         )
 
-        response = await self.provider.get_completion(request, response_format={"type": "json_object"})
+        response = await self.provider.get_completion.remote(request, response_format={"type": "json_object"})
         
-        clean_content = response.content.strip()
+        clean_content = response["content"].strip()
         if clean_content.startswith("```"):
             clean_content = re.sub(r"^```json\s*|^```\s*", "", clean_content, flags=re.MULTILINE)
             clean_content = re.sub(r"\s*```$", "", clean_content, flags=re.MULTILINE).strip()

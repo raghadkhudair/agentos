@@ -59,6 +59,7 @@ class ExecutionSupervisorActor:
             except Exception as e:
                 logger.error("sandbox_git_initialization_failed", error=str(e))
 
+    # currently is dead becasue of no where its the memory items is being inserted from 
     async def _verify_decision_conflict(self, action: ActionRequest) -> bool:
         await self._ensure_connected()
         safe_project_id = uuid.UUID(action.project_id) if isinstance(action.project_id, str) else action.project_id
@@ -110,6 +111,7 @@ class ExecutionSupervisorActor:
             
         return False
 
+    # check if the action is allowed by policy, if not return the guardrail result, if yes execute the action and return the result
     async def request_execution(self, action: dict) -> dict:
         action_obj = ActionRequest(**action)
         result: GuardrailResult = self.policy_engine.evaluate_action(action_obj)
@@ -238,11 +240,10 @@ class ExecutionSupervisorActor:
             logger.error("path_traversal_attack_blocked", attempted_path=file_path)
             return {"error": "Path traversal detected. Write blocked for safety."}
 
-        # --- Task Path-Safety Guardrails ---
         if task_id:
             await self._ensure_connected()
             try:
-                task_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
+                task_uuid = uuid.UUID(task_id) if isinstance(task_id, str) else task_id
                 query = "SELECT allowed_paths, blocked_paths FROM tasks WHERE id = $1;"
                 async with self.db_manager.pool.acquire() as conn:
                     task_record = await conn.fetchrow(query, task_uuid)
@@ -254,14 +255,14 @@ class ExecutionSupervisorActor:
                         # Normalize target file path for exact pattern checking
                         normalized_target = file_path.replace("\\", "/").strip("/")
 
-                        # Rule 1: Check Blocked Paths (Explicit Blacklist)
+                        # Check Blocked Paths (Explicit Blacklist)
                         for pattern in blocked_patterns:
                             clean_pattern = pattern.replace("\\", "/").strip("/")
                             if normalized_target.startswith(clean_pattern) or clean_pattern in normalized_target:
                                 logger.critical("security_escalation_blocked_path_violation", agent_id=agent_id, file=file_path)
                                 return {"error": f"Security boundary violation: Edits to '{file_path}' are explicitly BLOCKED for this task."}
 
-                        # Rule 2: Check Allowed Paths (Explicit Whitelist, if defined)
+                        # Check Allowed Paths (Explicit Whitelist, if defined)
                         if allowed_patterns:
                             is_allowed = False
                             for pattern in allowed_patterns:
@@ -357,6 +358,7 @@ class ExecutionSupervisorActor:
         except Exception as e:
             return {"error": f"Failed to execute process inside sandbox container: {str(e)}"}
 
+    # frees disk storage space and clears locks when an agent finishes its work
     async def prune_worktree_resources(self, agent_id: str) -> None:
         worktree_path = os.path.join(self.worktrees_dir, agent_id)
         if os.path.exists(worktree_path):
@@ -373,6 +375,7 @@ class ExecutionSupervisorActor:
                 await proc.communicate()
             except Exception as e:
                 logger.error("worktree_cleanup_failed", agent_id=agent_id, error=str(e))
+
 
     async def merge_and_finalize_branch(self, agent_id: str, commit_msg: str | None = None) -> dict:
         branch_name = f"task-branch-{agent_id}"

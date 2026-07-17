@@ -8,16 +8,27 @@ import typer
 from rich.console import Console
 from rich.table import Table
 import ray
-from agentos.dod.evaluator import DoDEvaluator
+from agentos.dod.evaluator import DoDEvaluatorActor
 
 from agentos.config.settings import load_settings
-from agentos.runtime.supervisor import RuntimeSupervisor
+from agentos.runtime.supervisor import RuntimeSupervisorActor
 from agentos.storage.database import DatabaseManager
 from agentos.config.loader import runtime_tuning
 
 app = typer.Typer(no_args_is_help=True, help="AgentOS Local CLI")
 console = Console()
 
+def _start_ray_and_get_supervisor(settings):
+    tuning_cfg = runtime_tuning()
+    if not ray.is_initialized():
+        ray.init(
+            ignore_reinit_error=True,
+            num_cpus=tuning_cfg["ray"]["num_cpus"],
+            namespace="agentos",
+            include_dashboard=False,
+            object_store_memory=tuning_cfg["ray"]["object_store_memory"],
+        )
+    return RuntimeSupervisorActor.options(namespace="agentos").remote(settings.model_dump(by_alias=False))
 
 @app.command()
 def init(project_name: str = typer.Argument(..., help="Local project name.")) -> None:
@@ -49,8 +60,8 @@ def init(project_name: str = typer.Argument(..., help="Local project name.")) ->
 def plan(request: str = typer.Argument(..., help="Project request, for example: Build an ecommerce website.")) -> None:
     """Create a first deterministic bootstrap plan preview."""
     settings = load_settings()
-    supervisor = RuntimeSupervisor(settings)
-    result = asyncio.run(supervisor.bootstrap_project(request))
+    supervisor = _start_ray_and_get_supervisor(settings)
+    result = asyncio.run(supervisor.bootstrap_project.remote(request))
     console.print_json(data=result["team_plan"])
 
 
@@ -58,8 +69,8 @@ def plan(request: str = typer.Argument(..., help="Project request, for example: 
 def run(request: str = typer.Argument(..., help="Project request to execute until DoD is satisfied.")) -> None:
     """Start the runtime supervisor and create the first Ray agent team."""
     settings = load_settings()
-    supervisor = RuntimeSupervisor(settings)
-    result = asyncio.run(supervisor.bootstrap_project(request))
+    supervisor = _start_ray_and_get_supervisor(settings)
+    result = asyncio.run(supervisor.bootstrap_project.remote(request))
     console.print("Runtime started. Starter scaffold creates and starts agent actors only.")
     console.print_json(data=result)
 
@@ -108,7 +119,7 @@ def test_agent() -> None:
     import asyncio
     
     from agentos.actors.base import AgentWorkerActor
-    from agentos.execution.supervisor import ExecutionSupervisor
+    from agentos.execution.supervisor import ExecutionSupervisorActor
     from agentos.governance.models import ActionRequest
     from agentos.storage.database import DatabaseManager
     from agentos.storage.repositories import TaskRepository
@@ -121,7 +132,7 @@ def test_agent() -> None:
         db = DatabaseManager(settings)
         await db.connect()
         task_repo = TaskRepository(db)
-        evaluator = DoDEvaluator(db)
+        evaluator = DoDEvaluatorActor(db)
         
         project_id = str(uuid.uuid4())
         unique_project_name = f"SecureCalcAPI-{project_id[:8]}"
@@ -192,7 +203,7 @@ def test_agent() -> None:
         )
         
         await agent.start()
-        supervisor = ExecutionSupervisor(settings)
+        supervisor = ExecutionSupervisorActor(settings)
         
         # 4. Multi-Step Inline Quality Gating Execution Loop
         max_iterations = 4

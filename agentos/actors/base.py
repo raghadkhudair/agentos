@@ -10,19 +10,20 @@ import structlog
 
 from agentos.checkpoints.manager import Checkpoint, CheckpointManager
 from agentos.config.settings import Settings
-from agentos.governance.models import ActionRequest
+from agentos.governance.models import ActionRequest, AgentIdentity
 from agentos.memory.broker import MemoryBroker
 from agentos.storage.database import DatabaseManager
 from agentos.messaging.events import Event, EventType
 from agentos.messaging.dragonfly_bus import DragonflyBus
 from agentos.storage.repositories import (
+    MemoryRepository,
     ProviderCallRepository, 
     TaskRepository, 
     AuditEventRepository, 
     ArtifactRepository,
     SummaryRepository
 )
-from agentos.provider.gateway import ProviderGateway, ProviderRequest
+from agentos.provider.gateway import  ProviderRequest
 from agentos.config.loader import runtime_tuning
 cfg = runtime_tuning()["agent_inbox_loop"]
 
@@ -51,9 +52,17 @@ class AgentWorkerActor:
         self.ownership_domains = spec_payload.get("ownership_domains", [])
         self.event_subscriptions = spec_payload.get("event_subscriptions", [])
         self.last_checkpoint_pointer = spec_payload.get("last_checkpoint_pointer", None)
-        
+        self.identity = AgentIdentity(
+        agent_id=agent_id,
+        role=role,
+        project_id=project_id,
+        squad=self.squad,
+        memory_scopes=self.memory_scopes,
+        allowed_actions=self.allowed_actions,
+        allowed_paths=[],  # no per-agent path allowlist exists yet; tracked per-task instead (see Fix B note below)
+    )
         self.db_manager = DatabaseManager(self.settings)
-        self.provider = ProviderGateway(self.settings)
+        self.provider = None
         
         self.status = "STARTING"
         self.current_task_id = None
@@ -73,13 +82,14 @@ class AgentWorkerActor:
         self.audit_repo = AuditEventRepository(self.db_manager)
         self.artifact_repo = ArtifactRepository(self.db_manager)
         self.summary_repo = SummaryRepository(self.db_manager)
-        self.provider.db_manager = self.db_manager
-        self.provider.call_repo = ProviderCallRepository(self.db_manager)
+        self.provider = ray.get_actor("provider_gateway", namespace="agentos")
         
         from redis.asyncio import Redis
         self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
         self.pubsub = self.redis_client.pubsub()
         
+        # Incase the agent crahsed and stopped to process events, 
+        # we will try to restore the last known state from the checkpoint manager
         self.status = "RESTORE_FROM_POSTGRES"
         try:
             restored_state = await self.checkpoints.recover_agent_state.remote(self.project_id, self.agent_id)
@@ -150,6 +160,8 @@ class AgentWorkerActor:
             provider_gateway=self.provider
         )
 
+        # return the active tasks that dont depend on any other uncompleted tasks, 
+        # so the agent can pick the most critical one to work on
         active_tasks = await self.task_repo.get_active_tasks(self.project_id)
         
         uncompleted_task_ids = {t["id"] for t in active_tasks}
@@ -168,12 +180,15 @@ class AgentWorkerActor:
             f"Here are the ongoing uncompleted tasks for this project that are currently UNBLOCKED and ready to work:\n{json.dumps(runnable_tasks)}\n"
             "Choose the most critical task from the list above that matches your role boundaries.\n"
             "CRITICAL: You must return the exact 'target_task_id' you are working on in your JSON response.\n\n"
+            "If there are NO runnable tasks left, but you believe the project is not actually finished, "
+            "use action_type 'create_task' to define new work instead of choosing 'wait'.\n\n"
             "SCHEMA LAYOUT:\n"
             "{\n"
-            "  \"target_task_id\": \"string-uuid\",\n"
-            "  \"action_type\": \"write_file\" | \"read_file\" | \"shell_command\" | \"wait\",\n"
+            "  \"target_task_id\": \"string-uuid or null (null only when action_type is 'create_task')\",\n"
+            "  \"action_type\": \"write_file\" | \"read_file\" | \"shell_command\" | \"create_task\" | \"wait\",\n"
             "  \"description\": \"Objective summary\",\n"
-            "  \"payload\": {\"file_path\": \"src/app.py\", \"content\": \"...\"}\n"
+            "  \"payload\": {\"file_path\": \"src/app.py\", \"content\": \"...\"} "
+            "or {\"title\": \"New task title\", \"task_description\": \"...\", \"priority\": 1-5} for create_task\n"
             "}"
         )
         
@@ -187,7 +202,7 @@ class AgentWorkerActor:
             request, 
             response_format={"type": "json_object"}
         )
-        clean_content = response_dict.content.strip()
+        clean_content = response_dict["content"].strip()
         if clean_content.startswith("```"):
             clean_content = re.sub(r"^```json\s*|^```\s*", "", clean_content, flags=re.MULTILINE)
             clean_content = re.sub(r"\s*```$", "", clean_content, flags=re.MULTILINE).strip()
@@ -204,6 +219,38 @@ class AgentWorkerActor:
             description = "Failed to parse choice structural template response."
             payload = {}
 
+        #if the agent action not wait we will try to acquire a lock on the task 
+        # to avoid multiple agents working on the same task at the same time.
+        if action_type == "create_task":
+            self.status = "CREATE_NEW_TASK"
+            new_title = payload.get("title", "Untitled follow-up task")
+            new_description = payload.get("task_description", description)
+            new_priority = int(payload.get("priority", 3))
+
+            new_task_id = await self.task_repo.create_task(
+                project_id=self.project_id,
+                title=new_title,
+                description=new_description,
+                priority=new_priority,
+            )
+            logger.info("new_task_created_by_agent", agent_id=self.agent_id, task_id=new_task_id, title=new_title)
+
+            success_checkpoint_data = Checkpoint(
+                checkpoint_id=str(uuid4()),
+                project_id=self.project_id,
+                agent_id=self.agent_id,
+                achievement="task_created",
+                summary=f"Created new task '{new_title}' to close a detected DoD gap.",
+                agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
+            ).model_dump()
+
+            self.status = "CHECKPOINT"
+            checkpoint_res = await self.checkpoints.create.remote(success_checkpoint_data)
+            self.last_checkpoint_pointer = checkpoint_res["checkpoint_id"]
+
+            self.status = "IDLE"
+            return {"status": "SUCCESS", "checkpoint_id": checkpoint_res["checkpoint_id"], "new_task_id": new_task_id}
+   
         if action_type != "wait":
             self.status = "REQUEST_LOCKS"
             lock_acquired = False
@@ -302,7 +349,30 @@ class AgentWorkerActor:
                     logger.info("task_completed_event_dispatched_to_stream", agent_id=self.agent_id, task_id=target_task_id)
                 except Exception as e:
                     logger.error("failed_to_publish_task_completed_event", agent_id=self.agent_id, error=str(e))
-                    
+                
+                try:
+                    from agentos.storage.repositories import MemoryRepository
+                    memory_repo = MemoryRepository(self.db_manager)
+                    memory_content = f"Task '{target_task_id}' completed by {self.agent_id}: {description}"
+                    mem_id = await memory_repo.save_memory_item(
+                        project_id=self.project_id,
+                        scope="project",
+                        owner_agent_id=self.agent_id,
+                        memory_type="task_completion",
+                        title=file_path if action_type == "write_file" else description[:80],
+                        content=memory_content,
+                    )
+                    embedding_vector = await self.provider.get_embedding.remote(memory_content)
+                    async with self.db_manager.pool.acquire() as conn:
+                        await conn.execute(
+                            "INSERT INTO memory_embeddings (memory_item_id, embedding) VALUES ($1, $2::vector)",
+                            uuid.UUID(mem_id), embedding_vector
+                        )
+                except Exception as e:
+                    logger.error("failed_to_write_memory_item", agent_id=self.agent_id, error=str(e))
+
+                merge_result = await self.supervisor.merge_and_finalize_branch.remote(self.agent_id)
+                
             await self.redis_client.delete(lock_key)
             await self.redis_client.delete(lease_key)
 
