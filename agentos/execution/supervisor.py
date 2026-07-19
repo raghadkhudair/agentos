@@ -7,9 +7,12 @@ import uuid
 import ray
 import structlog
 import json
-
+import asyncpg
+from agentos.messaging.events import Event, EventType
+from agentos.messaging.dragonfly_bus import DragonflyBus
 from agentos.config.settings import Settings
 from agentos.governance.models import ActionRequest, GuardrailResult, PolicyDecision, RiskLevel
+from agentos.storage.repositories import AuditEventRepository
 from agentos.config.loader import guardrail_policies
 from agentos.storage.database import DatabaseManager
 
@@ -28,8 +31,10 @@ class ExecutionSupervisorActor:
         self._sandbox_cfg = guardrail_policies()["execution_sandbox"]
         self.workspace_path = os.path.abspath(self.settings.workspace)
         self.worktrees_dir = os.path.join(self.workspace_path, ".agentos_worktrees")
-        self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)        
+        self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
+        self._authenticated_identities = {}        
         self.db_manager = DatabaseManager(self.settings)
+        self.sandbox_db_pool = None
         self._connected = False
         
         os.makedirs(self.workspace_path, exist_ok=True)
@@ -40,7 +45,16 @@ class ExecutionSupervisorActor:
     async def _ensure_connected(self) -> None:
         if not self._connected:
             await self.db_manager.connect()
+            sandbox_url = os.getenv("SANDBOX_DATABASE_URL", self.settings.database_url)
+            self.sandbox_db_pool = await asyncpg.create_pool(sandbox_url)
             self._connected = True
+
+    async def register_agent_identity(self, identity_data: dict) -> None:
+        from agentos.governance.models import AgentIdentity
+        identity_obj = AgentIdentity(**identity_data)
+        if not hasattr(self, "_authenticated_identities"):
+            self._authenticated_identities = {}
+        self._authenticated_identities[identity_obj.agent_id] = identity_obj
 
     def _initialize_git_workspace_safely(self) -> None:
         git_dir = os.path.join(self.workspace_path, ".git")
@@ -59,7 +73,7 @@ class ExecutionSupervisorActor:
             except Exception as e:
                 logger.error("sandbox_git_initialization_failed", error=str(e))
 
-    # currently is dead becasue of no where its the memory items is being inserted from 
+    # currently is dead because of no where its the memory items is being inserted from 
     async def _verify_decision_conflict(self, action: ActionRequest) -> bool:
         await self._ensure_connected()
         safe_project_id = uuid.UUID(action.project_id) if isinstance(action.project_id, str) else action.project_id
@@ -114,8 +128,24 @@ class ExecutionSupervisorActor:
     # check if the action is allowed by policy, if not return the guardrail result, if yes execute the action and return the result
     async def request_execution(self, action: dict) -> dict:
         action_obj = ActionRequest(**action)
-        result: GuardrailResult = self.policy_engine.evaluate_action(action_obj)
+        if not hasattr(self, "_authenticated_identities"):
+            self._authenticated_identities = {}
+            
+        auth_identity = self._authenticated_identities.get(action_obj.agent_id)
+        if not auth_identity:
+            return {"executed": False, "error": "Identity Registry Violation: Unknown agent signature."}
         
+        result: GuardrailResult = await self.policy_engine.evaluate_action(action_obj, auth_identity)
+        
+        audit_repo = AuditEventRepository(self.db_manager)
+        await audit_repo.log_audit_event(
+            project_id=action_obj.project_id,
+            agent_id=action_obj.agent_id,
+            action_type=action_obj.action_type,
+            policy_decision=result.decision.value if hasattr(result.decision, "value") else str(result.decision),
+            integrity_hash=action_obj.integrity_hash
+        )
+
         logger.info(
             "policy_guardrail_evaluated", 
             agent_id=action_obj.agent_id, 
@@ -123,6 +153,10 @@ class ExecutionSupervisorActor:
             decision=result.decision,
             risk_level=result.risk_level
         )
+        
+        if result.decision == PolicyDecision.QUARANTINE_AGENT:
+            logger.critical("execution_blocked_agent_quarantined", agent_id=action_obj.agent_id)
+            return {"executed": False, "guardrail": result.model_dump(), "error": "Action blocked: Agent is under quarantine constraints."}
         
         if result.decision in {PolicyDecision.DENY, PolicyDecision.QUARANTINE_AGENT}:
             logger.warning("policy_execution_blocked", agent_id=action_obj.agent_id, decision=result.decision, reasons=result.reasons)
@@ -142,8 +176,33 @@ class ExecutionSupervisorActor:
             PolicyDecision.REQUIRE_SECURITY_REVIEW,
         }:
             logger.info("policy_pending_out_of_band_approval", agent_id=action_obj.agent_id, decision=result.decision)
-            return {"executed": False, "guardrail": result.model_dump(), "pending_approval": True}
+    
             
+            unified_stream_key = f"project:{action_obj.project_id}:events"
+            bus = DragonflyBus(self.settings.dragonfly_url)
+            
+            approval_event = Event(
+                project_id=action_obj.project_id,
+                event_type=EventType.APPROVAL_REQUEST,
+                producer_agent_id=action_obj.agent_id,
+                topic=unified_stream_key,
+                payload={
+                    "action_type": action_obj.action_type,
+                    "description": action_obj.description,
+                    "risk_level": result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level),
+                    "required_gate": result.decision.value if hasattr(result.decision, "value") else str(result.decision),
+                    "integrity_hash": action_obj.integrity_hash
+                }
+            )
+            
+            try:
+                await bus.publish_event(unified_stream_key, approval_event)
+                logger.info("approval_request_dispatched_to_stream", agent_id=action_obj.agent_id)
+            except Exception as e:
+                logger.error("failed_to_publish_approval_request", error=str(e))
+                
+            return {"executed": False, "guardrail": result.model_dump(), "pending_approval": True}
+        
         execution_result = await self._route_and_execute(action_obj)
         
         return {
@@ -177,11 +236,14 @@ class ExecutionSupervisorActor:
             actual_payload = payload.get("payload", payload) if "payload" in payload else payload
             await self._ensure_worktree_context(task_branch_id, worktree_path)
             return await self._read_file_safely(actual_payload, worktree_path)
-            
+    
         elif action_type in {"shell_command", "run_command"}:
             actual_payload = payload.get("payload", payload) if "payload" in payload else payload
             await self._ensure_worktree_context(task_branch_id, worktree_path)
             return await self._execute_sandboxed_docker_command(actual_payload, worktree_path)
+        elif action_type == "execute_db_operation":
+            actual_payload = payload.get("payload", payload) if "payload" in payload else payload
+            return await self._execute_sandbox_db_query(actual_payload)
         else:
             return {"output": f"Action type '{action_type}' processed successfully, no internal driver assigned."}
 
@@ -240,6 +302,20 @@ class ExecutionSupervisorActor:
             logger.error("path_traversal_attack_blocked", attempted_path=file_path)
             return {"error": "Path traversal detected. Write blocked for safety."}
 
+        normalized_target = file_path.replace("\\", "/").strip("/").lower()
+        
+        from agentos.config.loader import guardrail_policies
+        policies = guardrail_policies()
+        
+        forbidden_patterns = policies.get("filesystem_safety", {}).get("blocked_global_paths", [
+            ".env", "schema.sql", "guardrail_policies.yaml", "settings.py", "secrets", "logs"
+        ])
+        
+        if any(forbidden.lower() in normalized_target for forbidden in forbidden_patterns):
+            logger.critical("system_infrastructure_modification_blocked", agent_id=agent_id, file=file_path)
+            return {"error": "Access Denied: Restricting unauthorized mutation of framework control schemas or system assets."}
+        
+        # Task-Specific Whitelist/Blacklist checking
         if task_id:
             await self._ensure_connected()
             try:
@@ -251,22 +327,16 @@ class ExecutionSupervisorActor:
                     if task_record:
                         allowed_patterns = task_record["allowed_paths"] or []
                         blocked_patterns = task_record["blocked_paths"] or []
-                        
-                        # Normalize target file path for exact pattern checking
-                        normalized_target = file_path.replace("\\", "/").strip("/")
-
-                        # Check Blocked Paths (Explicit Blacklist)
                         for pattern in blocked_patterns:
-                            clean_pattern = pattern.replace("\\", "/").strip("/")
+                            clean_pattern = pattern.replace("\\", "/").strip("/").lower()
                             if normalized_target.startswith(clean_pattern) or clean_pattern in normalized_target:
                                 logger.critical("security_escalation_blocked_path_violation", agent_id=agent_id, file=file_path)
                                 return {"error": f"Security boundary violation: Edits to '{file_path}' are explicitly BLOCKED for this task."}
 
-                        # Check Allowed Paths (Explicit Whitelist, if defined)
                         if allowed_patterns:
                             is_allowed = False
                             for pattern in allowed_patterns:
-                                clean_pattern = pattern.replace("\\", "/").strip("/")
+                                clean_pattern = pattern.replace("\\", "/").strip("/").lower()
                                 if normalized_target.startswith(clean_pattern) or clean_pattern in normalized_target:
                                     is_allowed = True
                                     break
@@ -279,7 +349,6 @@ class ExecutionSupervisorActor:
                 logger.error("failed_to_enforce_task_path_safety_failing_closed", error=str(e))
                 return {"error": "Internal security guardrail failure. Write aborted."}
 
-        # Dynamic File-Path Distributed Lock
         file_lock_key = f"project:{project_id}:file_lock:{file_path}"
         try:
             lock_owner = await self.redis_client.get(file_lock_key)
@@ -326,7 +395,8 @@ class ExecutionSupervisorActor:
         container_name = f"sandbox_{uuid.uuid4().hex[:8]}"
         docker_cmd = (
             f"docker run --rm --name {container_name} "
-            f"-v {shlex.quote(worktree_path)}:/workspace "
+            f"--network none "
+            f"-v {shlex.quote(worktree_path)}:/workspace:ro "
             f"-w /workspace python:3.11-slim "
             f"sh -c {shlex.quote(command_str)}"
         )
@@ -358,6 +428,7 @@ class ExecutionSupervisorActor:
         except Exception as e:
             return {"error": f"Failed to execute process inside sandbox container: {str(e)}"}
 
+
     # frees disk storage space and clears locks when an agent finishes its work
     async def prune_worktree_resources(self, agent_id: str) -> None:
         worktree_path = os.path.join(self.worktrees_dir, agent_id)
@@ -376,14 +447,44 @@ class ExecutionSupervisorActor:
             except Exception as e:
                 logger.error("worktree_cleanup_failed", agent_id=agent_id, error=str(e))
 
-
+    async def _execute_sandbox_db_query(self, payload: dict) -> dict:
+        await self._ensure_connected()
+        operation = payload.get("query")
+        params = payload.get("parameters", [])
+        if not operation:
+            return {"error": "Missing 'query' string key inside statement execution request."}
+            
+        try:
+            async with self.sandbox_db_pool.acquire() as conn:
+                if operation.strip().lower().startswith("select"):
+                    rows = await conn.fetch(operation, *params)
+                    return {"success": True, "data": [dict(r) for r in rows]}
+                else:
+                    status = await conn.execute(operation, *params)
+                    return {"success": True, "status": status}
+        except Exception as e:
+            return {"error": f"Sandbox database operation failed: {str(e)}"}
+        
     async def merge_and_finalize_branch(self, agent_id: str, commit_msg: str | None = None) -> dict:
         branch_name = f"task-branch-{agent_id}"
         worktree_path = os.path.join(self.worktrees_dir, agent_id)
         default_branch = self._sandbox_cfg['default_branch']
         
-        logger.info("initiating_branch_merge_and_finalization", agent_id=agent_id, branch=branch_name)
+        await self._ensure_connected()
+        query = """
+            SELECT achievement FROM checkpoints 
+            WHERE agent_id = $1 
+            ORDER BY created_at DESC LIMIT 1;
+        """
+        async with self.db_manager.pool.acquire() as conn:
+            last_achievement = await conn.fetchval(query, agent_id)
+            
+        if last_achievement == "review_failed":
+            logger.critical("merge_blocked_by_failed_security_review", agent_id=agent_id)
+            await self.prune_worktree_resources(agent_id)
+            return {"success": False, "error": "Security Breach: Merge denied due to a failed architectural or security review."}
 
+        logger.info("initiating_branch_merge_and_finalization", agent_id=agent_id, branch=branch_name)
         if not os.path.exists(worktree_path):
             return {"success": False, "error": f"No active worktree found for agent {agent_id}."}
 

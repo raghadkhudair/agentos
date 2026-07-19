@@ -56,8 +56,10 @@ class TaskRepository:
         owner_agent_id: str = None,
         parent_task_id: str = None,
         priority: int = 3,
+        acceptance_criteria: list[str] = None, # 👈 Added back for insertion matching
         allowed_paths: list[str] = None,
         blocked_paths: list[str] = None,
+        expected_outputs: list[str] = None,    # 👈 ADDED for Section 15
         required_reviewers: list[str] = None,
         affected_contracts: list[str] = None,
         risk_level: str = "LOW"
@@ -65,9 +67,10 @@ class TaskRepository:
         query = """
             INSERT INTO tasks (
                 project_id, title, description, owner_agent_id, parent_task_id, priority, 
-                allowed_paths, blocked_paths, required_reviewers, affected_contracts, risk_level
+                acceptance_criteria, allowed_paths, blocked_paths, expected_outputs,
+                required_reviewers, affected_contracts, risk_level
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id;
         """
         p_uuid = UUID(parent_task_id) if parent_task_id else None
@@ -80,8 +83,10 @@ class TaskRepository:
                 owner_agent_id, 
                 p_uuid, 
                 priority,
+                json.dumps(acceptance_criteria or []), 
                 allowed_paths or [],
                 blocked_paths or [],
+                expected_outputs or [],                
                 required_reviewers or [],
                 affected_contracts or [],
                 risk_level
@@ -107,8 +112,10 @@ class TaskRepository:
                 t.owner_agent_id,
                 t.priority,
                 t.parent_task_id::text,
+                t.acceptance_criteria,
                 t.allowed_paths,
                 t.blocked_paths,
+                t.expected_outputs, 
                 t.required_reviewers,
                 t.affected_contracts,
                 t.risk_level,
@@ -126,7 +133,7 @@ class TaskRepository:
         async with self.db.pool.acquire() as conn:
             rows = await conn.fetch(query, safe_id)
             return [dict(row) for row in rows]
-        
+
     async def update_task_status(self, task_id: str, status: str) -> None:
         try:
             safe_task_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
@@ -196,16 +203,15 @@ class ProviderCallRepository:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    async def log_call(self, project_id: str, purpose: str, provider: str, model: str, cost_usd: float) -> str:
+    async def log_call(self, project_id: str, purpose: str, provider: str, model: str, cost_usd: float, prompt_hash: str = None, response_hash: str = None) -> str:
         query = """
-            INSERT INTO provider_calls (project_id, purpose, provider, model, cost_usd, status)
-            VALUES ($1, $2, $3, $4, $5, 'COMPLETED')
+            INSERT INTO provider_calls (project_id, purpose, provider, model, cost_usd, prompt_hash, response_hash, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'COMPLETED')
             RETURNING id;
         """
         async with self.db.pool.acquire() as conn:
-            call_id = await conn.fetchval(query, UUID(project_id), purpose, provider, model, cost_usd)
+            call_id = await conn.fetchval(query, UUID(project_id), purpose, provider, model, cost_usd, prompt_hash, response_hash)
             return str(call_id)
-
 
 class MemoryRepository:
     def __init__(self, db_manager: DatabaseManager):

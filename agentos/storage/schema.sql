@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     acceptance_criteria JSONB NOT NULL DEFAULT '[]'::jsonb,
     allowed_paths TEXT[] NOT NULL DEFAULT '{}',
     blocked_paths TEXT[] NOT NULL DEFAULT '{}',
+    expected_outputs TEXT[] NOT NULL DEFAULT '{}', 
     required_reviewers TEXT[] NOT NULL DEFAULT '{}',
     affected_contracts TEXT[] NOT NULL DEFAULT '{}',
     risk_level TEXT NOT NULL DEFAULT 'LOW',

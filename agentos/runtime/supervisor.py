@@ -12,7 +12,7 @@ from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedT
 from agentos.watchdogs.runtime_watchdogs import DoDWatchdog, StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
 
 from agentos.storage.database import DatabaseManager
-from agentos.storage.repositories import ProjectRepository, EventRepository
+from agentos.storage.repositories import ProjectRepository, EventRepository, TaskRepository
 from agentos.messaging.dragonfly_bus import DragonflyBus
 from agentos.messaging.events import Event, EventType
 from agentos.runtime.trigger_engine import TriggerEngineActor
@@ -21,6 +21,7 @@ from agentos.provider.gateway import ProviderGatewayActor
 from agentos.execution.supervisor import ExecutionSupervisorActor
 from agentos.checkpoints.manager import CheckpointManagerActor, SummaryManagerActor
 from agentos.dod.evaluator import DoDEvaluatorActor
+from agentos.actors.reviewer import ReviewerAgentActor
 
 from agentos.config.loader import runtime_tuning
 tuning_cfg = runtime_tuning()
@@ -37,7 +38,7 @@ class RuntimeSupervisorActor:
         self.db_manager = DatabaseManager(self.settings)
         self.dragonfly = DragonflyBus(self.settings.dragonfly_url)
         
-        # Initialize Ray Actors with remote options and serializable settings payloads
+        
         self.trigger_engine = TriggerEngineActor.options(
             name="trigger_engine",
             namespace="agentos"
@@ -70,6 +71,11 @@ class RuntimeSupervisorActor:
         
         self.dod_evaluator = DoDEvaluatorActor.options(
             name="dod_evaluator",
+            namespace="agentos"
+        ).remote(self.settings.model_dump(by_alias=False))
+
+        self.safety_reviewer = ReviewerAgentActor.options(
+            name="safety_reviewer",
             namespace="agentos"
         ).remote(self.settings.model_dump(by_alias=False))
         
@@ -124,6 +130,37 @@ class RuntimeSupervisorActor:
         logger.info("spawning_ray_agent_actors", total_count=validated.total_agents)
         actors = await self.create_agent_actors(validated.agents, db_project_id)
 
+        for spec in validated.agents:
+            for index in range(1, spec.count + 1):
+                agent_id = f"{spec.role.value}-{index}"
+                identity_payload = {
+                    "agent_id": agent_id,
+                    "role": spec.role.value,
+                    "project_id": str(db_project_id),
+                    "squad": spec.role.value.split("_")[0],
+                    "memory_scopes": spec.memory_scopes,
+                    "allowed_actions": spec.allowed_action_categories,
+                    "allowed_paths": []
+                }
+                await self.memory_broker.register_agent_identity.remote(identity_payload)
+
+        initial_backlog = raw_plan.get("initial_backlog", [])
+        logger.info("seeding_initial_project_task_backlog", count=len(initial_backlog))
+       
+        task_repo = TaskRepository(self.db_manager)
+        for task_data in initial_backlog:
+            await task_repo.create_task(
+                project_id=db_project_id,
+                title=task_data["title"],
+                description=task_data["description"],
+                priority=int(task_data.get("priority", 3)),
+                allowed_paths=task_data.get("allowed_paths", []),
+                blocked_paths=task_data.get("blocked_paths", []),
+                expected_outputs=task_data.get("expected_outputs", []),
+                risk_level=task_data.get("risk_level", "LOW")
+            )
+                
+                
         unified_stream_key = f"project:{db_project_id}:events"
 
         first_pm_identity = None
@@ -140,6 +177,14 @@ class RuntimeSupervisorActor:
                         await self.trigger_engine.register_subscription.remote(e_type.value, agent_id)
                     except ValueError:
                         logger.warning("invalid_event_type_proposed", event_type=e_type_str)
+
+        for action_cat in spec.allowed_action_categories:
+            if action_cat == "implement":
+                await self.trigger_engine.register_allowed_producer.remote("TASK_COMPLETED", agent_id)
+                await self.trigger_engine.register_allowed_producer.remote("TASK_CREATED", agent_id)
+            elif action_cat == "review":
+                await self.trigger_engine.register_allowed_producer.remote("REVIEW_REQUEST", agent_id)
+                await self.trigger_engine.register_allowed_producer.remote("REVIEW_RESULT", agent_id)
 
         asyncio.create_task(self.trigger_engine.start_routing_loop.remote(db_project_id))
         asyncio.create_task(self.watchdog_loop(db_project_id, validated.original.dod))
@@ -275,6 +320,7 @@ class RuntimeSupervisorActor:
     async def create_agent_actors(self, specs: Iterable[AgentSpec], project_id: str) -> list[dict]:
         """Spawns Ray agent actors and registers them for health monitoring."""
         from agentos.actors.base import AgentWorkerActor
+        event_repo = EventRepository(self.db_manager)
 
         created: list[dict] = []
         settings_payload = self.settings.model_dump(by_alias=False)
@@ -320,12 +366,34 @@ class RuntimeSupervisorActor:
         return created
 
     async def _supervise_health_loop(self, project_id: str) -> None:
-        """Background daemon that pings actors and restarts them if they die."""
         from agentos.actors.base import AgentWorkerActor
+        from redis.asyncio import Redis
+        
+        redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
+        quarantine_key = "governance:global:quarantined_agents"
         
         while self.is_running:
             await asyncio.sleep(15) 
+            
             for agent_id, data in list(self._actor_registry.items()):
+                if data.get("status") == "QUARANTINED":
+                    continue
+                    
+                is_isolated = await redis_client.sismember(quarantine_key, agent_id)
+                if is_isolated:
+                    logger.critical("quarantine_manager_enforcing_containment", agent_id=agent_id)
+                    
+                    try:
+                        await redis_client.delete(f"agent:{agent_id}:inbox")
+                        await redis_client.delete(f"agent:{agent_id}:processing_lease")
+                    except Exception as ce:
+                        logger.error("failed_to_clear_quarantined_cache_keys", error=str(ce))
+                        
+                    ray.kill(data["handle"])
+                    self._actor_registry[agent_id]["status"] = "QUARANTINED"
+                    logger.critical("agent_actor_terminated_and_contained", agent_id=agent_id)
+                    continue
+                
                 actor = data["handle"]
                 try:
                     state = await actor.start.remote() 
@@ -361,7 +429,6 @@ class RuntimeSupervisorActor:
         while self.is_running:
             await asyncio.sleep(tuning_cfg["watchdog_loop"]["interval_seconds"])
             
-            # Evaluate the Definition of Done (DoD) remotely on the dedicated Ray Actor
             try:
                 evaluation_result = await self.dod_evaluator.evaluate.remote(project_id, dod)
                 if evaluation_result.get("satisfied", False):
@@ -374,17 +441,22 @@ class RuntimeSupervisorActor:
                     evaluation_result.get("gaps", [])
                 )
                 if stall_result.get("action_required") == "TRIGGER_REPLANNING":
-                    logger.warning("dod_stall_detected", reason=stall_result["reason"], gaps=stall_result["gaps"])
+                    logger.warning("dod_stall_detected_initiating_replanning_phase", gaps=stall_result["gaps"])
                     unified_stream_key = f"project:{project_id}:events"
-                    stall_event = Event(
+                    
+                    replanning_event = Event(
                         project_id=project_id,
-                        event_type=EventType.TASK_CREATED,
+                        event_type=EventType.REPLANNING_TRIGGERED, 
                         topic=unified_stream_key,
                         payload={
-                            "message": f"STALLED: No active tasks but DoD unsatisfied. Gaps: {', '.join(stall_result['gaps'])}",
+                            "message": f"CRITICAL STALL: Backlog is empty but project goals are unfulfilled.",
                             "missing_dod_items": stall_result["gaps"]
                         }
                     )
+                    
+                    await event_repo.save_event(project_id, replanning_event)
+                    await self.dragonfly.publish_event(unified_stream_key, replanning_event)
+
                     await self.dragonfly.publish_event(unified_stream_key, stall_event)
                     self._watchdog_cycle_count = getattr(self, "_watchdog_cycle_count", 0) + 1
                     if self._watchdog_cycle_count % 3 == 0:

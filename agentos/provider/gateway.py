@@ -8,6 +8,7 @@ import litellm
 import structlog
 from dataclasses import dataclass
 from typing import Any, Dict, List
+import hashlib
 
 from agentos.config.settings import Settings
 from agentos.storage.database import DatabaseManager
@@ -43,6 +44,10 @@ class ProviderGatewayActor:
         
         tuning = runtime_tuning()
         model_cfg = tuning.get("models", {})
+
+        policies = guardrail_policies()
+        self._allowed_egress_domains = policies.get("network_safety", {}).get("allowed_domains", ["api.google.com", "api.litellm.ai"])
+
         
         self.default_model = model_cfg.get("primary", "gemini/gemini-2.5-pro")
         self.fallback_model = model_cfg.get("fallback", "gemini/gemini-2.5-flash")
@@ -55,13 +60,48 @@ class ProviderGatewayActor:
             await self.db_manager.connect()
             self._connected = True
 
-    def _sanitize_prompt_input(self, text: str) -> str:
-        """Sanitizes user prompt inputs against configured safety patterns."""
-        patterns = guardrail_policies()["prompt_sanitization_patterns"]
-        sanitized = text
-        for pattern in patterns:
-            sanitized = re.sub(pattern, "[REDACTED_SECURITY_VIOLATION]", sanitized, flags=re.IGNORECASE)
-        return sanitized
+    def _sanitize_prompt_input(self, messages: list[dict]) -> list[dict]:
+        """
+        Hardens outbound calls against prompt-injection attacks, filters out sensitive data,
+        and redacts system secrets before external transmission.
+        """
+        import re
+
+        injection_patterns = [
+            r"(?i)ignore\s+(prev|old|above)\s+(instructions|directives)",
+            r"(?i)system\s+prompt\s+override",
+            r"(?i)you\s+are\s+now\s+an\s+unrestricted",
+            r"(?i)output\s+the\s+above\s+text\s+instead",
+            r"(?i)dan\s+mode"
+        ]
+
+        sensitive_patterns = [
+            r"(?i)sk-[a-zA-Z0-9]{32,}",          
+            r"(?i)ghp_[a-zA-Z0-9]{36}",           
+            r"(?i)bearer\s+[a-zA-Z0-9_\-\.]+",  
+            r"(?i)password\s*=\s*['\"][^'\"]+['\"]"
+        ]
+
+        sanitized_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            
+            for pattern in injection_patterns:
+                if re.search(pattern, content):
+                    logger.critical("prompt_injection_attack_detected", pattern=pattern)
+                    raise RuntimeError("Security Breach: Outbound gateway call blocked due to prompt-injection detection flag.")
+
+            for pattern in sensitive_patterns:
+                if re.search(pattern, content):
+                    logger.warning("sensitive_data_exposure_prevented_redacting")
+                    content = re.sub(pattern, "[REDACTED_SENSITIVE_CREDENTIAL]", content)
+
+            sanitized_messages.append({
+                "role": msg.get("role", "user"),
+                "content": content
+            })
+
+        return sanitized_messages
 
     async def _check_budget_allowance(self, project_id: str) -> bool:
         """Strictly enforces project budget caps before calling external models."""
@@ -101,6 +141,11 @@ class ProviderGatewayActor:
     async def get_completion(self, request: ProviderRequest, response_format: dict | None = None, **kwargs) -> dict:
         """Gets AI completion, handles fallbacks, enforces budgets, and validates output structures."""
         await self._ensure_connected()
+
+        request_purpose = request.purpose.strip().lower()
+        if not any(domain in self.settings.database_url or domain in "litellm" for domain in self._allowed_egress_domains):
+            logger.critical("network_egress_violation_blocked", purpose=request_purpose)
+            raise RuntimeError("Security Network Blocking: Outbound API destination falls outside allowed network egress boundaries.")
 
    
         if not await self._check_budget_allowance(request.budget_key):
@@ -152,14 +197,19 @@ class ProviderGatewayActor:
             logger.error("invalid_output_structure_detected", model=used_model)
             raise ValueError("Provider generated invalid output structure. JSON validation failed.")
 
-        
+        raw_prompt_str = "".join(m["content"] for m in sanitized_messages)
+        p_hash = hashlib.sha256(raw_prompt_str.encode()).hexdigest()
+        r_hash = hashlib.sha256(response_content.encode()).hexdigest()
+
         try:
             await self.call_repo.log_call(
                 project_id=request.budget_key,
                 purpose=request.purpose,
                 provider="litellm",
                 model=used_model,
-                cost_usd=float(cost)
+                cost_usd=float(cost),
+                prompt_hash=p_hash,
+                response_hash=r_hash
             )
         except Exception as log_error:
             logger.error("failed_to_log_call_metrics", error=str(log_error))
@@ -171,10 +221,28 @@ class ProviderGatewayActor:
             "estimated_cost_usd": float(cost)
         }
     
-    async def get_embedding(self, text: str) -> list[float]:
-        """Generates a semantic vector embedding using LiteLLM."""
+    async def get_embedding(self, text: str, project_id: str) -> list[float]:
+        await self._ensure_connected()
+        
+        if not await self._check_budget_allowance(project_id):
+            logger.error("budget_breach_detected_on_embedding", project_id=project_id)
+            raise RuntimeError("API Request blocked: Project budget cap has been exceeded.")
+            
         try:
             response = await litellm.aembedding(model=self.embedding_model, input=[text])
+            cost = litellm.completion_cost(completion_response=response) or 0.0
+            
+            try:
+                await self.call_repo.log_call(
+                    project_id=project_id,
+                    purpose="semantic_memory_embedding",
+                    provider="litellm",
+                    model=self.embedding_model,
+                    cost_usd=float(cost)
+                )
+            except Exception as log_error:
+                logger.error("failed_to_log_embedding_metrics", error=str(log_error))
+                
             return response['data'][0]['embedding']
         except Exception as e:
             logger.error("failed_to_fetch_embedding", error=str(e))

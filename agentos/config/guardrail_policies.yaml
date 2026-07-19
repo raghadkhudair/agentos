@@ -16,15 +16,56 @@ destructive_patterns:
   - "delete event log"
   - "curl | sh"
   - "wget | sh"
+  - "delete repository"
+  - "expose secret"
+  - "modify provider key"
+  - "deploy to production"
+  - "delete migration history"
+  - "remove backup"
+  - "modify production"
+  - "sudo"
+  - "chmod"
+  - "chown"
+  - "disable logs"
+  - "disable logging"
+  - "access host secrets"
 
-# action_type values that always require independent human/reviewer sign-off
+controlled_command_keywords:
+  - "npm install"
+  - "pip install"
+  - "poetry add"
+  - "docker build"
+  - "docker compose"
+  - "docker-compose"
+  - "run_migration"
+
 require_review_action_types:
   - "modify_auth"
   - "modify_ci"
   - "run_migration"
   - "add_dependency"
+  - "modify_docker"
 
-# action_type values considered low risk (auto-allowed)
+require_security_review_action_types:
+  - "modify_auth"
+  - "change_encryption"
+
+require_backup_action_types:
+  - "run_migration"
+  - "wipe_cache"
+
+sandbox_only_action_types:
+  - "shell_command"
+  - "run_command"
+
+medium_risk_shell_action_types:
+  - "shell_command"
+  - "run_command"
+  - "edit_file"
+  - "create_branch"
+  - "update_documentation"
+  - "publish_artifact"
+
 low_risk_action_types:
   - "read_file"
   - "write_file"
@@ -33,10 +74,23 @@ low_risk_action_types:
   - "create_summary"
   - "search_memory"
 
-# action_type values considered medium risk (allowed with constraints)
-medium_risk_shell_action_types:
-  - "shell_command"
-  - "run_command"
+
+filesystem_safety:
+  blocked_global_paths:
+    - ".env"
+    - "schema.sql"
+    - "guardrail_policies.yaml"
+    - "settings.py"
+    - "secrets"
+    - "logs"
+    - "provider_keys"
+    - "audit_logs"
+    - "checkpoints"
+    - ".github/workflows"
+    - ".gitlab-ci.yml"
+    - "docker.sock"
+    - "policy_engine.py"
+
 
 safety_watchdog:
   blocked_call_quarantine_threshold: 5   # violations before agent gets quarantined
@@ -45,7 +99,6 @@ stagnation_watchdog:
   checkpoint_history_lookback: 10        # how many recent checkpoints to inspect
   repeated_action_threshold: 4           # identical repeats before flagging a loop
 
-# Prompt-injection / malicious-instruction patterns scrubbed from every LLM prompt
 prompt_sanitization_patterns:
   - '\.env'
   - 'ignore\s+previous\s+instructions'

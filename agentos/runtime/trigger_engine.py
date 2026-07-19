@@ -17,6 +17,7 @@ class TriggerEngineActor:
     def __init__(self, dragonfly_url: str):
         self.bus = DragonflyBus(dragonfly_url)
         self.subscriptions: Dict[str, Set[str]] = {}
+        self._allowed_producers: Dict[str, List[str]] = {}
         self.is_running = False
 
     async def register_subscription(self, event_type: str, agent_id: str) -> None:
@@ -24,6 +25,11 @@ class TriggerEngineActor:
             self.subscriptions[event_type] = set()
         self.subscriptions[event_type].add(agent_id)
         logger.info("subscription_registered", event_type=event_type, agent_id=agent_id)
+
+    async def register_allowed_producer(self, event_type: str, agent_id: str) -> None:
+        if event_type not in self._allowed_producers:
+            self._allowed_producers[event_type] = []
+        self._allowed_producers[event_type].append(agent_id)
 
     async def start_routing_loop(self, project_id: str) -> None:
         self.is_running = True
@@ -96,7 +102,17 @@ class TriggerEngineActor:
                 await asyncio.sleep(1.0)
 
     async def _route_event(self, event: Event) -> None:
+
         event_type_str = event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type)
+        if event_type_str != "PROJECT_CREATED":
+            allowed = self._allowed_producers.get(event_type_str, [])
+            if event.producer_agent_id not in allowed:
+                logger.critical("unauthorized_communication_attempt_dropped", producer_agent_id=event.producer_agent_id, event_type=event_type_str)
+                return
+        if event_type_str == "SECURITY_ALERT" and "developer" in (event.producer_agent_id or "").lower():
+            logger.critical("privilege_escalation_interception", producer=event.producer_agent_id, event=event_type_str)
+            # Force route to security reviewer instead of intended targets
+            event.target_agent_id = "security_reviewer-1"
         subscribers = set(self.subscriptions.get(event_type_str, set()))
         
         affected_artifact = event.payload.get("artifact_uri") or event.payload.get("file_path")

@@ -46,23 +46,34 @@ class MemoryBrokerActor:
         # Redacts common credentials and API keys inside content streams
         scrubbed = re.sub(r'(?i)(api_key|password|secret|token|private_key)\s*[:=]\s*["\'][^"\']+["\']', r'\1: "[REDACTED_BY_MEMORY_BROKER]"', text)
         return scrubbed
+    
+    async def register_agent_identity(self, identity_data: dict) -> None:
+        from agentos.governance.models import AgentIdentity
+        identity_obj = AgentIdentity(**identity_data)
+        if not hasattr(self, "_authenticated_identities"):
+            self._authenticated_identities = {}
+        self._authenticated_identities[identity_obj.agent_id] = identity_obj
 
     async def build_catchup_packet(
-        self,
-        *,
-        project_id: str,
-        agent_id: str,
-        trigger_event_id: str,
-        agent_allowed_scopes: list[str],
-        requested_scopes: list[str] | None = None,
-        provider_gateway: any = None
-    ) -> dict:
-        """Retrieves context safely and delegates summarization to the SummaryManagerActor."""
+    self,
+    *,
+    project_id: str,
+    agent_id: str,
+    trigger_event_id: str,
+    requested_scopes: list[str] | None = None,
+    provider_gateway: any = None
+) -> dict:
         await self._ensure_connected()
         
-        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+        if not hasattr(self, "_authenticated_identities"):
+            self._authenticated_identities = {}
+            
+        auth_identity = self._authenticated_identities.get(agent_id)
+        if not auth_identity:
+            return {"error": "Identity Registry Violation: Unknown memory requester signature."}
+            
+        agent_allowed_scopes = auth_identity.memory_scopes
         
-        # Enforce Memory Access Control (ACL)
         resolved_scopes = []
         if requested_scopes:
             resolved_scopes = [s for s in requested_scopes if s in agent_allowed_scopes]
@@ -142,7 +153,7 @@ class MemoryBrokerActor:
         relevant_memories = []
         if provider_gateway and trigger_message:
             try:
-                query_vector = await provider_gateway.get_embedding.remote(trigger_message)
+                query_vector = await provider_gateway.get_embedding.remote(trigger_message, str(project_id))
                 
                 query_memories = """
                     SELECT mi.title, mi.content, (me.embedding <=> $2::vector) as distance

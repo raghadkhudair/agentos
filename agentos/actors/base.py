@@ -53,14 +53,14 @@ class AgentWorkerActor:
         self.event_subscriptions = spec_payload.get("event_subscriptions", [])
         self.last_checkpoint_pointer = spec_payload.get("last_checkpoint_pointer", None)
         self.identity = AgentIdentity(
-        agent_id=agent_id,
-        role=role,
-        project_id=project_id,
-        squad=self.squad,
-        memory_scopes=self.memory_scopes,
-        allowed_actions=self.allowed_actions,
-        allowed_paths=[],  # no per-agent path allowlist exists yet; tracked per-task instead (see Fix B note below)
-    )
+            agent_id=agent_id,
+            role=role,
+            project_id=project_id,
+            squad=self.squad,
+            memory_scopes=self.memory_scopes,
+            allowed_actions=self.allowed_actions,
+            allowed_paths=[],
+        )
         self.db_manager = DatabaseManager(self.settings)
         self.provider = None
         
@@ -88,8 +88,15 @@ class AgentWorkerActor:
         self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
         self.pubsub = self.redis_client.pubsub()
         
-        # Incase the agent crahsed and stopped to process events, 
-        # we will try to restore the last known state from the checkpoint manager
+        await self.memory_broker.register_agent_identity.remote(self.identity.model_dump())
+
+        self.status = "REGISTRATION"
+        try:
+            await self.supervisor.register_agent_identity.remote(self.identity.model_dump())
+            logger.info("agent_identity_registered_with_supervisor", agent_id=self.agent_id)
+        except Exception as e:
+            logger.error("identity_registration_failed", agent_id=self.agent_id, error=str(e))
+
         self.status = "RESTORE_FROM_POSTGRES"
         try:
             restored_state = await self.checkpoints.recover_agent_state.remote(self.project_id, self.agent_id)
@@ -156,17 +163,17 @@ class AgentWorkerActor:
             project_id=self.project_id,
             agent_id=self.agent_id,
             trigger_event_id=event_id,
-            agent_allowed_scopes=self.memory_scopes,
             provider_gateway=self.provider
         )
 
-        # return the active tasks that dont depend on any other uncompleted tasks, 
-        # so the agent can pick the most critical one to work on
         active_tasks = await self.task_repo.get_active_tasks(self.project_id)
         
         uncompleted_task_ids = {t["id"] for t in active_tasks}
         runnable_tasks = []
         for t in active_tasks:
+            if t.get("status") == "IN_PROGRESS":
+                continue
+                
             dependencies = t.get("dependencies", [])
             unsatisfied = [dep for dep in dependencies if dep in uncompleted_task_ids]
             if not unsatisfied:
@@ -175,20 +182,32 @@ class AgentWorkerActor:
         self.status = "DECIDE_NEXT_ACTION"
         system_prompt = (
             f"You are {self.agent_id}, a {self.role} in the {self.squad} squad.\n"
-            f"Your ownership domains are: {json.dumps(self.ownership_domains)}.\n"
-            f"Your allowed action capabilities are: {json.dumps(self.allowed_actions)}.\n"
-            f"Here are the ongoing uncompleted tasks for this project that are currently UNBLOCKED and ready to work:\n{json.dumps(runnable_tasks)}\n"
-            "Choose the most critical task from the list above that matches your role boundaries.\n"
-            "CRITICAL: You must return the exact 'target_task_id' you are working on in your JSON response.\n\n"
-            "If there are NO runnable tasks left, but you believe the project is not actually finished, "
-            "use action_type 'create_task' to define new work instead of choosing 'wait'.\n\n"
+    f"Your ownership domains are: {json.dumps(self.ownership_domains)}.\n"
+    f"Your allowed action capabilities are: {json.dumps(self.allowed_actions)}.\n"
+    f"Here are the uncompleted tasks for this project that are ready to work:\n{json.dumps(runnable_tasks)}\n"
+    "Choose the most critical task from the list above that matches your role boundaries.\n"
+    "CRITICAL: You must return the exact 'target_task_id' you are working on in your JSON response.\n\n"
+    "If there are NO runnable tasks left matching your capabilities, you must choose action_type 'wait'. "
+    "Do not invent new milestones autonomously.\n\n"
             "SCHEMA LAYOUT:\n"
             "{\n"
             "  \"target_task_id\": \"string-uuid or null (null only when action_type is 'create_task')\",\n"
-            "  \"action_type\": \"write_file\" | \"read_file\" | \"shell_command\" | \"create_task\" | \"wait\",\n"
+            "  \"action_type\": \"write_file\" | \"read_file\" | \"shell_command\" | \"create_task\" | \"execute_db_operation\" | \"wait\",\n"
             "  \"description\": \"Objective summary\",\n"
-            "  \"payload\": {\"file_path\": \"src/app.py\", \"content\": \"...\"} "
-            "or {\"title\": \"New task title\", \"task_description\": \"...\", \"priority\": 1-5} for create_task\n"
+            "  \"payload\": {\n"
+            "     \"query\": \"CREATE TABLE users (...)\",\n"
+            "     \"parameters\": []\n"
+            "     \"file_path\": \"src/app.py\", \n"
+            "     \"content\": \"...\",\n"
+            "     \"title\": \"New task title (create_task only)\",\n"
+            "     \"task_description\": \"Description (create_task only)\",\n"
+            "     \"priority\": 1-5,\n"
+            "     \"risk_level\": \"LOW\" | \"MEDIUM\" | \"HIGH\" | \"CRITICAL\",\n"
+            "     \"acceptance_criteria\": [\"conditions\"],\n"
+            "     \"allowed_paths\": [\"paths/\"],\n"
+            "     \"blocked_paths\": [\"paths/\"],\n"
+            "     \"expected_outputs\": [\"files\"]\n"
+            "  }\n"
             "}"
         )
         
@@ -213,25 +232,42 @@ class AgentWorkerActor:
             action_type = decision.get("action_type", "wait")
             description = decision.get("description", "")
             payload = decision.get("payload", {})
+            
+            if action_type != "wait" and action_type not in self.identity.allowed_actions:
+                logger.warning("hallucinated_or_unauthorized_tool_rejected_locally", agent_id=self.agent_id, action_type=action_type)
+                action_type = "wait"
+                target_task_id = None
+                payload = {}
         except Exception:
             action_type = "wait"
             target_task_id = None
             description = "Failed to parse choice structural template response."
             payload = {}
 
-        #if the agent action not wait we will try to acquire a lock on the task 
-        # to avoid multiple agents working on the same task at the same time.
         if action_type == "create_task":
             self.status = "CREATE_NEW_TASK"
             new_title = payload.get("title", "Untitled follow-up task")
             new_description = payload.get("task_description", description)
             new_priority = int(payload.get("priority", 3))
+            
+            allowed_paths = payload.get("allowed_paths", [])
+            blocked_paths = payload.get("blocked_paths", [])
+            expected_outputs = payload.get("expected_outputs", [])
+            acceptance_criteria = payload.get("acceptance_criteria", [])
+            risk_level = payload.get("risk_level", "LOW")
 
             new_task_id = await self.task_repo.create_task(
                 project_id=self.project_id,
                 title=new_title,
                 description=new_description,
+                owner_agent_id=None,
+                parent_task_id=self.current_task_id,
                 priority=new_priority,
+                acceptance_criteria=acceptance_criteria,
+                allowed_paths=allowed_paths,
+                blocked_paths=blocked_paths,
+                expected_outputs=expected_outputs,
+                risk_level=risk_level
             )
             logger.info("new_task_created_by_agent", agent_id=self.agent_id, task_id=new_task_id, title=new_title)
 
@@ -271,9 +307,29 @@ class AgentWorkerActor:
                 await self.redis_client.delete(lease_key)
                 return {"status": "LOCK_ERROR"}
 
+            # Set database task status to IN_PROGRESS and log claimed state checkpoint
+            if target_task_id:
+                self.current_task_id = target_task_id
+                await self.task_repo.update_task_status(target_task_id, "IN_PROGRESS")
+                
+                claim_checkpoint = Checkpoint(
+                    checkpoint_id=str(uuid4()),
+                    project_id=self.project_id,
+                    agent_id=self.agent_id,
+                    task_id=target_task_id,
+                    achievement="task_claimed",
+                    summary=f"Claimed task '{target_task_id}' and locked processing boundaries.",
+                    agent_state_snapshot={"current_task_id": self.current_task_id, "status": "EXECUTING"}
+                ).model_dump()
+                await self.checkpoints.create.remote(claim_checkpoint)
+
             self.status = "SUBMIT_ACTION_REQUEST"
             action_req = ActionRequest(
-                project_id=self.project_id, agent_id=self.agent_id, action_type=action_type, description=description, payload=payload
+                project_id=self.project_id, 
+                agent_id=self.identity.agent_id, 
+                action_type=action_type, 
+                description=description, 
+                payload=payload
             )
             
             self.status = "EXECUTION_SUPERVISOR_RUNS_IF_ALLOWED"
@@ -281,40 +337,6 @@ class AgentWorkerActor:
             
             if action_type in {"write_file", "write_code"} and exec_res.get("executed"):
                 self.status = "PUBLISH_OUTPUT"
-                from agentos.actors.reviewer import ReviewerAgentActor
-                
-                reviewer = ReviewerAgentActor.options(namespace="agentos").remote(settings_payload=self.settings.model_dump())
-                review = await reviewer.review_code_patch.remote(payload.get("file_path", ""), payload.get("content", ""))
-                
-                if not review.get("approved", False):
-                    error_checkpoint_data = Checkpoint(
-                        checkpoint_id=str(uuid4()),
-                        project_id=self.project_id,
-                        agent_id=self.agent_id,
-                        achievement="review_failed",
-                        summary=f"Blocker: Code patch rejected. Vulnerabilities: {review.get('vulnerabilities_found')}",
-                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-                    ).model_dump() 
-
-                    self.status = "CHECKPOINT"
-                    checkpoint_res = await self.checkpoints.create.remote(error_checkpoint_data)
-                    
-                    self.last_checkpoint_pointer = checkpoint_res["checkpoint_id"]
-                    
-                    await self.redis_client.delete(lock_key)
-                    await self.redis_client.delete(lease_key)
-                    
-                    self.status = "IDLE"
-                    return {"status": "BLOCKED_BY_REVIEW"}
-
-            policy_decision = exec_res.get("guardrail", {}).get("decision", "ALLOW")
-            await self.audit_repo.log_audit_event(
-                project_id=self.project_id,
-                agent_id=self.agent_id,
-                action_type=action_type,
-                policy_decision=policy_decision,
-                integrity_hash=action_req.integrity_hash
-            )
 
             if exec_res.get("executed") and target_task_id:
                 self.status = "PUBLISH_OUTPUT"
@@ -330,17 +352,18 @@ class AgentWorkerActor:
                     )
                 
                 await self.task_repo.update_task_status(target_task_id, "COMPLETED")
+                self.current_task_id = None
                 logger.info("task_completed_by_agent", agent_id=self.agent_id, task_id=target_task_id)
 
                 unified_stream_key = f"project:{self.project_id}:events"
                 completion_event = Event(
                     project_id=self.project_id,
                     event_type=EventType.TASK_COMPLETED,
-                    producer_agent_id=self.agent_id,
+                    producer_agent_id=self.identity.agent_id,
                     topic=unified_stream_key,
                     payload={
                         "task_id": target_task_id,
-                        "message": f"Task '{target_task_id}' completed by agent {self.agent_id}.",
+                        "message": f"Task '{target_task_id}' completed by agent {self.identity.agent_id}.",
                         "file_path": file_path
                     }
                 )
@@ -362,7 +385,7 @@ class AgentWorkerActor:
                         title=file_path if action_type == "write_file" else description[:80],
                         content=memory_content,
                     )
-                    embedding_vector = await self.provider.get_embedding.remote(memory_content)
+                    embedding_vector = await self.provider.get_embedding.remote(memory_content, self.project_id)
                     async with self.db_manager.pool.acquire() as conn:
                         await conn.execute(
                             "INSERT INTO memory_embeddings (memory_item_id, embedding) VALUES ($1, $2::vector)",
@@ -372,7 +395,14 @@ class AgentWorkerActor:
                     logger.error("failed_to_write_memory_item", agent_id=self.agent_id, error=str(e))
 
                 merge_result = await self.supervisor.merge_and_finalize_branch.remote(self.agent_id)
-                
+                if not merge_result.get("success"):
+                    logger.warning("branch_merge_failed", agent_id=self.agent_id, error=merge_result.get("error"))
+            
+            elif not exec_res.get("executed") and target_task_id:
+                # Fall back status to PENDING if guardrail filters or runtime execution blocks the call
+                await self.task_repo.update_task_status(target_task_id, "PENDING")
+                self.current_task_id = None
+                    
             await self.redis_client.delete(lock_key)
             await self.redis_client.delete(lease_key)
 
