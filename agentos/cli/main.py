@@ -112,6 +112,69 @@ def guardrail_check(action: str = typer.Argument(..., help="Action description t
     )
     console.print_json(data=result.model_dump())
 
+@app.command()
+def approve(event_id: str = typer.Argument(..., help="The approval event ID to approve.")) -> None:
+    """Approve a pending action request and execute it."""
+    from agentos.storage.database import DatabaseManager
+    from agentos.storage.repositories import EventRepository
+    from agentos.messaging.events import Event, EventType
+
+    settings = load_settings()
+
+    async def run():
+        db = DatabaseManager(settings)
+        await db.connect()
+        event_repo = EventRepository(db)
+        pending = await event_repo.get_event(event_id)
+        if not pending:
+            console.print("[red]No such approval event found.[/red]")
+            return
+
+        grant_event = Event(
+            project_id=str(pending["project_id"]),
+            event_type=EventType.APPROVAL_GRANTED,
+            topic=pending["topic"],
+            causation_id=event_id,
+        )
+        await event_repo.save_event(str(pending["project_id"]), grant_event)
+
+        import ray
+        ray.init(address="local", ignore_reinit_error=True, namespace="agentos")
+        exec_actor = ray.get_actor("execution_supervisor", namespace="agentos")
+        result = await exec_actor.execute_approved_action.remote(pending["payload"]["full_action"])
+        console.print_json(data=result)
+
+    asyncio.run(run())
+
+
+@app.command()
+def reject(event_id: str = typer.Argument(..., help="The approval event ID to reject.")) -> None:
+    """Reject a pending action request."""
+    from agentos.storage.database import DatabaseManager
+    from agentos.storage.repositories import EventRepository
+    from agentos.messaging.events import Event, EventType
+
+    settings = load_settings()
+
+    async def run():
+        db = DatabaseManager(settings)
+        await db.connect()
+        event_repo = EventRepository(db)
+        pending = await event_repo.get_event(event_id)
+        if not pending:
+            console.print("[red]No such approval event found.[/red]")
+            return
+        deny_event = Event(
+            project_id=str(pending["project_id"]),
+            event_type=EventType.APPROVAL_DENIED,
+            topic=pending["topic"],
+            causation_id=event_id,
+        )
+        await event_repo.save_event(str(pending["project_id"]), deny_event)
+        console.print(f"[yellow]Rejected action from event {event_id}.[/yellow]")
+
+    asyncio.run(run())
+
 @app.command("test-agent")
 def test_agent() -> None:
     """End-to-End test: Runs advanced multi-step software engineering task graphs and quality checks."""
@@ -128,7 +191,6 @@ def test_agent() -> None:
     console.print("[bold yellow]Initializing Advanced Multi-File Software Delivery Test Loop...[/bold yellow]")
     
     async def run_test():
-        # 1. Setup Database & Repositories
         db = DatabaseManager(settings)
         await db.connect()
         task_repo = TaskRepository(db)
@@ -137,14 +199,12 @@ def test_agent() -> None:
         project_id = str(uuid.uuid4())
         unique_project_name = f"SecureCalcAPI-{project_id[:8]}"
         
-        # High-Quality Quality Contract (DoD Checkboxes)
         project_dod = [
             "calculator.py", 
             "test_calculator.py", 
             "verify code output standard"
         ]
         
-        # Register project parameters
         await db.pool.execute(
             "INSERT INTO projects (id, name, dod) VALUES ($1, $2, $3)", 
             uuid.UUID(project_id), unique_project_name, json.dumps(project_dod)
@@ -153,7 +213,6 @@ def test_agent() -> None:
         console.print(f"[bold green]Created Advanced Project Entry:[/bold green] {unique_project_name}")
         console.print(f"[bold blue]Target Quality Contract (DoD):[/bold blue] {project_dod}")
         
-        # 2. Dynamic Task Graph Generation (Sequential Tree Topology)
         console.print("[cyan]Seeding engineering sub-tasks tree checklist into PostgreSQL database...[/cyan]")
         
         task_1_id = await task_repo.create_task(
@@ -173,7 +232,6 @@ def test_agent() -> None:
         
         await task_repo.add_dependency(task_id=task_2_id, depends_on_task_id=task_1_id)
         
-        # Create starting system trigger event with rigorous instructions
         fake_event_id = str(uuid.uuid4())
         await db.pool.execute(
             "INSERT INTO events (id, project_id, event_type, topic, payload) VALUES ($1, $2, $3, $4, $5)",
@@ -205,7 +263,6 @@ def test_agent() -> None:
         await agent.start()
         supervisor = ExecutionSupervisorActor(settings)
         
-        # 4. Multi-Step Inline Quality Gating Execution Loop
         max_iterations = 4
         current_step = 1
         
@@ -213,7 +270,6 @@ def test_agent() -> None:
             console.print(f"\n[bold magenta]=== AUTONOMOUS LOOP ITERATION {current_step}/{max_iterations} ===[/bold magenta]")
             console.print(f"[cyan]Evaluating active database task dependencies...[/cyan]")
             
-            # FIXED: Call process_next_step instead of obsolete handle_event
             result = await agent.process_next_step(fake_event_id)
             
             action_type = result.get("action_type", "wait")
@@ -227,7 +283,6 @@ def test_agent() -> None:
                 
             console.print("[cyan]Routing action to Execution Supervisor sandbox...[/cyan]")
             
-            # Reconstruct an ActionRequest payload dynamically from response keys
             action_request = ActionRequest(
                 project_id=project_id,
                 agent_id="dev-test-1",
@@ -240,7 +295,6 @@ def test_agent() -> None:
             console.print("[bold green]Execution Output Logs Returned to Memory Base:[/bold green]")
             console.print_json(data=execution_result)
             
-            # Update status maps dynamically based on which file the agent target writes
             if action_type in {"write_file", "write_code"} and execution_result.get("executed"):
                 res_data = execution_result.get("result", {})
                 file_written = res_data.get("path", "")

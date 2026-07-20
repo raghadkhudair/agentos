@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 import ray
 import structlog
@@ -195,14 +196,12 @@ class SummaryManagerActor:
         await self._ensure_connected()
         safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
 
-        # Pull overall task statistics
         task_query = """
             SELECT status, COUNT(*) as cnt 
             FROM tasks 
             WHERE project_id = $1 
             GROUP BY status;
         """
-        # Pull latest major achievements
         checkpoint_query = """
             SELECT agent_id, achievement, summary 
             FROM checkpoints 
@@ -231,7 +230,19 @@ class SummaryManagerActor:
             budget_key=project_id
         )
         response = await provider_gateway.get_completion.remote(req)
-        return response["content"].strip()
+        summary_text = response["content"].strip()
+
+        try:
+            await self.promote_to_global_lesson(
+                project_id=project_id,
+                milestone_summary=summary_text,
+                owner_agent_id="summary_manager",
+                provider_gateway=provider_gateway
+            )
+        except Exception as e:
+            logger.warning("failed_auto_promotion_global_lesson", error=str(e))
+
+        return summary_text
     
 
     async def compress_event_history(self, raw_events: list[str], project_id: str, provider_gateway: any) -> str:
@@ -262,3 +273,66 @@ class SummaryManagerActor:
         except Exception as e:
             logger.error("failed_to_compress_event_history", error=str(e))
             return "Fallback raw event stream:\n" + "\n".join(raw_events[:3])
+
+    async def promote_to_global_lesson(
+        self, 
+        project_id: str,
+        milestone_summary: str, 
+        owner_agent_id: str, 
+        provider_gateway: any
+    ) -> str | None:
+        """
+        Uses an LLM to extract reusable cross-project technical patterns from milestone 
+        summaries and persists them as global_patterns with pgvector embeddings.
+        """
+        await self._ensure_connected()
+        
+        prompt = (
+            "You are the Architectural Knowledge Manager for AgentOS.\n"
+            "Analyze the following project achievement summary and extract any reusable, generalizable "
+            "technical lesson, pattern, or best practice that would benefit future software engineering projects.\n"
+            "Do NOT include project-specific identifiers, user credentials, or specific file paths.\n\n"
+            f"MILESTONE SUMMARY:\n{milestone_summary}\n\n"
+            "Respond with a JSON object containing:\n"
+            "{\n"
+            '  "title": "Concise descriptive pattern title",\n'
+            '  "lesson_content": "Detailed explanation of the technical pattern or fix"\n'
+            "}"
+        )
+
+        req = ProviderRequest(
+            purpose="extract_global_lesson",
+            messages=[{"role": "user", "content": prompt}],
+            budget_key=project_id
+        )
+
+        try:
+            response = await provider_gateway.get_completion.remote(req, response_format={"type": "json_object"})
+            clean_content = response["content"].strip()
+            if clean_content.startswith("```"):
+                clean_content = re.sub(r"^```json\s*|^```\s*", "", clean_content, flags=re.MULTILINE)
+                clean_content = re.sub(r"\s*```$", "", clean_content, flags=re.MULTILINE).strip()
+
+            lesson_data = json.loads(clean_content)
+            title = lesson_data.get("title", "Reusable Architectural Pattern")
+            lesson_content = lesson_data.get("lesson_content", "")
+
+            if not lesson_content:
+                return None
+
+            lesson_vector = await provider_gateway.get_embedding.remote(lesson_content, "global_knowledge")
+
+            from agentos.storage.repositories import MemoryRepository
+            memory_repo = MemoryRepository(self.db)
+
+            mem_id = await memory_repo.save_global_lesson(
+                owner_agent_id=owner_agent_id,
+                title=title,
+                lesson_content=lesson_content,
+                lesson_embedding=lesson_vector
+            )
+            logger.info("promoted_global_lesson_learned", title=title, memory_id=mem_id)
+            return mem_id
+        except Exception as e:
+            logger.error("failed_to_promote_global_lesson", error=str(e))
+            return None

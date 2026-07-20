@@ -9,43 +9,49 @@ team_constraints:
 roles:
   - role: PM_TECH_LEAD
     description: "Owns planning, coordination, and overall delivery gating."
-    default_memory_scopes: ["project", "decision", "dod"]
+    default_memory_scopes: ["project_memory", "decision_memory", "execution_memory"]
     allowed_action_categories: ["plan", "summarize", "assign", "evaluate_dod"]
     default_event_subscriptions: ["PROJECT_CREATED", "TASK_COMPLETED", "CHECKPOINT_CREATED", "BLOCKER_CREATED"]
 
   - role: SOLUTION_ARCHITECT
     description: "Designs API contracts, system components, and architectural records."
-    default_memory_scopes: ["project", "decision", "contract"]
+    default_memory_scopes: ["project_memory", "decision_memory", "contract_memory"]
     allowed_action_categories: ["design", "review", "publish_contract"]
     default_event_subscriptions: ["PROJECT_CREATED", "CONTRACT_CHANGE", "REVIEW_REQUEST"]
 
   - role: BACKEND_DEVELOPER
     description: "Writes backend logic, code modules, databases, and structural asserts."
-    default_memory_scopes: ["project", "backend", "contract", "decision"]
+    default_memory_scopes: ["project_memory", "squad_memory", "contract_memory", "decision_memory", "private_agent_memory"]
     allowed_action_categories: ["implement", "test", "publish_artifact"]
     default_event_subscriptions: ["PROJECT_CREATED", "TASK_CREATED", "CONTRACT_CHANGE"]
 
   - role: FRONTEND_DEVELOPER
     description: "Crafts client application elements, layout systems, and views."
-    default_memory_scopes: ["project", "frontend", "contract", "decision"]
+    default_memory_scopes: ["project_memory", "squad_memory", "contract_memory", "decision_memory", "private_agent_memory"]
     allowed_action_categories: ["implement", "test", "publish_artifact"]
     default_event_subscriptions: ["PROJECT_CREATED", "TASK_CREATED", "CONTRACT_CHANGE"]
 
   - role: PLATFORM_ENGINEER
     description: "Builds Docker wrappers, sandboxes, and integration lifecycles."
-    default_memory_scopes: ["project", "platform", "decision"]
+    default_memory_scopes: ["project_memory", "squad_memory", "decision_memory", "private_agent_memory"]
     allowed_action_categories: ["configure", "test", "publish_artifact"]
     default_event_subscriptions: ["PROJECT_CREATED", "TASK_CREATED", "SECURITY_ALERT"]
 
   - role: QA_ENGINEER
     description: "Asserts acceptance criteria and collects delivery execution proof."
-    default_memory_scopes: ["project", "qa", "contract", "dod"]
+    default_memory_scopes: ["project_memory", "squad_memory", "contract_memory", "execution_memory"]
     allowed_action_categories: ["test", "verify", "publish_report"]
     default_event_subscriptions: ["PROJECT_CREATED", "REVIEW_REQUEST", "TEST_RESULT"]
 
+  - role: CODE_REVIEWER
+    description: "Reviews code patches for quality, correctness, and maintainability before merge."
+    default_memory_scopes: ["project_memory", "contract_memory", "decision_memory"]
+    allowed_action_categories: ["review", "approve_patch", "request_changes"]
+    default_event_subscriptions: ["PROJECT_CREATED", "REVIEW_REQUEST"]
+    
   - role: SECURITY_REVIEWER
     description: "Inspects logic paths for vulnerabilities or safety boundary violations."
-    default_memory_scopes: ["project", "security", "decision"]
+    default_memory_scopes: ["project_memory", "security_memory", "decision_memory"]
     allowed_action_categories: ["review", "block", "quarantine_recommendation"]
     default_event_subscriptions: ["PROJECT_CREATED", "ACTION_REQUEST", "SECURITY_ALERT"]
 

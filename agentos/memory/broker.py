@@ -96,6 +96,8 @@ class MemoryBrokerActor:
         raw_events = []
         trigger_message = ""
         
+        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
+        
         async with self.db.pool.acquire() as conn:
             rows = await conn.fetch(query_events, safe_project_id)
             for row in rows:
@@ -115,14 +117,11 @@ class MemoryBrokerActor:
         if not raw_events:
             raw_events = ["No recent events found. Project is initializing."]
 
-        # DELEGATED SUMMARIZATION (No more duplication!) 
         summarized_briefing = "No history to summarize."
         if provider_gateway and raw_events:
             try:
-                # Locate the remote Summary Manager Actor
                 summary_manager = ray.get_actor("summary_manager", namespace="agentos")
                 
-                #  Delegate the compression task
                 summarized_briefing = await summary_manager.compress_event_history.remote(
                     raw_events=raw_events,
                     project_id=str(project_id),
@@ -130,7 +129,6 @@ class MemoryBrokerActor:
                 )
             except Exception as e:
                 logger.error("failed_to_delegate_summarization", error=str(e))
-                # Fallback directly to the scrubbed events if lookup/call fails
                 summarized_briefing = "Fallback raw timeline:\n" + "\n".join(raw_events[:3])
 
         # Fetch Live Task Graph
@@ -149,25 +147,37 @@ class MemoryBrokerActor:
         if not formatted_tasks:
             formatted_tasks = ["No active tasks currently assigned."]
 
-        # Semantic Memory Lookup (pgvector)
         relevant_memories = []
         if provider_gateway and trigger_message:
             try:
                 query_vector = await provider_gateway.get_embedding.remote(trigger_message, str(project_id))
                 
-                query_memories = """
-                    SELECT mi.title, mi.content, (me.embedding <=> $2::vector) as distance
-                    FROM memory_items mi
-                    JOIN memory_embeddings me ON me.memory_item_id = mi.id
-                    WHERE mi.project_id = $1 AND mi.scope = ANY($3)
-                    ORDER BY distance ASC
-                    LIMIT 3;
-                """
-                async with self.db.pool.acquire() as conn:
-                    mem_rows = await conn.fetch(query_memories, safe_project_id, query_vector, resolved_scopes)
-                    for m in mem_rows:
-                        scrubbed_mem = self._scrub_secrets(m['content'])
-                        relevant_memories.append(f"🔍 [Memory Scope: {resolved_scopes}]: {m['title']} - {scrubbed_mem}")
+                from agentos.storage.repositories import MemoryRepository, CodebaseMapRepository
+                memory_repo = MemoryRepository(self.db)
+                
+                mem_rows = await memory_repo.search_hybrid_memories(
+                    project_id=str(project_id),
+                    agent_id=agent_id,
+                    allowed_scopes=resolved_scopes,
+                    query_text=trigger_message,
+                    query_embedding=query_vector,
+                    limit=3
+                )
+                
+                for m in mem_rows:
+                    scrubbed_mem = self._scrub_secrets(m['content'])
+                    relevant_memories.append(
+                        f"🔍 [Memory Scope: {m['scope']} | Type: {m['memory_type']}]: {m['title']} - {scrubbed_mem}"
+                    )
+                
+                # Codebase Map Search
+                code_repo = CodebaseMapRepository(self.db)
+                code_snippets = await code_repo.search_codebase(str(project_id), query_vector, limit=2)
+                for cs in code_snippets:
+                    relevant_memories.append(
+                        f"[Codebase Map - {cs['file_path']} ({cs['chunk_identifier']})]:\n{cs['code_snippet']}"
+                    )
+            
             except Exception as e:
                 logger.warning("vector_search_bypassed", reason=str(e))
 

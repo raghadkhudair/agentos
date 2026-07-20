@@ -128,7 +128,7 @@ class DoDEvaluatorActor:
                 gaps.append(item)
                 continue
 
-            #  Verify physical project assets
+            # Verify physical project assets
             if item_lower in existing_artifacts:
                 art = existing_artifacts[item_lower]
                 evidence_list.append(
@@ -166,21 +166,55 @@ class DoDEvaluatorActor:
             logger.warning("definition_of_done_has_unresolved_gaps", missing=gaps)
             unified_stream_key = f"project:{project_id}:events"
             
-            # Publish a GAP_DETECTED event onto the Dragonfly event bus stream
-            gap_event = Event(
-                project_id=project_id,
-                event_type=EventType.TASK_CREATED, 
-                topic=unified_stream_key,
-                payload={
-                    "message": f"Definition of Done Gaps Detected. Please resolve missing items: {', '.join(gaps)}",
-                    "missing_do_items": gaps
-                }
-            )
+            unhandled_gaps = []
+            gap_failure_context = []
+
             try:
-                await self.bus.publish_event(unified_stream_key, gap_event)
-                logger.info("gap_closure_event_successfully_dispatched", stream=unified_stream_key)
+                provider_gateway = ray.get_actor("provider_gateway", namespace="agentos")
+                from agentos.storage.repositories import TaskRepository, MemoryRepository
+                task_repo = TaskRepository(self.db)
+                memory_repo = MemoryRepository(self.db)
+
+                for gap in gaps:
+                    gap_vector = await provider_gateway.get_embedding.remote(gap, str(project_id))
+                    
+                    # Check if an active task already handles this gap
+                    similar_task = await task_repo.find_similar_task(str(project_id), gap_vector)
+                    if similar_task:
+                        logger.info(
+                            "gap_already_covered_by_active_task", 
+                            gap=gap, 
+                            existing_task_id=similar_task["id"]
+                        )
+                        continue
+
+                    # Retrieve historical failure context if this gap corresponds to a past failure
+                    past_failures = await memory_repo.find_similar_failures(str(project_id), gap_vector)
+                    if past_failures:
+                        for pf in past_failures:
+                            gap_failure_context.append(f"Historical Failure Lesson for '{gap}': {pf['content']}")
+
+                    unhandled_gaps.append(gap)
             except Exception as e:
-                logger.error("failed_to_dispatch_gap_closure_event", error=str(e))
+                logger.warning("dod_gap_similarity_check_bypassed", error=str(e))
+                unhandled_gaps = gaps
+
+            if unhandled_gaps:
+                gap_event = Event(
+                    project_id=project_id,
+                    event_type=EventType.TASK_CREATED, 
+                    topic=unified_stream_key,
+                    payload={
+                        "message": f"Definition of Done Gaps Detected. Please resolve missing items: {', '.join(unhandled_gaps)}",
+                        "missing_do_items": unhandled_gaps,
+                        "failure_context": gap_failure_context
+                    }
+                )
+                try:
+                    await self.bus.publish_event(unified_stream_key, gap_event)
+                    logger.info("gap_closure_event_successfully_dispatched", stream=unified_stream_key)
+                except Exception as e:
+                    logger.error("failed_to_dispatch_gap_closure_event", error=str(e))
 
         evaluation = DoDEvaluation(
             project_id=str(project_id),

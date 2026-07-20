@@ -11,6 +11,7 @@ from agentos.config.settings import Settings
 from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedTeamPlan
 from agentos.watchdogs.runtime_watchdogs import DoDWatchdog, StagnationWatchdog, SafetyWatchdog, DeadlockWatchdog
 
+from agentos.actors.safety_reviewer import SafetyReviewerAgentActor
 from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import ProjectRepository, EventRepository, TaskRepository
 from agentos.messaging.dragonfly_bus import DragonflyBus
@@ -74,7 +75,12 @@ class RuntimeSupervisorActor:
             namespace="agentos"
         ).remote(self.settings.model_dump(by_alias=False))
 
-        self.safety_reviewer = ReviewerAgentActor.options(
+        self.code_reviewer = ReviewerAgentActor.options(
+            name="code_reviewer",
+            namespace="agentos"
+        ).remote(self.settings.model_dump(by_alias=False))
+
+        self.safety_reviewer = SafetyReviewerAgentActor.options(
             name="safety_reviewer",
             namespace="agentos"
         ).remote(self.settings.model_dump(by_alias=False))
@@ -149,15 +155,28 @@ class RuntimeSupervisorActor:
        
         task_repo = TaskRepository(self.db_manager)
         for task_data in initial_backlog:
+            title = task_data["title"]
+            description = task_data["description"]
+
+            task_embedding = None
+            try:
+                text_to_embed = f"{title}: {description}"
+                task_embedding = await self.provider_gateway.get_embedding.remote(
+                    text_to_embed, str(db_project_id)
+                )
+            except Exception as e:
+                logger.warning("failed_to_generate_bootstrap_task_embedding", error=str(e))
+
             await task_repo.create_task(
                 project_id=db_project_id,
-                title=task_data["title"],
-                description=task_data["description"],
+                title=title,
+                description=description,
                 priority=int(task_data.get("priority", 3)),
                 allowed_paths=task_data.get("allowed_paths", []),
                 blocked_paths=task_data.get("blocked_paths", []),
                 expected_outputs=task_data.get("expected_outputs", []),
-                risk_level=task_data.get("risk_level", "LOW")
+                risk_level=task_data.get("risk_level", "LOW"),
+                embedding=task_embedding  
             )
                 
                 
@@ -365,59 +384,30 @@ class RuntimeSupervisorActor:
                 created.append(started)
         return created
 
-    async def _supervise_health_loop(self, project_id: str) -> None:
-        from agentos.actors.base import AgentWorkerActor
-        from redis.asyncio import Redis
-        
-        redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
-        quarantine_key = "governance:global:quarantined_agents"
-        
-        while self.is_running:
-            await asyncio.sleep(15) 
-            
-            for agent_id, data in list(self._actor_registry.items()):
-                if data.get("status") == "QUARANTINED":
-                    continue
-                    
-                is_isolated = await redis_client.sismember(quarantine_key, agent_id)
-                if is_isolated:
-                    logger.critical("quarantine_manager_enforcing_containment", agent_id=agent_id)
-                    
-                    try:
-                        await redis_client.delete(f"agent:{agent_id}:inbox")
-                        await redis_client.delete(f"agent:{agent_id}:processing_lease")
-                    except Exception as ce:
-                        logger.error("failed_to_clear_quarantined_cache_keys", error=str(ce))
-                        
-                    ray.kill(data["handle"])
-                    self._actor_registry[agent_id]["status"] = "QUARANTINED"
-                    logger.critical("agent_actor_terminated_and_contained", agent_id=agent_id)
-                    continue
-                
-                actor = data["handle"]
-                try:
-                    state = await actor.start.remote() 
-                except ray.exceptions.RayActorError:
-                    logger.warning("actor_crash_detected_restarting", agent_id=agent_id)
+    async def _supervise_health_loop(self) -> None:
+        """Monitors agent process health and Dragonfly heartbeats."""
+        while True:
+            try:
+                await self._ensure_connected()
+                for agent_id in list(self._authenticated_identities.keys()):
+                    heartbeat_key = f"agent:{agent_id}:heartbeat"
+                    is_alive = await self.redis_client.get(heartbeat_key)
 
-                    settings_payload = self.settings.model_dump(by_alias=False)
-                    max_threads = tuning_cfg["agent_limits"]["max_threads_per_agent"]
-                    
-                    new_actor = AgentWorkerActor.options(
-                        name=agent_id, 
-                        namespace="agentos",
-                        max_concurrency=max_threads+1,
-                        lifetime="detached" 
-                    ).remote(
-                        agent_id=agent_id,
-                        role=data["spec"].role.value,
-                        project_id=data["project_id"],
-                        settings=settings_payload,
-                        spec_payload=data["spec_payload"]
-                    )
-                    await new_actor.start.remote()
-                    self._actor_registry[agent_id]["handle"] = new_actor
-                    logger.info("actor_successfully_restarted", agent_id=agent_id)
+                    if not is_alive:
+                        logger.warning("agent_heartbeat_missing_reclaiming_resources", agent_id=agent_id)
+                        
+                        async with self.db_manager.pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE tasks SET status = 'PENDING' WHERE owner_agent_id = $1 AND status = 'IN_PROGRESS'",
+                                agent_id
+                            )
+                        
+                        await self.prune_worktree_resources(agent_id)
+
+            except Exception as e:
+                logger.error("health_supervision_loop_error", error=str(e))
+                
+            await asyncio.sleep(15)
 
     async def watchdog_loop(self, project_id: str, dod: list[str]) -> None:
         """Monitors system states, delegating DoD validation to the dedicated DoDEvaluatorActor."""

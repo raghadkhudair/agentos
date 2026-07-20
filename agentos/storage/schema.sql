@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     required_reviewers TEXT[] NOT NULL DEFAULT '{}',
     affected_contracts TEXT[] NOT NULL DEFAULT '{}',
     risk_level TEXT NOT NULL DEFAULT 'LOW',
+    embedding vector(768),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -120,13 +121,13 @@ CREATE TABLE IF NOT EXISTS memory_items (
 );
 
 CREATE TABLE IF NOT EXISTS memory_embeddings (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    memory_item_id UUID REFERENCES memory_items(id) ON DELETE CASCADE,
-    embedding_model TEXT NOT NULL,
-    embedding_dimension INTEGER NOT NULL,
-    embedding vector(768),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            memory_item_id UUID REFERENCES memory_items(id) ON DELETE CASCADE,
+            embedding_model VARCHAR(100) NOT NULL DEFAULT 'text-embedding-004',
+            embedding_dimension INT NOT NULL DEFAULT 768,
+            embedding vector(768),
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
 
 CREATE INDEX IF NOT EXISTS memory_items_project_scope_idx ON memory_items(project_id, scope, memory_type);
 CREATE INDEX IF NOT EXISTS memory_items_metadata_idx ON memory_items USING gin(metadata);
@@ -159,3 +160,31 @@ CREATE TABLE IF NOT EXISTS audit_events (
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+
+CREATE TABLE IF NOT EXISTS dod_checks (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+            criterion TEXT NOT NULL,
+            status VARCHAR(50) DEFAULT 'PENDING',
+            verified_by_agent_id VARCHAR(255),
+            evidence_summary TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+CREATE INDEX IF NOT EXISTS idx_dod_checks_project ON dod_checks(project_id, status);
+
+CREATE TABLE IF NOT EXISTS codebase_semantic_map (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            chunk_identifier VARCHAR(255) NOT NULL, 
+            code_snippet TEXT NOT NULL,
+            embedding vector(768),
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+CREATE INDEX IF NOT EXISTS idx_codebase_map_project 
+        ON codebase_semantic_map(project_id, file_path);

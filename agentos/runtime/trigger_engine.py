@@ -34,7 +34,6 @@ class TriggerEngineActor:
     async def start_routing_loop(self, project_id: str) -> None:
         self.is_running = True
         
-        # Define all mandated architectural topic categories
         topics = [
             f"project.{project_id}.events",
             f"project.{project_id}.tasks",
@@ -53,7 +52,6 @@ class TriggerEngineActor:
         group_name = "trigger_engine_group"
         consumer_name = f"engine_processor_{ray.get_runtime_context().get_actor_id()}"
 
-        # Safe multi-stream group registration
         for topic in topics:
             try:
                 await self.bus.redis.xgroup_create(topic, group_name, mkstream=True)
@@ -64,8 +62,6 @@ class TriggerEngineActor:
 
         while self.is_running:
             try:
-                # Read across all registered streams simultaneously using XREADGROUP
-                # Passing ">" reads only new messages for our group
                 streams_to_read = {topic: ">" for topic in topics}
                 
                 response = await self.bus.redis.xreadgroup(
@@ -91,7 +87,6 @@ class TriggerEngineActor:
                         
                         await self._route_event(event)
                         
-                        # Acknowledge the message was safely processed on this specific stream
                         await self.bus.redis.xack(stream_key, group_name, message_id)
 
             except asyncio.CancelledError:
@@ -111,8 +106,8 @@ class TriggerEngineActor:
                 return
         if event_type_str == "SECURITY_ALERT" and "developer" in (event.producer_agent_id or "").lower():
             logger.critical("privilege_escalation_interception", producer=event.producer_agent_id, event=event_type_str)
-            # Force route to security reviewer instead of intended targets
             event.target_agent_id = "security_reviewer-1"
+
         subscribers = set(self.subscriptions.get(event_type_str, set()))
         
         affected_artifact = event.payload.get("artifact_uri") or event.payload.get("file_path")
@@ -126,6 +121,36 @@ class TriggerEngineActor:
             if review_subs:
                 subscribers = subscribers.union(review_subs)
                 logger.info("agent_handoff_opportunity_detected", routing_to=list(review_subs))
+                
+        if not subscribers and event.payload:
+            try:
+                provider_gateway = ray.get_actor("provider_gateway", namespace="agentos")
+                event_text = event.payload.get("message") or json.dumps(event.payload)
+                event_vector = await provider_gateway.get_embedding.remote(event_text, str(event.project_id))
+                
+                # Fetch database connection from settings to locate matching agent/task
+                from agentos.config.settings import load_settings
+                from agentos.storage.database import DatabaseManager
+                from uuid import UUID
+
+                db = DatabaseManager(load_settings())
+                await db.connect()
+                
+                query = """
+                    SELECT owner_agent_id 
+                    FROM tasks 
+                    WHERE project_id = $1 AND embedding IS NOT NULL AND owner_agent_id IS NOT NULL
+                    ORDER BY (embedding <=> $2::vector) ASC 
+                    LIMIT 1;
+                """
+                async with db.pool.acquire() as conn:
+                    matched_agent = await conn.fetchval(query, UUID(str(event.project_id)), event_vector)
+                    if matched_agent:
+                        subscribers.add(matched_agent)
+                        logger.info("semantic_trigger_routing_success", event_type=event_type_str, routed_agent=matched_agent)
+                await db.disconnect()
+            except Exception as e:
+                logger.warning("semantic_trigger_routing_failed", error=str(e))
 
         interrupt_level = "NORMAL"
         if event_type_str in {"SECURITY_ALERT", "BLOCKER_CREATED", "BLOCKER"}:

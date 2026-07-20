@@ -27,7 +27,8 @@ class EventType(StrEnum):
     BLOCKER_CREATED = "BLOCKER_CREATED"
     DOD_EVALUATED = "DOD_EVALUATED"
     AGENT_QUARANTINED = "AGENT_QUARANTINED"
-
+    APPROVAL_GRANTED = "APPROVAL_GRANTED"
+    APPROVAL_DENIED = "APPROVAL_DENIED"
     TASK_PROPOSAL = "TASK_PROPOSAL"
     TASK_UPDATE = "TASK_UPDATE"
     CONTRACT_CHANGE = "CONTRACT_CHANGE"
@@ -84,3 +85,11 @@ class Event(BaseModel):
                 return f"squad.qa.events"
 
         return f"project.{p_id}.events"
+    
+    def validate_event(event: "Event", claimed_agent_id: str | None = None) -> tuple[bool, str]:
+        """Basic communication guardrail: catches spoofed sender IDs and malformed topics."""
+        if claimed_agent_id and event.producer_agent_id and event.producer_agent_id != claimed_agent_id:
+            return False, f"Sender mismatch: event claims producer '{event.producer_agent_id}' but caller is '{claimed_agent_id}'."
+        if not event.topic or not event.topic.strip():
+            return False, "Event rejected: empty topic."
+        return True, ""

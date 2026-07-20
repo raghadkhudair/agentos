@@ -73,6 +73,24 @@ class ExecutionSupervisorActor:
             except Exception as e:
                 logger.error("sandbox_git_initialization_failed", error=str(e))
 
+    async def _save_checkpoint(self, project_id: str, agent_id: str, achievement: str, summary: str, task_id: str | None = None) -> None:
+        """Helper to durably save Section 18 execution checkpoints."""
+        try:
+            checkpoint_manager = ray.get_actor("checkpoint_manager", namespace="agentos")
+            checkpoint_data = {
+                "checkpoint_id": str(uuid.uuid4()),
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "achievement": achievement,
+                "summary": summary,
+                "agent_state_snapshot": {"supervisor_status": "EXECUTED"}
+            }
+            await checkpoint_manager.create.remote(checkpoint_data)
+            logger.info("execution_checkpoint_saved", agent_id=agent_id, achievement=achievement)
+        except Exception as e:
+            logger.error("failed_to_save_execution_checkpoint", agent_id=agent_id, achievement=achievement, error=str(e))
+
     # currently is dead because of no where its the memory items is being inserted from 
     async def _verify_decision_conflict(self, action: ActionRequest) -> bool:
         await self._ensure_connected()
@@ -170,6 +188,15 @@ class ExecutionSupervisorActor:
             )
             return {"executed": False, "guardrail": conflict_result.model_dump(), "error": "Action blocked due to established decision conflict."}
 
+        if result.decision == PolicyDecision.REQUIRE_SECURITY_REVIEW:
+            safety_reviewer = ray.get_actor("safety_reviewer", namespace="agentos")
+            provider_gateway = ray.get_actor("provider_gateway", namespace="agentos")
+            review = await safety_reviewer.review_agent_behavior.remote(
+                action_obj.action_type, action_obj.description, 0, provider_gateway
+            )
+            if not review.get("safe", False):
+                return {"executed": False, "error": f"Safety review rejected: {review.get('reason')}"}
+            
         if result.decision in {
             PolicyDecision.REQUIRE_HUMAN_APPROVAL,
             PolicyDecision.REQUIRE_REVIEW,
@@ -191,12 +218,17 @@ class ExecutionSupervisorActor:
                     "description": action_obj.description,
                     "risk_level": result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level),
                     "required_gate": result.decision.value if hasattr(result.decision, "value") else str(result.decision),
+                    "full_action": action_obj.model_dump(),
                     "integrity_hash": action_obj.integrity_hash
                 }
             )
             
             try:
-                await bus.publish_event(unified_stream_key, approval_event)
+                await bus.publish_event(unified_stream_key, approval_event, claimed_agent_id=action_obj.agent_id)
+                from agentos.storage.repositories import EventRepository
+                event_repo = EventRepository(self.db_manager)
+                await event_repo.save_event(action_obj.project_id, approval_event)
+
                 logger.info("approval_request_dispatched_to_stream", agent_id=action_obj.agent_id)
             except Exception as e:
                 logger.error("failed_to_publish_approval_request", error=str(e))
@@ -367,6 +399,14 @@ class ExecutionSupervisorActor:
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(content)
             
+        await self._save_checkpoint(
+            project_id=project_id,
+            agent_id=agent_id,
+            achievement="code_patch_generated",
+            summary=f"Code patch generated and applied to file '{file_path}' ({len(content)} bytes written).",
+            task_id=task_id
+        )
+        
         return {"success": True, "path": file_path, "bytes_written": len(content)}
     
     def _read_file_safely(self, payload: dict, worktree_path: str) -> dict:
@@ -428,6 +468,11 @@ class ExecutionSupervisorActor:
         except Exception as e:
             return {"error": f"Failed to execute process inside sandbox container: {str(e)}"}
 
+    async def execute_approved_action(self, action_dict: dict) -> dict:
+        action_obj = ActionRequest(**action_dict)
+        logger.info("executing_human_approved_action", agent_id=action_obj.agent_id)
+        result = await self._route_and_execute(action_obj)
+        return {"executed": True, "result": result}
 
     # frees disk storage space and clears locks when an agent finishes its work
     async def prune_worktree_resources(self, agent_id: str) -> None:
@@ -518,12 +563,29 @@ class ExecutionSupervisorActor:
             integration_cmd = "pytest tests/ || echo 'No integration tests configured.'"
             integration_res = await self._execute_sandboxed_docker_command({"command": integration_cmd}, self.workspace_path)
             
+            query_proj = "SELECT project_id FROM agents WHERE agent_id = $1 LIMIT 1;"
+            async with self.db_manager.pool.acquire() as conn:
+                project_id = await conn.fetchval(query_proj, agent_id) or "global"
+
             if integration_res.get("exit_code", 0) != 0:
                 logger.error("integration_tests_failed_after_merge", output=integration_res.get("stderr"))
                 rollback_proc = await asyncio.create_subprocess_shell(f"git reset --hard HEAD~1", cwd=self.workspace_path)
                 await rollback_proc.communicate()
+                await self._save_checkpoint(
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    achievement="tests_failed",
+                    summary=f"Integration tests failed after branch merge: {integration_res.get('stderr', 'Test error')[:200]}"
+                )
                 return {"success": False, "error": "Integration tests failed after merging. Rolled back changes."}
 
+            await self._save_checkpoint(
+                project_id=project_id,
+                agent_id=agent_id,
+                achievement="tests_passed",
+                summary=f"All integration tests passed successfully after branch merge for agent {agent_id}."
+            )
+            
             await self.prune_worktree_resources(agent_id)
 
             delete_branch_proc = await asyncio.create_subprocess_shell(

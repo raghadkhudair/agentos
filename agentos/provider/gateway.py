@@ -15,6 +15,7 @@ from agentos.storage.database import DatabaseManager
 from agentos.storage.repositories import ProviderCallRepository
 from agentos.config.loader import guardrail_policies
 from agentos.config.loader import runtime_tuning
+from redis.asyncio import Redis
 
 logger = structlog.get_logger()
 
@@ -52,6 +53,7 @@ class ProviderGatewayActor:
         self.default_model = model_cfg.get("primary", "gemini/gemini-2.5-pro")
         self.fallback_model = model_cfg.get("fallback", "gemini/gemini-2.5-flash")
         self.embedding_model = model_cfg.get("embedding", "gemini/text-embedding-004")
+        self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
         self._connected = False
 
     async def _ensure_connected(self):
@@ -143,11 +145,7 @@ class ProviderGatewayActor:
         await self._ensure_connected()
 
         request_purpose = request.purpose.strip().lower()
-        if not any(domain in self.settings.database_url or domain in "litellm" for domain in self._allowed_egress_domains):
-            logger.critical("network_egress_violation_blocked", purpose=request_purpose)
-            raise RuntimeError("Security Network Blocking: Outbound API destination falls outside allowed network egress boundaries.")
-
-   
+        
         if not await self._check_budget_allowance(request.budget_key):
             logger.error("budget_breach_detected", project_id=request.budget_key)
             raise RuntimeError("API Request blocked: Project budget cap has been exceeded.")
@@ -200,6 +198,13 @@ class ProviderGatewayActor:
         raw_prompt_str = "".join(m["content"] for m in sanitized_messages)
         p_hash = hashlib.sha256(raw_prompt_str.encode()).hexdigest()
         r_hash = hashlib.sha256(response_content.encode()).hexdigest()
+
+        try:
+            hot_counter_key = f"provider:cost:{request.budget_key}"
+            await self.redis_client.incrbyfloat(hot_counter_key, float(cost))
+        except Exception as counter_error:
+            logger.warning("failed_to_update_hot_provider_counter", error=str(counter_error))
+            
 
         try:
             await self.call_repo.log_call(
