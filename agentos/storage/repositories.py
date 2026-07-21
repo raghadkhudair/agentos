@@ -5,14 +5,36 @@ from agentos.cli.main import status
 from agentos.storage.database import DatabaseManager
 from agentos.messaging.events import Event
 
+class ProjectState(str, Enum):
+    INITIALIZING = "INITIALIZING"
+    PLANNING = "PLANNING"
+    TEAM_FORMING = "TEAM_FORMING"
+    RUNNING = "RUNNING"
+    REPLANNING = "REPLANNING"
+    INTEGRATING = "INTEGRATING"
+    VERIFYING = "VERIFYING"
+    BLOCKED_REQUIRES_APPROVAL = "BLOCKED_REQUIRES_APPROVAL"
+    BLOCKED_REQUIRES_INPUT = "BLOCKED_REQUIRES_INPUT"
+    
+
+    DOD_SATISFIED = "DOD_SATISFIED"
+    FAILED_BY_POLICY = "FAILED_BY_POLICY"
+    STOPPED_BY_USER = "STOPPED_BY_USER"
+
 class ProjectRepository:
+    TERMINAL_STATES = {
+        ProjectState.DOD_SATISFIED, 
+        ProjectState.FAILED_BY_POLICY, 
+        ProjectState.STOPPED_BY_USER
+    }
+
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
     async def create_project(self, name: str, request: str, dod: list) -> str:
         query = """
             INSERT INTO projects (name, request, status, dod)
-            VALUES ($1, $2, 'INITIALIZED', $3)
+            VALUES ($1, $2, 'INITIALIZING', $3)
             ON CONFLICT (name) DO UPDATE SET updated_at = now()
             RETURNING id;
         """
@@ -20,6 +42,36 @@ class ProjectRepository:
             project_id = await conn.fetchval(query, name, request, json.dumps(dod))
             return str(project_id)
 
+    async def update_status(self, project_id: str, status: str | ProjectState) -> None:
+        """
+        Updates project state while enforcing terminal state immutability.
+        """
+        target_state = status.value if isinstance(status, ProjectState) else str(status)
+        safe_id = UUID(project_id) if isinstance(project_id, str) else project_id
+
+        async with self.db.pool.acquire() as conn:
+            current_status = await conn.fetchval("SELECT status FROM projects WHERE id = $1;", safe_id)
+            
+            if current_status in {s.value for s in self.TERMINAL_STATES}:
+                print(f"erminal state guardrail: Project {project_id} is in terminal state '{current_status}'. Transition to '{target_state}' blocked.")
+                return
+
+            query = "UPDATE projects SET status = $1, updated_at = NOW() WHERE id = $2;"
+            await conn.execute(query, target_state, safe_id)
+
+class AgentRepository:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def register_agent(self, agent_id: str, project_id: str, role: str, squad: str) -> None:
+        query = """
+            INSERT INTO agents (id, project_id, role, squad, status)
+            VALUES ($1, $2, $3, $4, 'ACTIVE')
+            ON CONFLICT (id) DO UPDATE SET status = 'ACTIVE', updated_at = now();
+        """
+        async with self.db.pool.acquire() as conn:
+            await conn.execute(query, agent_id, UUID(project_id), role, squad)
+            
 class EventRepository:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
@@ -300,7 +352,7 @@ class MemoryRepository:
                     mi.scope,
                     mi.memory_type,
                     mi.created_at,
-                    COALESCE(mi.importance_score, 1.0) as importance,
+                    COALESCE(mi.importance, 1.0) as importance,
                     
                     
                     (1.0 - (me.embedding <=> $4::vector)) as vector_score,
@@ -316,7 +368,8 @@ class MemoryRepository:
                 FROM memory_items mi
                 JOIN memory_embeddings me ON me.memory_item_id = mi.id
                 WHERE (mi.project_id = $1 OR mi.scope = 'global_patterns')
-                  AND mi.scope = ANY($2::text[])
+                AND mi.scope = ANY($2::text[])
+                AND (mi.scope != 'private_agent_memory' OR mi.owner_agent_id = $6)
             )
             SELECT 
                 title,
@@ -363,7 +416,7 @@ class MemoryRepository:
         
         query = """
             INSERT INTO memory_items (
-                project_id, scope, owner_agent_id, memory_type, title, content, content_hash, importance_score
+                project_id, scope, owner_agent_id, memory_type, title, content, content_hash, importance
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
             RETURNING id;
@@ -485,35 +538,68 @@ class AuditEventRepository:
         
 
 class DoDRepository:
-    """Manages explicit Definition of Done (DoD) verification criteria and historical states."""
+    """Manages explicit Definition of Done (DoD) verification criteria, evidence, and historical states."""
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    async def add_dod_check(self, project_id: str, criterion: str) -> str:
+    async def add_dod_check(
+        self, 
+        project_id: str, 
+        criterion: str, 
+        verification_method: str = "INSPECT_ARTIFACTS_AND_TESTS", 
+        required_artifacts: list | None = None
+    ) -> str:
         query = """
-            INSERT INTO dod_checks (project_id, criterion)
-            VALUES ($1, $2)
+            INSERT INTO dod_checks (project_id, criterion, verification_method, required_artifacts, status)
+            VALUES ($1, $2, $3, $4, 'NOT_STARTED')
+            ON CONFLICT (project_id, criterion) DO NOTHING
             RETURNING id;
         """
+        safe_id = UUID(project_id) if isinstance(project_id, str) else project_id
         async with self.db.pool.acquire() as conn:
-            check_id = await conn.fetchval(query, UUID(project_id), criterion)
-            return str(check_id)
+            check_id = await conn.fetchval(
+                query, safe_id, criterion, verification_method, json.dumps(required_artifacts or [])
+            )
+            return str(check_id) if check_id else ""
 
-    async def update_check_status(
-        self, check_id: str, status: str, agent_id: str, evidence: str = ""
+    async def update_criterion_status(
+        self, 
+        project_id: str, 
+        criterion: str, 
+        status: str, 
+        agent_id: str, 
+        evidence: str = ""
     ) -> None:
+        """
+        'No item becomes SATISFIED without evidence.'
+        """
+        valid_statuses = {
+            "NOT_STARTED", "IN_PROGRESS", "IMPLEMENTED", 
+            "UNDER_REVIEW", "FAILED_VERIFICATION", "SATISFIED", "WAIVED_BY_HUMAN"
+        }
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid DoD Status: '{status}'. Must be one of {valid_statuses}")
+
+        if status == "SATISFIED" and not evidence.strip():
+            raise ValueError("Cannot mark DoD item as SATISFIED without non-empty evidence.")
+
         query = """
             UPDATE dod_checks 
-            SET status = $1, verified_by_agent_id = $2, evidence_summary = $3, updated_at = NOW()
-            WHERE id = $4;
+            SET status = $1, 
+                verified_by_agent_id = $2, 
+                evidence_summary = $3, 
+                updated_at = NOW()
+            WHERE project_id = $4 AND LOWER(criterion) = LOWER($5);
         """
+        safe_id = UUID(project_id) if isinstance(project_id, str) else project_id
         async with self.db.pool.acquire() as conn:
-            await conn.execute(query, status, agent_id, evidence, UUID(check_id))
+            await conn.execute(query, status, agent_id, evidence, safe_id, criterion)
 
     async def get_project_dod_status(self, project_id: str) -> list[dict]:
         query = "SELECT * FROM dod_checks WHERE project_id = $1 ORDER BY created_at ASC;"
+        safe_id = UUID(project_id) if isinstance(project_id, str) else project_id
         async with self.db.pool.acquire() as conn:
-            rows = await conn.fetch(query, UUID(project_id))
+            rows = await conn.fetch(query, safe_id)
             return [dict(row) for row in rows]
 
 

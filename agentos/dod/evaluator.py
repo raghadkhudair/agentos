@@ -39,6 +39,7 @@ class DoDEvaluatorActor:
         self.settings = Settings(**settings_payload) if settings_payload else Settings()
         self.db = DatabaseManager(self.settings)
         self.bus = DragonflyBus(self.settings.dragonfly_url)
+        self.checkpoints = None
         self._connected = False
 
     async def _ensure_connected(self):
@@ -104,7 +105,10 @@ class DoDEvaluatorActor:
 
         evaluated_items: list[DoDItemStatus] = []
         gaps: list[str] = []
-        
+        from agentos.storage.repositories import DoDRepository
+        dod_repo = DoDRepository(self.db)
+        previous_statuses = {row["criterion"]: row["status"] for row in await dod_repo.get_project_dod_status(str(project_id))}
+
         for item in dod:
             item_lower = item.lower()
             evidence_list = []
@@ -123,7 +127,7 @@ class DoDEvaluatorActor:
                     f"⚠️ [FALSE COMPLETION BLOCKED] Rejection detected: '{compromise_reason}'"
                 )
                 evaluated_items.append(
-                    DoDItemStatus(item=item, status="BLOCKED_REJECTED", evidence=evidence_list)
+                    DoDItemStatus(item=item, status="FAILED_VERIFICATION", evidence=evidence_list)
                 )
                 gaps.append(item)
                 continue
@@ -154,8 +158,21 @@ class DoDEvaluatorActor:
             
             if evidence_list:
                 status_entry = DoDItemStatus(item=item, status="SATISFIED", evidence=evidence_list)
+                if previous_statuses.get(item) not in ("SATISFIED", None):
+                    try:
+                        checkpoints = ray.get_actor("checkpoint_manager", namespace="agentos")
+                        gap_closed_cp = {
+                            "checkpoint_id": str(uuid.uuid4()),
+                            "project_id": str(project_id),
+                            "agent_id": "dod_evaluator",
+                            "achievement": "dod_gap_closed",
+                            "summary": f"DoD item now satisfied: {item}",
+                        }
+                        await checkpoints.create.remote(gap_closed_cp)
+                    except Exception as e:
+                        logger.warning("failed_to_log_dod_gap_closed", error=str(e))
             else:
-                status_entry = DoDItemStatus(item=item, status="MISSING")
+                status_entry = DoDItemStatus(item=item, status="NOT_STARTED")
                 gaps.append(item)
                 
             evaluated_items.append(status_entry)
@@ -215,6 +232,23 @@ class DoDEvaluatorActor:
                     logger.info("gap_closure_event_successfully_dispatched", stream=unified_stream_key)
                 except Exception as e:
                     logger.error("failed_to_dispatch_gap_closure_event", error=str(e))
+
+        from agentos.storage.repositories import DoDRepository
+        dod_repo = DoDRepository(self.db)
+
+        for evaluated in evaluated_items:
+            evidence_summary_text = "\n".join(evaluated.evidence)
+            
+            try:
+                await dod_repo.update_criterion_status(
+                    project_id=str(project_id),
+                    criterion=evaluated.item,
+                    status=evaluated.status,
+                    agent_id="dod_evaluator",
+                    evidence=evidence_summary_text if evaluated.status == "SATISFIED" else (evidence_summary_text or "No evidence provided")
+                )
+            except Exception as e:
+                logger.error("failed_to_persist_dod_item_status", criterion=evaluated.item, error=str(e))
 
         evaluation = DoDEvaluation(
             project_id=str(project_id),

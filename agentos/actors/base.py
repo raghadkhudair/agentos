@@ -21,7 +21,8 @@ from agentos.storage.repositories import (
     TaskRepository, 
     AuditEventRepository, 
     ArtifactRepository,
-    SummaryRepository
+    SummaryRepository,
+    AgentRepository
 )
 from agentos.provider.gateway import  ProviderRequest
 from agentos.config.loader import runtime_tuning
@@ -82,6 +83,8 @@ class AgentWorkerActor:
         self.audit_repo = AuditEventRepository(self.db_manager)
         self.artifact_repo = ArtifactRepository(self.db_manager)
         self.summary_repo = SummaryRepository(self.db_manager)
+        self.agent_repo = AgentRepository(self.db_manager)
+        await self.agent_repo.register_agent(self.agent_id, self.project_id, self.role, self.squad)
         self.provider = ray.get_actor("provider_gateway", namespace="agentos")
         
         from redis.asyncio import Redis
@@ -89,7 +92,7 @@ class AgentWorkerActor:
         self.pubsub = self.redis_client.pubsub()
         
         await self.memory_broker.register_agent_identity.remote(self.identity.model_dump())
-
+        
         self.status = "REGISTRATION"
         try:
             await self.supervisor.register_agent_identity.remote(self.identity.model_dump())
@@ -400,9 +403,27 @@ class AgentWorkerActor:
                         agent_state_snapshot={"current_task_id": self.current_task_id, "status": "BLOCKED"}
                     ).model_dump()
                     await self.checkpoints.create.remote(blocker_cp)
+                    if target_task_id:
+                        await self.task_repo.update_status(target_task_id, "BLOCKED")
                 except Exception as e:
                     logger.error("failed_to_log_execution_failure_memory", error=str(e))
 
+            current_task_status = next((t["status"] for t in active_tasks if str(t["id"]) == str(target_task_id)), None)
+            if current_task_status == "BLOCKED" and exec_res.get("executed"):
+                try:
+                    resolved_cp = Checkpoint(
+                        checkpoint_id=str(uuid4()),
+                        project_id=self.project_id,
+                        agent_id=self.agent_id,
+                        task_id=target_task_id,
+                        achievement="blocker_resolved",
+                        summary=f"Previously blocked task succeeded on action: {action_type}",
+                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
+                    ).model_dump()
+                    await self.checkpoints.create.remote(resolved_cp)
+                except Exception as e:
+                    logger.error("failed_to_save_blocker_resolved_checkpoint", error=str(e))
+                    
             if action_type in {"write_file", "write_code"} and exec_res.get("executed"):
                 self.status = "PUBLISH_OUTPUT"
                 try:
@@ -418,6 +439,24 @@ class AgentWorkerActor:
                     await self.checkpoints.create.remote(patch_cp)
                 except Exception as e:
                     logger.error("failed_to_save_code_patch_checkpoint", error=str(e))
+
+                code_reviewer = ray.get_actor("code_reviewer", namespace="agentos")
+                review_result = await code_reviewer.review_code_patch.remote(
+                    payload.get("file_path", "unknown_file"), payload.get("content", "")
+                )
+                try:
+                    review_cp = Checkpoint(
+                        checkpoint_id=str(uuid4()),
+                        project_id=self.project_id,
+                        agent_id=self.agent_id,
+                        task_id=target_task_id,
+                        achievement="review_completed",
+                        summary=f"Code review result: approved={review_result.get('approved')}",
+                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
+                    ).model_dump()
+                    await self.checkpoints.create.remote(review_cp)
+                except Exception as e:
+                    logger.error("failed_to_save_review_checkpoint", error=str(e))
 
             if exec_res.get("executed") and target_task_id:
                 self.status = "PUBLISH_OUTPUT"

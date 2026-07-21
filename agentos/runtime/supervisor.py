@@ -101,6 +101,8 @@ class RuntimeSupervisorActor:
         logger.info("contacting_bootstrap_agent_for_team_blueprint")
         bootstrap = BootstrapAgentActor.options(namespace="agentos").remote(project_id=self.settings.project_name)
         
+        await project_repo.update_status(db_project_id, "PLANNING")
+
         raw_plan = await bootstrap.create_team_plan.remote(
             user_request, tuning_cfg["agent_limits"]["max_agents_total"]
         )
@@ -132,9 +134,18 @@ class RuntimeSupervisorActor:
             request=user_request,
             dod=validated.original.dod
         )
+        
+        from agentos.storage.repositories import DoDRepository
+        dod_repo = DoDRepository(self.db_manager)
+        
+        for criterion in validated.original.dod:
+            await dod_repo.add_dod_check(db_project_id, criterion)
 
+        await project_repo.update_status(db_project_id, "TEAM_FORMING")
         logger.info("spawning_ray_agent_actors", total_count=validated.total_agents)
         actors = await self.create_agent_actors(validated.agents, db_project_id)
+
+        await project_repo.update_status(db_project_id, "RUNNING")
 
         for spec in validated.agents:
             for index in range(1, spec.count + 1):
@@ -411,10 +422,12 @@ class RuntimeSupervisorActor:
 
     async def watchdog_loop(self, project_id: str, dod: list[str]) -> None:
         """Monitors system states, delegating DoD validation to the dedicated DoDEvaluatorActor."""
-        dod_wd = DoDWatchdog(self.db_manager)
-        stag_wd = StagnationWatchdog(self.db_manager)
-        safety_wd = SafetyWatchdog(self.db_manager)
-        deadlock_wd = DeadlockWatchdog(self.db_manager)
+        event_repo = EventRepository(self.db_manager)
+        project_repo = ProjectRepository(self.db_manager)
+        dod_wd = DoDWatchdog(self.db_manager, self.settings.dragonfly_url)
+        stag_wd = StagnationWatchdog(self.db_manager, self.settings.dragonfly_url)
+        safety_wd = SafetyWatchdog(self.db_manager, self.settings.dragonfly_url)
+        deadlock_wd = DeadlockWatchdog(self.db_manager, self.settings.dragonfly_url)
         
         while self.is_running:
             await asyncio.sleep(tuning_cfg["watchdog_loop"]["interval_seconds"])
@@ -424,30 +437,15 @@ class RuntimeSupervisorActor:
                 if evaluation_result.get("satisfied", False):
                     logger.info("[WATCHDOG]: All Definition of Done (DoD) criteria successfully met!")
                     self._project_complete.set()
+
+                    await project_repo.update_status(project_id, "DOD_SATISFIED")
                     return
-                stall_result = await dod_wd.inspect(
+                stall_result = await dod_wd.inspect_and_act(
                     project_id,
                     evaluation_result.get("satisfied", False),
                     evaluation_result.get("gaps", [])
                 )
                 if stall_result.get("action_required") == "TRIGGER_REPLANNING":
-                    logger.warning("dod_stall_detected_initiating_replanning_phase", gaps=stall_result["gaps"])
-                    unified_stream_key = f"project:{project_id}:events"
-                    
-                    replanning_event = Event(
-                        project_id=project_id,
-                        event_type=EventType.REPLANNING_TRIGGERED, 
-                        topic=unified_stream_key,
-                        payload={
-                            "message": f"CRITICAL STALL: Backlog is empty but project goals are unfulfilled.",
-                            "missing_dod_items": stall_result["gaps"]
-                        }
-                    )
-                    
-                    await event_repo.save_event(project_id, replanning_event)
-                    await self.dragonfly.publish_event(unified_stream_key, replanning_event)
-
-                    await self.dragonfly.publish_event(unified_stream_key, stall_event)
                     self._watchdog_cycle_count = getattr(self, "_watchdog_cycle_count", 0) + 1
                     if self._watchdog_cycle_count % 3 == 0:
                         try:
@@ -468,20 +466,15 @@ class RuntimeSupervisorActor:
 
             for wd, args in [(stag_wd, (project_id,)), (safety_wd, (project_id,)), (deadlock_wd, (project_id,))]:
                 try:
-                    result = await wd.inspect(*args)
-                    action = result.get("action_required")
-                    if action == "QUARANTINE_AGENT" and result.get("agent_id"):
+                    result = await wd.inspect_and_act(*args)
+                    if result.get("action_required") == "QUARANTINE_AGENT" and result.get("agent_id"):
                         from agentos.governance.policy_engine import PolicyEngine
                         policy_engine = PolicyEngine(self.settings)
                         policy_engine.quarantine_agent(result["agent_id"])
                         logger.critical("agent_quarantined_by_watchdog", agent_id=result["agent_id"], reason=result.get("reason"))
-                    elif action == "FREEZE_STREAM":
-                        logger.warning("stagnation_detected_manual_review_needed", reason=result.get("reason"))
-                    elif action == "RESOLVE_DEADLOCK":
-                        logger.critical("deadlock_detected_manual_review_needed", reason=result.get("reason"))
                 except Exception as e:
                     logger.error("watchdog_inspection_failed", watchdog=wd.__class__.__name__, error=str(e))
-
+                    
     async def shutdown(self):
         """Gracefully cleans up resources and shuts down the supervisor."""
         logger.info("initiating_supervisor_shutdown")
@@ -494,3 +487,35 @@ class RuntimeSupervisorActor:
             
         await self.db_manager.disconnect()
         logger.info("supervisor_shutdown_complete")
+
+    async def stop_project_by_user(self, project_id: str) -> dict:
+        """
+        Manually halts project execution and transitions state to terminal STOPPED_BY_USER.
+        Section 20 Terminal State Transition.
+        """
+        logger.info("project_stop_requested_by_user", project_id=project_id)
+        
+        from agentos.storage.repositories import ProjectRepository
+        project_repo = ProjectRepository(self.db_manager)
+        
+        await project_repo.update_status(project_id, "STOPPED_BY_USER")
+        
+        await self.shutdown()
+        
+        return {"status": "SUCCESS", "project_id": project_id, "final_state": "STOPPED_BY_USER"}
+
+    async def mark_failed_by_policy(self, project_id: str, reason: str) -> dict:
+        """
+        Halts project execution due to safety/policy violation and transitions state to terminal FAILED_BY_POLICY.
+        Section 20 Terminal State Transition.
+        """
+        logger.critical("project_failed_by_policy_violation", project_id=project_id, reason=reason)
+        
+        from agentos.storage.repositories import ProjectRepository
+        project_repo = ProjectRepository(self.db_manager)
+        
+        await project_repo.update_status(project_id, "FAILED_BY_POLICY")
+        
+        await self.shutdown()
+        
+        return {"status": "FAILED", "project_id": project_id, "final_state": "FAILED_BY_POLICY", "reason": reason}

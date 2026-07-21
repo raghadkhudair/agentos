@@ -5,7 +5,22 @@ CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name TEXT NOT NULL UNIQUE,
     request TEXT,
-    status TEXT NOT NULL DEFAULT 'INITIALIZING',
+    status TEXT NOT NULL DEFAULT 'INITIALIZING' CHECK (
+        status IN (
+            'INITIALIZING',
+            'PLANNING',
+            'TEAM_FORMING',
+            'RUNNING',
+            'REPLANNING',
+            'INTEGRATING',
+            'VERIFYING',
+            'BLOCKED_REQUIRES_APPROVAL',
+            'BLOCKED_REQUIRES_INPUT',
+            'DOD_SATISFIED',
+            'FAILED_BY_POLICY',
+            'STOPPED_BY_USER'
+        )
+    ),
     dod JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -163,15 +178,27 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 
 CREATE TABLE IF NOT EXISTS dod_checks (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-            criterion TEXT NOT NULL,
-            status VARCHAR(50) DEFAULT 'PENDING',
-            verified_by_agent_id VARCHAR(255),
-            evidence_summary TEXT,
-            updated_at TIMESTAMPTZ DEFAULT NOW(),
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        );
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    criterion TEXT NOT NULL,
+    verification_method TEXT,
+    required_artifacts JSONB DEFAULT '[]'::jsonb,
+    status VARCHAR(50) DEFAULT 'NOT_STARTED' CHECK (
+        status IN (
+            'NOT_STARTED', 
+            'IN_PROGRESS', 
+            'IMPLEMENTED', 
+            'UNDER_REVIEW', 
+            'FAILED_VERIFICATION', 
+            'SATISFIED', 
+            'WAIVED_BY_HUMAN'
+        )
+    ),
+    verified_by_agent_id VARCHAR(255),
+    evidence_summary TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 CREATE INDEX IF NOT EXISTS idx_dod_checks_project ON dod_checks(project_id, status);
 

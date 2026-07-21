@@ -81,7 +81,7 @@ class MemoryBrokerActor:
             resolved_scopes = agent_allowed_scopes
 
         if not resolved_scopes:
-            resolved_scopes = ["project"]
+            resolved_scopes = ["project_memory"]
 
         logger.info("enforcing_memory_access_control", agent_id=agent_id, effective=resolved_scopes)
         

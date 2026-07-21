@@ -245,6 +245,27 @@ class SummaryManagerActor:
         return summary_text
     
 
+    async def generate_stagnation_summary(self, project_id: str, reason: str, context_lines: list[str], provider_gateway: any) -> str:
+        """Writes a real, human-readable explanation of a detected stagnation event."""
+        await self._ensure_connected()
+        raw_context = "\n".join(context_lines) if context_lines else "No additional context available."
+
+        prompt = (
+            f"You are the Summary Manager for AgentOS. The Stagnation Watchdog just detected a problem: "
+            f"'{reason}'.\n\n"
+            f"Write a clear, 3-4 sentence explanation of what's actually going wrong, based on this evidence, "
+            f"so a human or the PM agent can understand it at a glance and decide what to do next.\n\n"
+            f"EVIDENCE:\n{raw_context}"
+        )
+
+        req = ProviderRequest(
+            purpose="generate_stagnation_summary",
+            messages=[{"role": "user", "content": prompt}],
+            budget_key=project_id
+        )
+        response = await provider_gateway.get_completion.remote(req)
+        return response["content"].strip()
+    
     async def compress_event_history(self, raw_events: list[str], project_id: str, provider_gateway: any) -> str:
         """
         Takes a raw event stream list and compresses it into a high-density,

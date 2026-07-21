@@ -107,25 +107,21 @@ class ProviderGatewayActor:
 
     async def _check_budget_allowance(self, project_id: str) -> bool:
         """Strictly enforces project budget caps before calling external models."""
-        await self._ensure_connected()
-        if not self.db_manager or not self.db_manager.pool:
-            return False 
-        
         try:
-            query = "SELECT COALESCE(SUM(cost_usd), 0.0) FROM provider_calls WHERE project_id = $1"
-            total_spent = await self.db_manager.pool.fetchval(query, uuid.UUID(project_id))
-            
+            hot_counter_key = f"provider:cost:{project_id}"
+            current_spent = await self.redis_client.get(hot_counter_key)
+            total_spent = float(current_spent) if current_spent else 0.0
             max_budget = getattr(self.settings, "daily_budget_usd", 10.0)
-            return float(total_spent) < float(max_budget)
+            return total_spent < float(max_budget)
         except Exception as e:
             logger.error("budget_lookup_failed_failing_closed", error=str(e))
-            return False 
+            return False
 
     def _validate_response_format(self, content: str, response_format: dict | None) -> bool:
         """Validates if the generated content conforms to expected structure formatting."""
         if not response_format:
             return True
-            
+        
         fmt_type = response_format.get("type")
         if fmt_type == "json_object":
             try:
@@ -201,6 +197,7 @@ class ProviderGatewayActor:
 
         try:
             hot_counter_key = f"provider:cost:{request.budget_key}"
+            await self.redis_client.set(hot_counter_key, 0.0, ex=86400, nx=True)  # only sets if key doesn't exist yet, expires in 24h
             await self.redis_client.incrbyfloat(hot_counter_key, float(cost))
         except Exception as counter_error:
             logger.warning("failed_to_update_hot_provider_counter", error=str(counter_error))

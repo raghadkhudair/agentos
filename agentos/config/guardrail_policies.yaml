@@ -96,9 +96,10 @@ safety_watchdog:
   blocked_call_quarantine_threshold: 5   # violations before agent gets quarantined
 
 stagnation_watchdog:
-  checkpoint_history_lookback: 10        # how many recent checkpoints to inspect
-  repeated_action_threshold: 4           # identical repeats before flagging a loop
-
+  checkpoint_history_lookback: 10
+  repeated_action_threshold: 4
+  staleness_seconds: 300
+  
 prompt_sanitization_patterns:
   - '\.env'
   - 'ignore\s+previous\s+instructions'
