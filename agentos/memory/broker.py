@@ -1,199 +1,375 @@
 from __future__ import annotations
 
-import re
-import uuid
+import hashlib
 import json
+import re
+from datetime import UTC, datetime
+from typing import Any, cast
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
+
 import ray
 import structlog
-from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 
-from agentos.storage.database import DatabaseManager
-from agentos.storage.repositories import TaskRepository
-from agentos.provider.gateway import ProviderGateway, ProviderRequest
+from agentos.config.loader import runtime_tuning
+from agentos.config.settings import Settings
+from agentos.governance.models import AgentIdentity
+from agentos.storage.clients.milvus import MilvusVectorClient, VectorRecord
+from agentos.storage.clients.minio import MinioObjectClient
+from agentos.storage.clients.mongodb import MongoDocumentClient
+from agentos.storage.clients.postgres import PostgresClient
+from agentos.storage.repositories import EventRepository, MemoryRepository, TaskRepository
 
 logger = structlog.get_logger()
 
-@dataclass(frozen=True)
-class CatchUpPacket:
+
+class CatchUpPacket(BaseModel):
     project_id: str
     agent_id: str
     trigger_event_id: str
-    summary_of_recent_events: str  # Summarized to prevent prompt pollution
-    active_tasks: list[str] = field(default_factory=list)
-    relevant_memories: list[str] = field(default_factory=list)
-    recommended_next_actions: list[str] = field(default_factory=list)
+    recent_events: list[dict[str, Any]] = Field(default_factory=list)
+    active_tasks: list[dict[str, Any]] = Field(default_factory=list)
+    midterm_memories: list[dict[str, Any]] = Field(default_factory=list)
+    longterm_memories: list[dict[str, Any]] = Field(default_factory=list)
+    recommended_next_actions: list[str] = Field(default_factory=list)
 
 
-@ray.remote(namespace="agentos")
-class MemoryBrokerActor:
-    """Scoped memory gateway enforcing context boundaries, zero-trust ACL layers, and context summarization."""
-    
-    def __init__(self, settings_payload: dict):
-        from agentos.config.settings import Settings
-        self.settings = Settings(**settings_payload)
-        self.db = DatabaseManager(self.settings)
-        self.task_repo = TaskRepository(self.db)
-        self._connected = False
+class MemoryService:
+    """Coordinates short-, mid-, and long-term memory without merging their stores."""
 
-    async def _ensure_connected(self):
-        """Ensures PostgreSQL connections are active in this Ray process."""
-        if not self._connected:
-            await self.db.connect()
-            self._connected = True
+    _SECRET = re.compile(
+        r"(?i)(api[_-]?key|password|secret|token|private[_-]?key)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
+    )
 
-    def _scrub_secrets(self, text: str) -> str:
-        """Zero-trust data-scrubbing pattern to block password/API key exposure."""
-        # Redacts common credentials and API keys inside content streams
-        scrubbed = re.sub(r'(?i)(api_key|password|secret|token|private_key)\s*[:=]\s*["\'][^"\']+["\']', r'\1: "[REDACTED_BY_MEMORY_BROKER]"', text)
-        return scrubbed
-    
-    async def register_agent_identity(self, identity_data: dict) -> None:
-        from agentos.governance.models import AgentIdentity
-        identity_obj = AgentIdentity(**identity_data)
-        if not hasattr(self, "_authenticated_identities"):
-            self._authenticated_identities = {}
-        self._authenticated_identities[identity_obj.agent_id] = identity_obj
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.postgres = PostgresClient(settings)
+        self.mongo = MongoDocumentClient(settings)
+        self.milvus = MilvusVectorClient(settings)
+        self.minio = MinioObjectClient(settings)
+        self.memory_repo = MemoryRepository(self.postgres)
+        self.event_repo = EventRepository(self.postgres)
+        self.task_repo = TaskRepository(self.postgres)
+        self.tuning = runtime_tuning().get("memory", {})
 
-    async def build_catchup_packet(
-    self,
-    *,
-    project_id: str,
-    agent_id: str,
-    trigger_event_id: str,
-    requested_scopes: list[str] | None = None,
-    provider_gateway: any = None
-) -> dict:
-        await self._ensure_connected()
-        
-        if not hasattr(self, "_authenticated_identities"):
-            self._authenticated_identities = {}
-            
-        auth_identity = self._authenticated_identities.get(agent_id)
-        if not auth_identity:
-            return {"error": "Identity Registry Violation: Unknown memory requester signature."}
-            
-        agent_allowed_scopes = auth_identity.memory_scopes
-        
-        resolved_scopes = []
-        if requested_scopes:
-            resolved_scopes = [s for s in requested_scopes if s in agent_allowed_scopes]
-        else:
-            resolved_scopes = agent_allowed_scopes
+    @classmethod
+    def scrub(cls, text: str) -> str:
+        return cls._SECRET.sub("[REDACTED_BY_MEMORY_BROKER]", text)
 
-        if not resolved_scopes:
-            resolved_scopes = ["project_memory"]
+    async def initialize(self) -> None:
+        await self.postgres.connect()
+        await self.mongo.initialize()
+        await self.minio.initialize()
+        await self.milvus.initialize()
 
-        logger.info("enforcing_memory_access_control", agent_id=agent_id, effective=resolved_scopes)
-        
-        # Fetch Live Historical Events Stream
-        query_events = """
-            SELECT event_type, topic, payload 
-            FROM events
-            WHERE project_id = $1
-            ORDER BY created_at DESC 
-            LIMIT 10;
-        """
-        raw_events = []
-        trigger_message = ""
-        
-        safe_project_id = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
-        
-        async with self.db.pool.acquire() as conn:
-            rows = await conn.fetch(query_events, safe_project_id)
-            for row in rows:
-                raw_payload = row['payload']
-                scrubbed_payload = self._scrub_secrets(
-                    raw_payload if isinstance(raw_payload, str) else json.dumps(raw_payload)
-                )
-                
-                raw_events.append(f"[{row['event_type']}] {row['topic']}: {scrubbed_payload}")
-                if not trigger_message:
-                    try:
-                        payload_dict = json.loads(scrubbed_payload)
-                        trigger_message = payload_dict.get("message", "")
-                    except Exception:
-                        trigger_message = scrubbed_payload
-                
-        if not raw_events:
-            raw_events = ["No recent events found. Project is initializing."]
+    async def close(self) -> None:
+        await self.postgres.disconnect()
+        await self.mongo.close()
 
-        summarized_briefing = "No history to summarize."
-        if provider_gateway and raw_events:
-            try:
-                summary_manager = ray.get_actor("summary_manager", namespace="agentos")
-                
-                summarized_briefing = await summary_manager.compress_event_history.remote(
-                    raw_events=raw_events,
-                    project_id=str(project_id),
-                    provider_gateway=provider_gateway
-                )
-            except Exception as e:
-                logger.error("failed_to_delegate_summarization", error=str(e))
-                summarized_briefing = "Fallback raw timeline:\n" + "\n".join(raw_events[:3])
-
-        # Fetch Live Task Graph
-        live_tasks = await self.task_repo.get_active_tasks(str(project_id))
-        formatted_tasks = []
-        for t in live_tasks:
-            dep_list = t.get("dependencies", [])
-            dep_str = ", ".join(dep_list) if dep_list else "NONE"
-            
-            formatted_tasks.append(
-                f"- [Task ID: {t['id']}] {t['title']} (Status: {t['status']})\n"
-                f"  Description: {t['description']}\n"
-                f"  Blocked By Tasks: {dep_str}"
+    async def remember(
+        self,
+        *,
+        project_id: str,
+        agent_id: str,
+        scope: str,
+        kind: str,
+        title: str,
+        content: str,
+        importance: int,
+        provider_gateway: Any,
+        metadata: dict[str, Any] | None = None,
+        promote_long_term: bool = True,
+    ) -> dict[str, Any]:
+        safe_content = self.scrub(content)
+        result: dict[str, Any] = {"midterm_saved": False, "longterm_saved": False}
+        if not promote_long_term:
+            await self.mongo.append_memory(
+                project_id=project_id,
+                agent_id=agent_id,
+                scope=scope,
+                kind=kind,
+                content=safe_content,
+                metadata=metadata,
             )
-            
-        if not formatted_tasks:
-            formatted_tasks = ["No active tasks currently assigned."]
+            result["midterm_saved"] = True
+            return result
 
-        relevant_memories = []
-        if provider_gateway and trigger_message:
+        encoded = safe_content.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        large_content = len(encoded) > 16_384
+        memory_id = await self.memory_repo.save_memory_item(
+            project_id=project_id,
+            scope=scope,
+            owner_agent_id=agent_id,
+            memory_type=kind,
+            title=self.scrub(title),
+            content=safe_content,
+            importance_score=importance,
+            content_hash=digest,
+            content_length=len(encoded),
+            storage_status="PENDING_OBJECT" if large_content else "READY",
+            metadata=metadata,
+        )
+        content_object_uri: str | None = None
+        if large_content:
             try:
-                query_vector = await provider_gateway.get_embedding.remote(trigger_message, str(project_id))
-                
-                from agentos.storage.repositories import MemoryRepository, CodebaseMapRepository
-                memory_repo = MemoryRepository(self.db)
-                
-                mem_rows = await memory_repo.search_hybrid_memories(
-                    project_id=str(project_id),
-                    agent_id=agent_id,
-                    allowed_scopes=resolved_scopes,
-                    query_text=trigger_message,
-                    query_embedding=query_vector,
-                    limit=3
+                object_name = f"{project_id}/memory/{uuid4()}.txt"
+                obj = await self.minio.put_bytes(
+                    bucket=self.settings.minio_memory_bucket,
+                    object_name=object_name,
+                    data=encoded,
+                    content_type="text/plain; charset=utf-8",
+                    metadata={"project-id": project_id, "agent-id": agent_id, "scope": scope},
                 )
-                
-                for m in mem_rows:
-                    scrubbed_mem = self._scrub_secrets(m['content'])
-                    relevant_memories.append(
-                        f"🔍 [Memory Scope: {m['scope']} | Type: {m['memory_type']}]: {m['title']} - {scrubbed_mem}"
-                    )
-                
-                # Codebase Map Search
-                code_repo = CodebaseMapRepository(self.db)
-                code_snippets = await code_repo.search_codebase(str(project_id), query_vector, limit=2)
-                for cs in code_snippets:
-                    relevant_memories.append(
-                        f"[Codebase Map - {cs['file_path']} ({cs['chunk_identifier']})]:\n{cs['code_snippet']}"
-                    )
-            
-            except Exception as e:
-                logger.warning("vector_search_bypassed", reason=str(e))
-
-        if not relevant_memories:
-            relevant_memories = ["No matching vector memories found within the assigned access scopes."]
-
-        packet = CatchUpPacket(
-            project_id=str(project_id),
+                if obj.sha256 != digest or obj.size != len(encoded):
+                    raise OSError("MinIO memory object verification failed")
+                content_object_uri = obj.uri
+                await self.memory_repo.attach_memory_object(
+                    memory_id,
+                    object_uri=obj.uri,
+                    object_version_id=obj.version_id,
+                    content_hash=digest,
+                    content_length=len(encoded),
+                    preview=safe_content[:16_384],
+                )
+            except Exception:
+                await self.memory_repo.mark_memory_object_failed(memory_id)
+                raise
+        await self.mongo.append_memory(
+            project_id=project_id,
             agent_id=agent_id,
+            scope=scope,
+            kind=kind,
+            content=safe_content,
+            metadata={**(metadata or {}), "longterm_memory_id": memory_id},
+        )
+        result.update(
+            midterm_saved=True,
+            longterm_saved=True,
+            memory_id=memory_id,
+            content_object_uri=content_object_uri,
+            semantic_indexed=False,
+        )
+        try:
+            vector = await provider_gateway.get_embedding.remote(
+                f"{title}\n{safe_content[:8000]}", project_id
+            )
+            milvus_id = str(uuid4())
+            await self.milvus.upsert(
+                VectorRecord(
+                    record_id=milvus_id,
+                    vector=vector,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    scope=scope,
+                    kind=kind,
+                    content_ref=memory_id,
+                    importance=importance,
+                    created_at_epoch=int(datetime.now(UTC).timestamp()),
+                )
+            )
+            await self.memory_repo.link_vector(memory_id, milvus_id, self.settings.embedding_model)
+            result.update(semantic_indexed=True, milvus_record_id=milvus_id)
+        except Exception as error:
+            logger.warning(
+                "semantic_memory_indexing_unavailable",
+                project_id=project_id,
+                error_type=type(error).__name__,
+            )
+        return result
+
+    async def _hydrate_longterm_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        safe_row = dict(row)
+        uri = safe_row.get("content_object_uri")
+        if not uri:
+            return safe_row
+        parsed = urlparse(str(uri))
+        if parsed.scheme != "minio" or not parsed.netloc or not parsed.path.lstrip("/"):
+            raise ValueError("invalid stored MinIO memory URI")
+        version_id = safe_row.get("content_object_version_id")
+        if not version_id:
+            version_values = parse_qs(parsed.query).get("versionId", [])
+            version_id = version_values[-1] if version_values else None
+        data = await self.minio.get_bytes(
+            bucket=parsed.netloc,
+            object_name=parsed.path.lstrip("/"),
+            version_id=str(version_id) if version_id else None,
+        )
+        if len(data) != int(safe_row.get("content_length") or 0):
+            raise OSError("stored memory length does not match PostgreSQL metadata")
+        if hashlib.sha256(data).hexdigest() != str(safe_row.get("content_hash")):
+            raise OSError("stored memory checksum does not match PostgreSQL metadata")
+        safe_row["content"] = data.decode("utf-8")
+        return safe_row
+
+    async def build_packet(
+        self,
+        *,
+        identity: AgentIdentity,
+        trigger_event_id: str,
+        scopes: list[str],
+        provider_gateway: Any,
+        query_text: str,
+    ) -> CatchUpPacket:
+        recent_events = await self.event_repo.recent(
+            identity.project_id, int(self.tuning.get("recent_event_limit", 20))
+        )
+        active_tasks = await self.task_repo.get_active_tasks(identity.project_id)
+        midterm = await self.mongo.recent_memories(
+            project_id=identity.project_id,
+            requester_agent_id=identity.agent_id,
+            scopes=scopes,
+            limit=int(self.tuning.get("recent_midterm_limit", 20)),
+        )
+
+        longterm: list[dict[str, Any]] = []
+        if query_text.strip():
+            semantic_rows: list[dict[str, Any]] = []
+            try:
+                vector = await provider_gateway.get_embedding.remote(
+                    query_text, identity.project_id
+                )
+                hits = await self.milvus.search(
+                    vector=vector,
+                    project_id=identity.project_id,
+                    scopes=scopes,
+                    requester_agent_id=identity.agent_id,
+                    limit=int(self.tuning.get("semantic_result_limit", 8)),
+                )
+                semantic_rows = await self.memory_repo.get_by_ids(
+                    [hit.content_ref for hit in hits],
+                    project_id=identity.project_id,
+                    agent_id=identity.agent_id,
+                    scopes=scopes,
+                )
+            except Exception as error:
+                logger.warning(
+                    "semantic_memory_retrieval_unavailable",
+                    project_id=identity.project_id,
+                    error_type=type(error).__name__,
+                )
+            lexical_rows = await self.memory_repo.lexical_search(
+                identity.project_id,
+                identity.agent_id,
+                scopes,
+                query_text,
+                limit=int(self.tuning.get("semantic_result_limit", 8)),
+            )
+            seen: set[str] = set()
+            for row in [*semantic_rows, *lexical_rows]:
+                key = str(row["id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                safe_row = await self._hydrate_longterm_row(dict(row))
+                safe_row["content"] = self.scrub(str(safe_row.get("content", "")))
+                longterm.append(safe_row)
+
+        max_chars = int(self.tuning.get("max_prompt_memory_characters", 16_000))
+        consumed = 0
+        bounded_longterm: list[dict[str, Any]] = []
+        for row in longterm:
+            size = len(str(row.get("content", "")))
+            if consumed + size > max_chars:
+                break
+            bounded_longterm.append(row)
+            consumed += size
+
+        return CatchUpPacket(
+            project_id=identity.project_id,
+            agent_id=identity.agent_id,
             trigger_event_id=trigger_event_id,
-            summary_of_recent_events=summarized_briefing,
-            active_tasks=formatted_tasks,
-            relevant_memories=relevant_memories,
+            recent_events=[self._json_safe_event(row) for row in recent_events],
+            active_tasks=[self._json_safe(row) for row in active_tasks],
+            midterm_memories=[self._json_safe(row) for row in midterm],
+            longterm_memories=[self._json_safe(row) for row in bounded_longterm],
             recommended_next_actions=[
-                "Verify task hierarchy sequences before generating code requests.",
-                "Ensure standard verification checks pass via sandboxed execution paths."
+                "Select only an unblocked task inside the agent ownership boundary.",
+                "Publish a typed collaboration update after a meaningful state change.",
+                "Record test and review evidence before claiming completion.",
             ],
         )
-        return packet.__dict__
+
+    @staticmethod
+    def _json_safe(row: dict[str, Any]) -> dict[str, Any]:
+        return cast(dict[str, Any], json.loads(json.dumps(row, default=str)))
+
+    @classmethod
+    def _json_safe_event(cls, row: dict[str, Any]) -> dict[str, Any]:
+        safe = cls._json_safe(row)
+        if "payload" in safe:
+            safe["payload"] = json.loads(cls.scrub(json.dumps(safe["payload"], default=str)))
+        return safe
+
+
+@ray.remote(num_cpus=0.2, max_concurrency=32)  # type: ignore[call-overload]
+class MemoryBrokerActor:
+    def __init__(self, settings_payload: dict[str, Any]):
+        self.service = MemoryService(Settings(**settings_payload))
+        self.identities: dict[str, AgentIdentity] = {}
+
+    async def register_agent_identity(self, identity_data: dict[str, Any]) -> None:
+        identity = AgentIdentity.model_validate(identity_data)
+        row = await self.service.postgres.fetchrow(
+            "SELECT role,project_id,memory_scopes FROM agents WHERE id=$1 AND project_id=$2",
+            identity.agent_id,
+            identity.project_id,
+        )
+        if row is None:
+            raise PermissionError("memory identity is not registered in PostgreSQL")
+        if str(row["role"]) != identity.role or str(row["project_id"]) != identity.project_id:
+            raise PermissionError("memory identity does not match the persisted agent")
+        persisted_scopes = set(row["memory_scopes"] or [])
+        if not set(identity.memory_scopes).issubset(persisted_scopes):
+            raise PermissionError("memory identity claims unregistered scopes")
+        existing = self.identities.get(identity.agent_id)
+        if existing is not None and existing != identity:
+            raise PermissionError("memory identity is already registered with different claims")
+        self.identities[identity.agent_id] = identity
+
+    async def record_memory(self, **kwargs: Any) -> dict[str, Any]:
+        agent_id = kwargs.get("agent_id")
+        if not isinstance(agent_id, str):
+            raise PermissionError("memory writer identity is required")
+        identity = self.identities.get(agent_id)
+        if not identity:
+            raise PermissionError("unknown memory writer identity")
+        if kwargs.get("project_id") != identity.project_id:
+            raise PermissionError("memory writer cannot cross project boundaries")
+        scope = kwargs.get("scope")
+        if scope not in identity.memory_scopes:
+            raise PermissionError(f"agent cannot write memory scope {scope!r}")
+        return await self.service.remember(**kwargs)
+
+    async def build_catchup_packet(
+        self,
+        *,
+        project_id: str,
+        agent_id: str,
+        trigger_event_id: str,
+        requested_scopes: list[str] | None = None,
+        provider_gateway: Any,
+        query_text: str = "",
+    ) -> dict[str, Any]:
+        identity = self.identities.get(agent_id)
+        if identity is None or identity.project_id != project_id:
+            raise PermissionError("unknown or cross-project memory requester")
+        scopes = list(identity.memory_scopes)
+        if requested_scopes is not None:
+            scopes = [scope for scope in requested_scopes if scope in identity.memory_scopes]
+        if not scopes:
+            raise PermissionError("memory request has no authorized scope")
+        packet = await self.service.build_packet(
+            identity=identity,
+            trigger_event_id=trigger_event_id,
+            scopes=scopes,
+            provider_gateway=provider_gateway,
+            query_text=query_text,
+        )
+        return packet.model_dump(mode="json")
+
+
+MemoryBroker = MemoryService
+
+__all__ = ["CatchUpPacket", "MemoryBroker", "MemoryBrokerActor", "MemoryService"]

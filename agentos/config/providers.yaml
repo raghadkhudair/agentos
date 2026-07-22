@@ -1,0 +1,140 @@
+schema_version: 1
+
+# Model identifiers are normal LiteLLM routes and may be overridden with the
+# corresponding environment variable. A provider is considered available only
+# when its credential exists (Ollama is the intentional local exception).
+providers:
+  openai:
+    litellm_prefix: openai
+    api_key_env: OPENAI_API_KEY
+    api_base_env: OPENAI_API_BASE
+    allowed_hosts: [api.openai.com]
+    models:
+      low: ${OPENAI_MODEL_LOW:-openai/gpt-5-nano}
+      standard: ${OPENAI_MODEL_STANDARD:-openai/gpt-5-mini}
+      high: ${OPENAI_MODEL_HIGH:-openai/gpt-5.1}
+      critical: ${OPENAI_MODEL_CRITICAL:-openai/gpt-5-pro}
+    capabilities: [chat, json, tools, reasoning, vision]
+
+  anthropic:
+    litellm_prefix: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    api_base_env: ANTHROPIC_API_BASE
+    allowed_hosts: [api.anthropic.com]
+    models:
+      low: ${ANTHROPIC_MODEL_LOW:-anthropic/claude-haiku-4-5}
+      standard: ${ANTHROPIC_MODEL_STANDARD:-anthropic/claude-sonnet-5}
+      high: ${ANTHROPIC_MODEL_HIGH:-anthropic/claude-opus-4-8}
+      critical: ${ANTHROPIC_MODEL_CRITICAL:-anthropic/claude-opus-4-8}
+    capabilities: [chat, json, tools, reasoning, vision]
+
+  gemini:
+    litellm_prefix: gemini
+    api_key_env: GEMINI_API_KEY
+    api_base_env: GEMINI_API_BASE
+    allowed_hosts: [generativelanguage.googleapis.com]
+    models:
+      low: ${GEMINI_MODEL_LOW:-gemini/gemini-3.5-flash-lite}
+      standard: ${GEMINI_MODEL_STANDARD:-gemini/gemini-3.6-flash}
+      high: ${GEMINI_MODEL_HIGH:-gemini/gemini-3.5-flash}
+      critical: ${GEMINI_MODEL_CRITICAL:-gemini/gemini-3.5-flash}
+    capabilities: [chat, json, tools, reasoning, vision]
+
+  deepseek:
+    litellm_prefix: deepseek
+    api_key_env: DEEPSEEK_API_KEY
+    api_base_env: DEEPSEEK_API_BASE
+    allowed_hosts: [api.deepseek.com]
+    models:
+      low: ${DEEPSEEK_MODEL_LOW:-deepseek/deepseek-v4-flash}
+      standard: ${DEEPSEEK_MODEL_STANDARD:-deepseek/deepseek-v4-flash}
+      high: ${DEEPSEEK_MODEL_HIGH:-deepseek/deepseek-v4-pro}
+      critical: ${DEEPSEEK_MODEL_CRITICAL:-deepseek/deepseek-v4-pro}
+    capabilities: [chat, json, tools, reasoning]
+
+  moonshot:
+    litellm_prefix: moonshot
+    api_key_env: MOONSHOT_API_KEY
+    api_base_env: MOONSHOT_API_BASE
+    allowed_hosts: [api.moonshot.ai, api.moonshot.cn]
+    models:
+      low: ${MOONSHOT_MODEL_LOW:-moonshot/kimi-k2.5}
+      standard: ${MOONSHOT_MODEL_STANDARD:-moonshot/kimi-k2.5}
+      high: ${MOONSHOT_MODEL_HIGH:-moonshot/kimi-k2.5}
+      critical: ${MOONSHOT_MODEL_CRITICAL:-moonshot/kimi-k2.5}
+    capabilities: [chat, json, tools, reasoning, vision]
+
+  alibaba:
+    litellm_prefix: dashscope
+    api_key_env: DASHSCOPE_API_KEY
+    api_base_env: DASHSCOPE_API_BASE
+    allowed_hosts: [dashscope.aliyuncs.com]
+    models:
+      low: ${ALIBABA_MODEL_LOW:-dashscope/qwen3.6-flash}
+      standard: ${ALIBABA_MODEL_STANDARD:-dashscope/qwen3.7-plus}
+      high: ${ALIBABA_MODEL_HIGH:-dashscope/qwen3.7-plus}
+      critical: ${ALIBABA_MODEL_CRITICAL:-dashscope/qwen3.7-max}
+    capabilities: [chat, json, tools, reasoning, vision]
+
+  zai:
+    litellm_prefix: zai
+    api_key_env: ZAI_API_KEY
+    api_base_env: ZAI_API_BASE
+    allowed_hosts: [api.z.ai, open.bigmodel.cn]
+    models:
+      low: ${ZAI_MODEL_LOW:-zai/glm-4.7-flashx}
+      standard: ${ZAI_MODEL_STANDARD:-zai/glm-5}
+      high: ${ZAI_MODEL_HIGH:-zai/glm-5.1}
+      critical: ${ZAI_MODEL_CRITICAL:-zai/glm-5.1}
+    capabilities: [chat, json, tools, reasoning, vision]
+
+  minimax:
+    litellm_prefix: minimax
+    api_key_env: MINIMAX_API_KEY
+    api_base_env: MINIMAX_API_BASE
+    allowed_hosts: [api.minimax.io, api.minimax.chat]
+    models:
+      low: ${MINIMAX_MODEL_LOW:-minimax/MiniMax-M2.7-highspeed}
+      standard: ${MINIMAX_MODEL_STANDARD:-minimax/MiniMax-M2.7}
+      high: ${MINIMAX_MODEL_HIGH:-minimax/MiniMax-M2.7}
+      critical: ${MINIMAX_MODEL_CRITICAL:-minimax/MiniMax-M2.7}
+    capabilities: [chat, json, tools, reasoning]
+
+  ollama:
+    litellm_prefix: ollama
+    api_key_env: null
+    api_base_env: OLLAMA_API_BASE
+    allowed_hosts: [localhost, 127.0.0.1, ollama]
+    local: true
+    models:
+      low: ${OLLAMA_MODEL_LOW:-ollama/qwen3:8b}
+      standard: ${OLLAMA_MODEL_STANDARD:-ollama/qwen3-coder:30b}
+      high: ${OLLAMA_MODEL_HIGH:-ollama/deepseek-r1:32b}
+      critical: ${OLLAMA_MODEL_CRITICAL:-ollama/deepseek-r1:32b}
+    capabilities: [chat, json, tools, reasoning]
+
+routing:
+  default_order: [openai, anthropic, gemini, deepseek, moonshot, alibaba, zai, minimax, ollama]
+  role_preferences:
+    pm_tech_lead: [openai, anthropic, gemini]
+    solution_architect: [anthropic, openai, gemini, deepseek]
+    backend_developer: [deepseek, alibaba, openai, ollama]
+    frontend_developer: [anthropic, gemini, openai, alibaba]
+    platform_engineer: [deepseek, openai, alibaba, ollama]
+    qa_engineer: [gemini, openai, deepseek, ollama]
+    code_reviewer: [anthropic, openai, gemini, deepseek]
+    security_reviewer: [openai, anthropic, deepseek, gemini]
+    infrastructure_agent: [deepseek, openai, alibaba, ollama]
+  purpose_complexity:
+    heartbeat_summary: low
+    compress_event_history: low
+    decide_next_action: standard
+    bootstrap_team_planning: high
+    review_code_patch: high
+    infrastructure_planning: high
+    decision_conflict_check: critical
+    safety_behavior_review: critical
+    dod_evidence_review: critical
+  circuit_breaker:
+    failure_threshold: 3
+    recovery_seconds: 120

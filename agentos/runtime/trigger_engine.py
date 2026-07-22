@@ -2,180 +2,202 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import defaultdict
+from typing import Any
+
 import ray
 import structlog
-from typing import Dict, Set, List
+
+from agentos.config.loader import runtime_tuning
+from agentos.config.settings import Settings
 from agentos.messaging.dragonfly_bus import DragonflyBus
-from agentos.messaging.events import Event, EventType
+from agentos.messaging.events import Event, validate_event
+from agentos.storage.clients.postgres import PostgresClient
+from agentos.storage.repositories import EventRepository
 
 logger = structlog.get_logger()
 
 
-@ray.remote(namespace="agentos")
+@ray.remote(num_cpus=0.2, max_concurrency=8)  # type: ignore[call-overload]
 class TriggerEngineActor:
+    """Routes typed events to independent agent inboxes with consumer-group recovery."""
 
-    def __init__(self, dragonfly_url: str):
-        self.bus = DragonflyBus(dragonfly_url)
-        self.subscriptions: Dict[str, Set[str]] = {}
-        self._allowed_producers: Dict[str, List[str]] = {}
+    SYSTEM_PRODUCERS = {
+        None,
+        "runtime_supervisor",
+        "dod_evaluator",
+        "dod_watchdog",
+        "stagnation_watchdog",
+        "deadlock_watchdog",
+        "safety_watchdog",
+        "infrastructure_agent-1",
+        "outbox_dispatcher",
+    }
+
+    def __init__(self, settings_payload: dict[str, Any]):
+        self.settings = Settings(**settings_payload)
+        self.bus = DragonflyBus(self.settings)
+        self.db = PostgresClient(self.settings)
+        self.receipts = EventRepository(self.db)
+        self.subscriptions: dict[str, set[str]] = defaultdict(set)
+        self.registered_agents: set[str] = set()
+        self.allowed_producers: dict[str, set[str]] = defaultdict(set)
+        self.fallback_coordinator: str | None = None
         self.is_running = False
+        self.tuning = runtime_tuning()
+
+    async def register_agent(
+        self,
+        agent_id: str,
+        event_subscriptions: list[str],
+        allowed_event_types: list[str],
+        *,
+        coordinator: bool = False,
+    ) -> None:
+        self.registered_agents.add(agent_id)
+        for event_type in event_subscriptions:
+            self.subscriptions[event_type].add(agent_id)
+        for event_type in allowed_event_types:
+            self.allowed_producers[event_type].add(agent_id)
+        if coordinator:
+            self.fallback_coordinator = agent_id
 
     async def register_subscription(self, event_type: str, agent_id: str) -> None:
-        if event_type not in self.subscriptions:
-            self.subscriptions[event_type] = set()
+        self.registered_agents.add(agent_id)
         self.subscriptions[event_type].add(agent_id)
-        logger.info("subscription_registered", event_type=event_type, agent_id=agent_id)
 
     async def register_allowed_producer(self, event_type: str, agent_id: str) -> None:
-        if event_type not in self._allowed_producers:
-            self._allowed_producers[event_type] = []
-        self._allowed_producers[event_type].append(agent_id)
+        self.allowed_producers[event_type].add(agent_id)
+
+    @staticmethod
+    def topics(project_id: str) -> list[str]:
+        return [
+            f"project.{project_id}.{suffix}"
+            for suffix in (
+                "events",
+                "tasks",
+                "contracts",
+                "reviews",
+                "tests",
+                "blockers",
+                "checkpoints",
+                "summaries",
+                "resources",
+            )
+        ]
 
     async def start_routing_loop(self, project_id: str) -> None:
+        if self.is_running:
+            return
         self.is_running = True
-        
-        topics = [
-            f"project.{project_id}.events",
-            f"project.{project_id}.tasks",
-            f"project.{project_id}.contracts",
-            f"project.{project_id}.reviews",
-            f"project.{project_id}.tests",
-            f"project.{project_id}.blockers",
-            f"project.{project_id}.checkpoints",
-            f"project.{project_id}.summaries",
-            "squad.backend.events",
-            "squad.frontend.events",
-            "squad.platform.events",
-            "squad.qa.events"
-        ]
-        
-        group_name = "trigger_engine_group"
-        consumer_name = f"engine_processor_{ray.get_runtime_context().get_actor_id()}"
-
+        topics = self.topics(project_id)
+        group = f"trigger-engine-{project_id}"
+        consumer = f"router-{ray.get_runtime_context().get_actor_id()}"
         for topic in topics:
-            try:
-                await self.bus.redis.xgroup_create(topic, group_name, mkstream=True)
-            except Exception:
-                pass
-
-        logger.info("trigger_engine_multi_topic_loop_activated", project_id=project_id, active_topics=topics)
+            await self.bus.ensure_group(topic, group)
+        logger.info("trigger_engine_started", project_id=project_id, topics=topics)
+        block_ms = int(self.tuning["agent_inbox_loop"]["stream_block_milliseconds"])
+        batch_size = int(self.tuning["agent_inbox_loop"]["batch_size"])
+        claim_idle_ms = int(self.tuning["agent_inbox_loop"]["processing_lease_seconds"]) * 1000
 
         while self.is_running:
             try:
-                streams_to_read = {topic: ">" for topic in topics}
-                
+                reclaimed: list[tuple[str, list[tuple[str, dict[str, str]]]]] = []
+                for topic in topics:
+                    stream_key = self.bus.stream_key(topic)
+                    claimed = await self.bus.redis.xautoclaim(
+                        stream_key,
+                        group,
+                        consumer,
+                        claim_idle_ms,
+                        "0-0",
+                        count=batch_size,
+                    )
+                    if claimed and len(claimed) > 1 and claimed[1]:
+                        reclaimed.append((stream_key, claimed[1]))
+                if reclaimed:
+                    await self._process_stream_messages(group, reclaimed)
+
+                streams = {self.bus.stream_key(topic): ">" for topic in topics}
                 response = await self.bus.redis.xreadgroup(
-                    groupname=group_name,
-                    consumername=consumer_name,
-                    streams=streams_to_read,
-                    count=5,
-                    block=1000
+                    groupname=group,
+                    consumername=consumer,
+                    streams=streams,
+                    count=batch_size,
+                    block=block_ms,
                 )
-
-                if not response:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                for stream_key, items in response:
-                    for message_id, fields in items:
-                        raw_event = fields.get("event")
-                        if not raw_event:
-                            continue
-
-                        event_dict = json.loads(raw_event)
-                        event = Event(**event_dict)
-                        
-                        await self._route_event(event)
-                        
-                        await self.bus.redis.xack(stream_key, group_name, message_id)
-
+                await self._process_stream_messages(group, response or [])
+                await asyncio.sleep(0)
             except asyncio.CancelledError:
                 self.is_running = False
-                break
-            except Exception as e:
-                logger.error("trigger_engine_loop_error", error=str(e))
-                await asyncio.sleep(1.0)
+                raise
+            except Exception as error:
+                logger.error("trigger_engine_loop_error", error_type=type(error).__name__)
+                await asyncio.sleep(float(self.tuning["agent_inbox_loop"]["error_backoff_seconds"]))
+
+    async def _process_stream_messages(
+        self,
+        group: str,
+        response: list[tuple[str, list[tuple[str, dict[str, str]]]]],
+    ) -> None:
+        for stream_key, items in response:
+            for message_id, fields in items:
+                raw = fields.get("event")
+                if not raw:
+                    await self.bus.redis.xack(stream_key, group, message_id)
+                    continue
+                try:
+                    event = Event.model_validate(json.loads(raw))
+                    await self._route_event(event)
+                    await self.bus.redis.xack(stream_key, group, message_id)
+                except Exception as error:
+                    logger.error(
+                        "event_routing_failed",
+                        message_id=message_id,
+                        error_type=type(error).__name__,
+                    )
 
     async def _route_event(self, event: Event) -> None:
+        valid, reason = validate_event(event)
+        if not valid:
+            raise ValueError(reason)
+        event_type = event.event_type.value
+        producer = event.producer_agent_id
+        if producer not in self.SYSTEM_PRODUCERS and producer not in self.registered_agents:
+            raise PermissionError("unregistered event producer")
+        explicit = self.allowed_producers.get(event_type)
+        if producer not in self.SYSTEM_PRODUCERS and explicit and producer not in explicit:
+            raise PermissionError(f"producer cannot emit {event_type}")
 
-        event_type_str = event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type)
-        if event_type_str != "PROJECT_CREATED":
-            allowed = self._allowed_producers.get(event_type_str, [])
-            if event.producer_agent_id not in allowed:
-                logger.critical("unauthorized_communication_attempt_dropped", producer_agent_id=event.producer_agent_id, event_type=event_type_str)
-                return
-        if event_type_str == "SECURITY_ALERT" and "developer" in (event.producer_agent_id or "").lower():
-            logger.critical("privilege_escalation_interception", producer=event.producer_agent_id, event=event_type_str)
-            event.target_agent_id = "security_reviewer-1"
-
-        subscribers = set(self.subscriptions.get(event_type_str, set()))
-        
-        affected_artifact = event.payload.get("artifact_uri") or event.payload.get("file_path")
-        if affected_artifact:
-            logger.info("evaluating_downstream_artifact_consumers", path=affected_artifact)
-          
+        subscribers = set(self.subscriptions.get(event_type, set()))
         if event.target_agent_id:
-            subscribers = subscribers.intersection({event.target_agent_id})
-        elif event_type_str == "TASK_COMPLETED":
-            review_subs = set(self.subscriptions.get("REVIEW_REQUEST", set()))
-            if review_subs:
-                subscribers = subscribers.union(review_subs)
-                logger.info("agent_handoff_opportunity_detected", routing_to=list(review_subs))
-                
-        if not subscribers and event.payload:
-            try:
-                provider_gateway = ray.get_actor("provider_gateway", namespace="agentos")
-                event_text = event.payload.get("message") or json.dumps(event.payload)
-                event_vector = await provider_gateway.get_embedding.remote(event_text, str(event.project_id))
-                
-                # Fetch database connection from settings to locate matching agent/task
-                from agentos.config.settings import load_settings
-                from agentos.storage.database import DatabaseManager
-                from uuid import UUID
+            if event.target_agent_id not in self.registered_agents:
+                raise PermissionError("target agent is not registered")
+            subscribers = {event.target_agent_id}
+        if producer:
+            subscribers.discard(producer)
+        if not subscribers and self.fallback_coordinator and producer != self.fallback_coordinator:
+            subscribers.add(self.fallback_coordinator)
 
-                db = DatabaseManager(load_settings())
-                await db.connect()
-                
-                query = """
-                    SELECT owner_agent_id 
-                    FROM tasks 
-                    WHERE project_id = $1 AND embedding IS NOT NULL AND owner_agent_id IS NOT NULL
-                    ORDER BY (embedding <=> $2::vector) ASC 
-                    LIMIT 1;
-                """
-                async with db.pool.acquire() as conn:
-                    matched_agent = await conn.fetchval(query, UUID(str(event.project_id)), event_vector)
-                    if matched_agent:
-                        subscribers.add(matched_agent)
-                        logger.info("semantic_trigger_routing_success", event_type=event_type_str, routed_agent=matched_agent)
-                await db.disconnect()
-            except Exception as e:
-                logger.warning("semantic_trigger_routing_failed", error=str(e))
-
-        interrupt_level = "NORMAL"
-        if event_type_str in {"SECURITY_ALERT", "BLOCKER_CREATED", "BLOCKER"}:
-            interrupt_level = "CRITICAL_INTERRUPT"
-            logger.warning("high_priority_interrupt_detected", event_type=event_type_str)
-
-        for agent_id in subscribers:
-            inbox_key = f"agent:{agent_id}:inbox"
-            busy_lock_key = f"agent:{agent_id}:processing_lease"
-
-            is_busy = await self.bus.redis.exists(busy_lock_key)
-            
-            await self.bus.redis.rpush(inbox_key, event.model_dump_json())
-
-            if is_busy and interrupt_level == "NORMAL":
-                logger.info("skipping_unnecessary_wakeup_agent_busy", agent_id=agent_id)
+        for agent_id in sorted(subscribers):
+            status = await self.receipts.event_receipt_status(
+                event.project_id, str(event.event_id), agent_id
+            )
+            if status is not None:
                 continue
+            stream_id = await self.bus.send_to_inbox(event.project_id, agent_id, event)
+            await self.receipts.record_event_delivery(
+                event.project_id, str(event.event_id), agent_id, stream_id
+            )
+        logger.info(
+            "event_dispatched",
+            event_id=str(event.event_id),
+            event_type=event_type,
+            recipients=sorted(subscribers),
+        )
 
-            wakeup_payload = {
-                "signal": "NEW_EVENT",
-                "interrupt_level": interrupt_level,
-                "trigger_catchup": "TRUE" if not is_busy else "FALSE"
-            }
-            await self.bus.redis.publish(f"agent:{agent_id}:wakeup", json.dumps(wakeup_payload))
-            logger.info("📡 event_dispatched_to_inbox", agent_id=agent_id, event_type=event_type_str)
-
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self.is_running = False
+
+    def status(self) -> dict[str, bool]:
+        return {"running": self.is_running}

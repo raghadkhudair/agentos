@@ -1,0 +1,2 @@
+# Test and quality dependencies are declared by the package metadata.
+.[test]

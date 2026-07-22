@@ -1,1102 +1,412 @@
-# AgentOS Local Architecture Plan
+# AgentOS Local Architecture and Implementation Plan
 
-## 1. Executive architecture summary
+Status: implemented architecture, reviewed against the live repository and fresh Compose storage stack on 2026-07-23.
 
-AgentOS Local is a local-first, Python-based autonomous software delivery platform. It runs a dynamic team of IT and development agents that collaborate in parallel through guarded event-driven communication, scoped memory, controlled execution, continuous checkpointing, and continuous DoD evaluation.
+This document is the technical contract for the current code. The original scaffold assumptions (notably pgvector and partially wired actors) have been superseded by the polyglot storage, independent-agent, provider-routing, and resource-governance implementation below.
 
-The platform is designed to run for as long as required until the project Definition of Done is fully satisfied with evidence. It is not time-bound. It is DoD-bound.
+## 1. Architectural objective
 
-The platform is not a general-purpose assistant. It is dedicated to software delivery and IT engineering activities.
+AgentOS accepts a software-delivery request and operates a bounded engineering organization until a strict, evidence-backed DoD is satisfied. Autonomy belongs to workers' reasoning and task choice; authority remains in deterministic supervisors, storage constraints, identities, policy, reviews, and evidence gates.
 
-## 2. Core operating principle
+Core invariants:
 
-```text
-Agents decide what they want to do.
-The runtime decides what they are allowed to do.
-The project ends only when DoD is verified.
-```
+1. PostgreSQL is the durable authority.
+2. Workers are independent actors, not threads sharing an orchestration object.
+3. All cross-agent facts use durable memory/events; all hot coordination is recoverable.
+4. Workers never call providers or host execution directly.
+5. Resource allocations cannot exceed a generated host envelope.
+6. Agent claims cannot complete a project; only current evidence can.
+7. Production configuration and required dependencies fail closed.
 
-The system should not stop because:
-
-- the current task list is empty
-- one agent has no next step
-- tests failed
-- agents disagree
-- integration failed
-- current implementation is incomplete
-
-If DoD is incomplete and no active work exists, the platform must trigger DoD gap analysis, replan, create new tasks, and continue.
-
-## 3. Final platform definition
-
-AgentOS Local is a local-first autonomous software delivery runtime that:
-
-- uses Python as the implementation language
-- uses a CLI as the control surface
-- uses Ray actors as the agent execution model
-- uses PostgreSQL as the durable source of truth
-- uses pgvector inside PostgreSQL for semantic memory recall
-- uses Dragonfly as a Redis-compatible hot coordination layer
-- uses Docker for local deployment and execution isolation
-- routes all AI provider calls through an internal provider gateway
-- uses strict guardrails for agent communication, memory, actions, files, commands, databases, network, provider I/O, approvals, and audit
-- dynamically creates an agent team through the first bootstrap PM/Tech Lead agent
-- runs continuously until the project DoD is fully satisfied
-
-## 4. Non-goals
-
-The platform should not initially provide:
-
-- web UI
-- public REST API
-- generic personal assistant behavior
-- arbitrary internet-browsing agents
-- HR/legal/medical/finance decision agents
-- production deployment without approval gates
-- direct agent access to shell, filesystem, database, secrets, or provider keys
-- unrestricted agent-to-agent chat
-
-## 5. Domain scope
-
-Allowed activities:
-
-- software architecture
-- backend development
-- frontend development
-- database design
-- API design
-- DevOps and platform engineering
-- CI/CD design
-- Docker/local deployment
-- testing and QA
-- security review
-- documentation
-- dependency management
-- debugging
-- performance review
-- release preparation
-
-Denied or out-of-scope activities:
-
-- general personal task automation
-- social media automation
-- unrelated browsing
-- legal/medical/financial judgment
-- HR decisions
-- destructive host operations
-- uncontrolled production changes
-
-## 6. High-level architecture
+## 2. System topology
 
 ```text
-CLI
- ↓
-Runtime Supervisor Actor
- ↓
-Bootstrap PM/Tech Lead Agent
- ↓
-Validated Dynamic Team Plan
- ↓
-Ray Agent Worker Actors
- ↓
-Agent Governance Layer
- ↓
-Guarded Communication Bus
- ↓
-Scoped Memory Broker
- ↓
-Guarded Action Requests
- ↓
-Execution Supervisor
- ↓
-Docker Sandbox / Git Workspace / Test Database
- ↓
-Review / Tests / Security / DoD Evaluation
- ↓
-Checkpoints + Summaries + Audit Logs
- ↓
-Continue until DoD is satisfied
+Operator / CLI
+    |
+    v
+RuntimeSupervisorActor (detached, named)
+    |-- BootstrapAgentActor
+    |-- InfrastructureAgentActor
+    |-- ProviderGatewayActor
+    |-- MemoryBrokerActor
+    |-- ExecutionSupervisorActor
+    |-- ReviewerAgentActor
+    |-- SafetyReviewerAgentActor
+    |-- CheckpointManagerActor / SummaryManagerActor
+    |-- TriggerEngineActor / OutboxDispatcherActor
+    |-- DoDEvaluatorActor
+    `-- independent AgentWorkerActor instances
+
+Durable plane: PostgreSQL ---- MinIO ---- Milvus ---- MongoDB
+Hot plane: DragonflyDB
+Execution plane: Git worktrees + Docker socket proxy + sandbox PostgreSQL
 ```
-1.settings.py (The Blueprint Configurator): Wakes up first to read the .env file, load your database strings, credentials, and configuration choices.
 
-2.models.py (The zero-trust Rules Registry): Initializes your structural data objects and schemas so the system knows what valid requests look like.
+System-service actors are per project, named with the project suffix, and detached so CLI driver exit does not define their lifecycle. Worker names are deterministic and persisted. The supervisor owns handles and lifecycle policy, while the actor's durable state is recoverable from storage.
 
-3.supervisor.py (The Main Conductor): Instantiates your database connections, spins up your standalone Ray cluster, and bootstraps the project lifecycle records in PostgreSQL.
+## 3. Project lifecycle
 
-4.dragonfly_bus.py & trigger_engine.py (The Communication Array): Turn on simultaneously in the background to handle asynchronous message queuing and routing streams.
+### 3.1 Bootstrap
 
-5.base.py & broker.py (The Agent Team Lifecycle): Woken up by the trigger engine to catch up on recent memories and begin running LLM decision steps.
+1. Validate production secrets when `AGENTOS_ENV=production`.
+2. Connect PostgreSQL and apply the idempotent v3 schema under an advisory lock.
+3. Health-check PostgreSQL, Dragonfly, MongoDB, MinIO, and Milvus.
+4. Create a project in `PLANNING` state.
+5. Start per-project service actors and reliable outbox routing.
+6. Ask the bootstrap PM for a structured plan through the provider gateway.
+7. Validate DoD IDs/evidence, role caps, mandatory roles, task ownership, dependencies, and bounded paths.
+8. Persist project plan, DoD checks, backlog, dependencies, service registrations, and planned agents.
+9. Ask the infrastructure agent for a resource/model allocation and persist both resource plan and generated runtime snapshot.
+10. If no provider is configured, leave the plan durable and set `BLOCKED_REQUIRES_INPUT`; never synthesize credentials or fabricated work.
+11. Otherwise create independent workers, set `RUNNING`, and start health/watchdog loops.
 
-6.runtime_watchdogs.py & evaluator.py (The Security Patrol & Quality Inspectors): Turn on last, looping every 30 seconds to audit the database logs, check task graphs, and verify completed goals.
+### 3.2 Work cycle
 
-Act I: The Awakening and The Blueprinting
-settings.py parses the system configurations and confirms your daily token budget limits.
+Each worker:
 
-supervisor.py boots the system. It fires up your local compute memory partitions, connects to the PostgreSQL database registry, and initializes an external AI architect agent to analyze your request.
+1. Loads its own MongoDB state and memory/event cursors.
+2. Emits heartbeats and collaboration summaries at the configured interval.
+3. Consumes its own Dragonfly consumer-group inbox, claims a durable receipt lease, and acknowledges only after durable processing state is recorded.
+4. Builds a catch-up packet through the memory broker.
+5. Claims one dependency-ready `PENDING` task matching its role under a PostgreSQL row lock and expiring lease.
+6. Selects task complexity and asks the provider gateway for one structured next action.
+7. Seals the `ActionRequest` and submits it to execution.
+8. For writes, records the versioned artifact, obtains independent review for that artifact, checks aggregate expected outputs, runs criterion commands in the sandbox, records evidence, and requests merge.
+9. Creates a checkpoint, updates mid-term/long-term memory, and broadcasts durable progress.
+10. Returns to idle; no worker is a perpetual busy loop when no work is available.
 
-The AI architect designs a master team roster and a list of structural goals (the Definition of Done) containing things like: ["posts_db.py", "comments_api.py", "verify inputs"].
+### 3.3 Completion and replanning
 
-supervisor.py reads this plan, makes sure it doesn't break team resource caps via validation structures in team_plan.py, registers the project inside your database tables using repositories.py, and launches your permanent agent workers (like pm_tech_lead-1 and backend_developer-1) into memory.
+The DoD evaluator groups the latest evidence by criterion, evidence type, and task. It checks required evidence, exit codes, independent reviews, MinIO object presence/version/checksum, and required artifact names. All mandatory criteria must pass.
 
-Act II: The First Event and The Briefcase
-To kick off the project, supervisor.py creates a master PROJECT_CREATED event data payload defined by events.py, logs it to PostgreSQL, and broadcasts it over the real-time cache channels via dragonfly_bus.py.
+If the queue is empty but gaps remain, the DoD watchdog emits `REPLANNING_TRIGGERED` to the PM. New tasks must map only to existing DoD gaps and must name a present owner role. `DOD_SATISFIED` is written only after the evaluator reports satisfaction.
 
-The background trigger_engine.py intercepts that streaming message. It checks its subscription tables, notices that pm_tech_lead-1 is listening for project creation events, pushes the payload into its private inbox queue, and fires a wakeup signal.
+## 4. Agent independence and collaboration
 
-pm_tech_lead-1 wakes up inside base.py! It instantly calls broker.py to build its context briefcase.
+### 4.1 Independence boundaries
 
-broker.py scans the database for past project histories using pgvector math. It finds nothing because the project is new, gathers the open project requirements, and hands the agent a pristine context brief.
+Every `AgentWorkerActor` receives immutable identity/configuration plus names of service actors. It constructs its own:
 
-The PM agent calls Gemini through the gateway.py provider wrapper. The gateway verifies the project hasn't exceeded its budget cap and scrubs the incoming inputs for malicious prompt injections. The LLM returns a structured JSON payload mapping out the very first database developer assignment:
+- `PostgresClient` and repositories;
+- `DragonflyEventBus` and inbox consumer;
+- `MongoDocumentClient` runtime state access;
+- task capacity lease and heartbeat loop;
+- local cursor, status, current task, and collaboration timer.
 
-Task ID 101: "Create posts_db.py schema with validation rules"
+Workers do not share Python repositories, database pools, message consumers, task state, or provider clients. They cannot mutate another worker's state. The only intentional shared services are governed actors whose APIs enforce memory/provider/execution policy.
 
-Act III: The Developer Sandbox and the Security Interception
-The trigger engine routes this newly created task down into the inbox list for backend_developer-1.
+### 4.2 Communication model
 
-The developer wakes up in base.py, loads its memory briefcase from broker.py, and generates a code patch containing the Python database source files.
+Producers insert the canonical event and outbox row in PostgreSQL. The dispatcher reserves only the project's due rows, publishes to Dragonfly Streams, and marks delivery. The trigger engine reads the project stream, applies subscriptions, and writes to a bounded per-agent inbox. Consumer groups, acknowledgement, leases, and retry delays prevent one worker from consuming another worker's message.
 
-The developer doesn't write this code straight to your machine; it packages the request into an ActionRequest wrapped in an unalterable SHA-256 fingerprint from models.py and sends it to the supervisor.
+Frequent communication is driven by:
 
-execution/supervisor.py catches the package and pushes it through the zero-trust filters inside policy_engine.py. The policy engine reads the code text line-by-line. If it registers any banned keywords (like an agent trying to run rm -rf or clear out audit trails), it immediately halts execution and locks the agent into a permanent blacklist quarantine zone.
+- event-triggered task/review/test/blocker messages;
+- periodic heartbeat and agent-health events;
+- periodic collaboration summaries (default 30 seconds);
+- checkpoint and memory-promotion events after meaningful actions;
+- infrastructure/resource-pressure messages;
+- PM replanning messages.
 
-Since our developer is behaving nicely, the engine returns an outright ALLOW verdict. The supervisor opens an isolated Git sandbox folder branch matched to that specific task, writes the new posts_db.py file inside it, and registers a permanent asset tracker inside the artifacts table using repositories.py.
+The event log remains queryable after Dragonfly loss because the durable event and outbox records are authoritative.
 
-Act IV: The Quality Checkers and The Report Card
-Every 30 seconds, runtime_watchdogs.py walks the virtual factory floor in the background.
+### 4.3 Memory scopes
 
-DeadlockWatchdog checks the task_dependencies database table using a recursive cycle-search pattern to ensure developer tasks aren't blocking each other in an infinite circle.
+Supported scopes include shared project, squad, contract, decision, execution, infrastructure, security, and private-agent memory. Reads are filtered by project and requested allowed scopes. Private memory additionally requires matching `agent_id`.
 
-Simultaneously, DoDWatchdog queries the database task counts. It fires up evaluator.py to check if the team is meeting the client's goals.
+## 5. Resource architecture
 
-evaluator.py queries your physical artifacts table and reads the structured acceptance_criteria JSON details attached to your completed database rows. It notes that posts_db.py physically exists and its validation criteria match the first item on your high-level project goals list.
+### 5.1 Resource envelope
 
-It checks off that specific box as "SATISFIED" inside the DoDItemStatus Pydantic record and compiles the master DoDEvaluation report card.
+`ResourcePlanner.build_envelope()` detects logical CPUs and physical memory and intersects:
 
-Act V: Project Graduation
-The event loop repeats across the team. Developers continue writing code, reviewers audit the patches, and the database clerks log the progress. Finally, evaluator.py finds that the gaps list is completely empty and every single required milestone has passed multi-layered validation.
+- configured usage fraction;
+- explicitly reserved CPU cores and bytes;
+- configured maximum CPU/memory;
+- at least one unallocated CPU on multi-core hosts;
+- Ray object-store memory;
+- per-worker CPU/memory demand;
+- maximum active-agent count.
 
-The background watchdogs report an absolute COMPLIANT status, the main supervisor saves the completion state to the database vault, cleans up the container memory pools, and prints a success notification to your console terminal! The simple blog platform is complete.
+The Pydantic model rejects an envelope that consumes every multi-core CPU or whose allocated plus reserved memory exceeds detected memory.
 
-## 7. Application stack
+### 5.2 Infrastructure agent
 
-| Concern | Selected technology | Reason |
-|---|---|---|
-| Main language | Python 3.11+ | Strong ecosystem for agents, Ray, automation, DevOps tooling |
-| CLI | Typer + Rich | Simple local control surface with good UX |
-| Actor runtime | Ray | Stateful Python actor model, parallelism, independent workers |
-| Durable database | PostgreSQL | Strong relational source of truth |
-| Vector retrieval | pgvector | Semantic search inside PostgreSQL without separate vector service |
-| Hot coordination | Dragonfly | Redis-compatible streams, locks, leases, counters, pub/sub |
-| AI provider abstraction | Provider Gateway, planned LiteLLM adapter | External provider isolation and provider portability |
-| Execution isolation | Docker | Local sandboxing and app deployment base |
-| Configuration | Pydantic Settings | Typed configuration from environment |
-| Logging | structlog, planned | Structured auditability |
-| Testing | pytest | Standard Python testing |
-| Quality | ruff, mypy, black | Linting, type checks, formatting |
+The infrastructure actor combines the envelope with the validated agent roster and provider registry. It emits a `RuntimeConfig` containing:
 
-## 8. Runtime actor architecture
+- generation time/environment;
+- detected, allocated, and reserved CPU/memory;
+- object-store memory and active-agent limit;
+- per-agent role, CPU, memory, concurrency, provider, model, and complexity;
+- thread environment variables.
 
-### 8.1 RuntimeSupervisorActor
+The supervisor persists the resource plan and safe runtime snapshot before worker launch. The infrastructure agent is registered in the agent inventory as a first-class system role alongside the supervisor.
 
-Responsibilities:
+### 5.3 Enforcement layers
 
-- start project lifecycle
-- start bootstrap agent
-- validate team plan against configured limits
-- create Ray agent actors
-- supervise actor health
-- restart failed actors
-- coordinate shutdown and resume
-- enforce max agent limits
+- Ray `num_cpus` limits actor admission.
+- Active-agent and parallel-code semaphores use Dragonfly counters/leases.
+- Provider calls use a process semaphore.
+- OpenMP, OpenBLAS, MKL, NumExpr, and VecLib thread variables are bounded.
+- Compose sets application CPU, memory, and shared-memory ceilings.
+- Sandbox containers set nano-CPU, memory, PID, tmpfs, capability, network, and filesystem limits.
 
-### 8.2 Bootstrap PM/Tech Lead Agent
+Ray CPU resources are scheduling quantities, so the container/thread layers are required to provide real host protection.
 
-First agent to run.
+## 6. Storage architecture
 
-Responsibilities:
+### 6.1 PostgreSQL: control-plane truth
 
-- understand project request
-- define assumptions
-- define initial DoD
-- propose agent team composition
-- propose memory scopes
-- propose ownership boundaries
-- propose initial task categories
-- propose high-level architecture direction
-- propose event subscriptions
+Schema version 3 contains:
 
-The bootstrap agent proposes. The runtime validates.
+- `schema_migrations`
+- `projects`, `agents`, `tasks`, `task_dependencies`
+- `events`, `event_outbox`, `event_receipts`
+- `artifacts`
+- `checkpoints`, `summaries`
+- `memory_items`
+- `provider_call_intents`, `provider_calls`
+- `audit_events`, `approval_requests`
+- `dod_checks`, `dod_evidence`
+- `resource_plans`, `runtime_config_snapshots`
 
-### 8.3 AgentWorkerActors
+Important mechanics:
 
-Long-running Ray actors representing specialized agents.
+- foreign keys plus table-specific project-isolation triggers prevent orphan/cross-project references;
+- row locks and `SKIP LOCKED` make task/outbox claims concurrent-safe;
+- task leases are renewable and reclaimable;
+- append-only triggers protect provider/audit rows;
+- audit events carry previous/current hashes;
+- updated-at triggers are database-side;
+- indexes follow project/status/time/task access paths;
+- schema initialization holds an advisory lock;
+- legacy schemas are detected and rejected rather than destructively altered.
 
-Each agent has:
+`PostgresClient` owns pool bounds, command/statement timeouts, UTC sessions, transactions, and schema installation.
 
-- agent identity
-- role
-- squad
-- project ID
-- permissions
-- memory scopes
-- allowed actions
-- ownership domains
-- active task state
-- event subscription profile
-- checkpoint pointer
+### 6.2 DragonflyDB: hot coordination
 
-Agents do not directly execute actions. They generate action requests.
+Dragonfly stores streams, inboxes, locks, budget counters, capacity counters, circuit state, quarantine sets, and ephemeral agent coordination. Keys are namespaced. Lock release uses compare-and-delete Lua. Budget reservation is atomic Lua across daily/monthly counters.
 
-### 8.4 TriggerEngineActor
+No project completion fact exists only in Dragonfly.
 
-Responsibilities:
+### 6.3 MongoDB: mid-term memory
 
-- route events to impacted agents
-- determine interrupt level
-- avoid unnecessary wakeups
-- identify downstream consumers of contracts/artifacts
-- trigger catch-up packets
-- detect agent handoff opportunities
+`MongoDocumentClient` uses PyMongo's `AsyncMongoClient`. It creates:
 
-### 8.5 MemoryBrokerActor
+- TTL index on `expires_at`;
+- project/scope/time and project/agent/time indexes;
+- unique project/agent runtime-state index.
 
-Responsibilities:
+Mid-term memories expire by policy (default seven days). Recent retrieval filters project, allowed scopes, and private ownership.
 
-- enforce memory access control
-- retrieve relevant memory
-- use PostgreSQL filters and pgvector search
-- summarize catch-up packets
-- prevent prompt pollution
-- prevent restricted data exposure
+### 6.4 MinIO: object bodies
 
-### 8.6 ProviderGatewayActor
+Buckets for artifacts and memory are created idempotently and versioning is enabled. Object names are normalized and traversal-safe. Writes return bucket/name, ETag, version ID, length, and SHA-256. Large memory bodies are moved to MinIO while PostgreSQL stores the durable reference and checksum.
 
-Responsibilities:
+### 6.5 Milvus: semantic references
 
-- isolate external AI provider access
-- hold provider configuration
-- perform prompt redaction
-- enforce budgets
-- route models
-- handle fallback models
-- log provider calls
-- validate provider output
+Milvus collection fields are `id`, vector, project, agent, scope, kind, content reference, importance, and timestamp. The collection uses an AUTOINDEX/COSINE vector index and strong consistency for read-after-write recall. Every search expression includes project and allowed scopes, with an additional agent predicate for private memory.
 
-### 8.7 ExecutionSupervisorActor
+Milvus stores no completion authority. If embedding creation/search fails, lexical/relational memory still works and the failure is logged. Embedding dimension is validated on every upsert/search.
 
-Responsibilities:
+## 7. Provider architecture
 
-- execute file changes through controlled paths
-- execute shell commands through command policies
-- manage Git branches/worktrees
-- manage Docker sandbox execution
-- run tests/lint/builds
-- block destructive operations
-- return structured execution results
+### 7.1 Registry
 
-### 8.8 CheckpointManagerActor
+`providers.yaml` defines nine profiles, credential/base URL environment variables, allowed hosts, local/remote behavior, capabilities, and four complexity models. Routing defines default order, role preferences, purpose complexity, and circuit-breaker policy.
 
-Responsibilities:
+Current profiles: OpenAI, Anthropic, Gemini, DeepSeek, Moonshot, Alibaba/DashScope, Z.AI, MiniMax, and Ollama. Model IDs are overridable through environment variables so model lifecycle changes do not require code changes.
 
-- create checkpoints after achievements
-- persist actor state pointers
-- link checkpoints to artifacts
-- support recovery and resume
+### 7.2 Selection
 
-### 8.9 SummaryManagerActor
+`ProviderRegistry.candidates()` computes:
 
-Responsibilities:
+1. explicit request preference;
+2. role preference;
+3. global fallback order;
+4. configured credential/local base availability;
+5. required capability subset;
+6. complexity-tier model.
 
-- generate local agent summaries
-- generate squad summaries
-- generate project summaries
-- compress long event history into usable context
-- feed validated memory into long-term storage
+Duplicates are removed while preserving order. A model prefix mismatch is a configuration error.
 
-### 8.10 DoDEvaluatorActor
+### 7.3 Gateway controls
 
-Responsibilities:
+The gateway:
 
-- evaluate current project state against DoD
-- verify evidence for each DoD item
-- detect gaps
-- trigger gap-closure work
-- prevent false completion
+- accepts typed chat requests only;
+- redacts common API keys, bearer tokens, passwords, and private keys;
+- validates optional custom base URLs against the profile allowlist and requires HTTPS remotely in production;
+- reserves daily/monthly budget before the call and settles actual cost;
+- limits global concurrency and per-request attempts;
+- skips open circuits and applies bounded exponential jitter;
+- validates nonempty responses and JSON-object output when requested;
+- logs provider/model, prompt/response hashes, redaction count, usage, latency, status, and error type;
+- returns content only after the audit write succeeds.
 
-## 9. Agent lifecycle
+Embedding calls use the same redaction, budget, timeout, dimension validation, and audit boundary.
+
+## 8. Governance and execution
+
+### 8.1 Identity and integrity
+
+`ActionRequest` includes project, agent, task, action type, description, paths, command/database operation, payload, timestamp, nonce, and an integrity hash computed from canonical content. `PolicyEngine` rejects hash tampering, unknown identities, identity/project mismatch, disallowed role action, path traversal, and paths outside task/identity boundaries.
+
+### 8.2 Decisions
+
+Policy decisions are:
+
+- allow;
+- allow with constraints;
+- sandbox only;
+- require review/security review/backup/human approval;
+- deny;
+- quarantine.
+
+Destructive patterns are denied by default. Repeated violations increase a TTL-bound counter and quarantine the agent after the configured threshold. Approval records are project-, hash-, gate-, expiry-, and human-identity-bound.
+
+### 8.3 Git and object flow
+
+When `AGENTOS_SOURCE_REPOSITORY` is set, the execution service first validates and locally clones that Git worktree into the isolated managed repository; otherwise it initializes an empty managed repository. Each task uses branch `agentos/task-{task_id}` in a dedicated worktree. Writes are atomic (`fsync` plus replace), committed with a controlled Git identity, uploaded to versioned MinIO, and recorded as artifacts with checksums and commit metadata.
+
+Task ownership has allowed and blocked path lists. Every produced artifact is reviewed before a partial-output decision, and expected-output globs must all match recorded artifacts before verification/merge. A task without mapped DoD criteria or a verification command cannot merge.
+
+### 8.4 Sandbox
+
+Commands must be token arrays and start with an allowlisted executable. They run through a restricted Docker socket proxy in an allowlisted image with:
+
+- `network_disabled=true`;
+- read-only root filesystem;
+- `/tmp` as size-limited `noexec,nosuid` tmpfs;
+- all capabilities dropped and no-new-privileges;
+- bounded CPU, memory, PIDs, threads, duration, and captured output;
+- only the assigned worktree volume mounted.
+
+Database operations use `SANDBOX_DATABASE_URL`, which production validation requires to differ from the control database. Only one allowlisted parameterized statement class is accepted per action.
+
+### 8.5 Review and merge
+
+The code reviewer uses a separate provider request and identity from the author. Security-sensitive behavior uses the safety reviewer. Reviews become evidence. Verification commands run in the sandbox and become latest-attempt evidence. Merge requires current passing `review` and `test` evidence, then executes a non-fast-forward merge under a Dragonfly merge lock.
+
+Review/test failure returns the task to `PENDING` for repair. Merge conflict moves it to visible `BLOCKED`; it is never silently resolved.
+
+## 9. Messaging reliability
+
+Events are Pydantic-validated envelopes with UUID project ID, producer, optional target, version, UTC time, payload, correlation/causation, priority, and replay flag. Event-type-specific payload validators reject malformed critical events.
+
+PostgreSQL insertion and outbox creation form the durable publication boundary. Dispatcher rows have attempt count, next attempt, reservation time, last error, and delivered time. Reservations expire, so a crashed dispatcher does not permanently own work. Dragonfly stream trimming is bounded by configuration.
+
+Each worker has its own consumer group. PostgreSQL `event_receipts` atomically claim an event/agent pair with an expiring lease; already processed events are idempotent no-ops, and failed handlers remain reclaimable through `XAUTOCLAIM`. Dragonfly acknowledgement happens only after the receipt is durably `PROCESSED`. Error paths record retry state, log type, and apply bounded backoff rather than swallowing failures.
+
+## 10. Checkpoints, summaries, and memory promotion
+
+A checkpoint records project, agent, task, achievement, summary, artifacts, and state metadata. Summaries are versioned by scope and subject. Checkpoints demonstrate progress but are not DoD evidence by themselves.
+
+Long-term memory writes first persist the complete scrubbed body and hash in PostgreSQL. Large bodies begin as `PENDING_OBJECT`, upload to a versioned MinIO object, verify size/SHA-256, then atomically retain a preview plus URI/version and become `READY`; failure is visibly `OBJECT_FAILED`. MongoDB receives the full TTL-bound working copy only after durable object completion. Important memories request an embedding and Milvus upsert, whose failure cannot erase durable memory. Reads hydrate MinIO by exact version and revalidate length/hash before use. Catch-up packets combine recent durable events, MongoDB scope-filtered memory, PostgreSQL long-term records, and semantic references within a configured prompt-character budget.
+
+## 11. Health, watchdogs, and recovery
+
+- Dependency health verifies all five required stores and reports configured provider availability.
+- Heartbeat loop renews agent/task leases and records health.
+- Expired task leases return to `PENDING`.
+- DoD watchdog triggers replanning or completion evaluation.
+- Stagnation watchdog detects repeated checkpoints and stale work.
+- Deadlock watchdog detects cycles in task dependencies.
+- Safety watchdog correlates denied/quarantine audit outcomes.
+- Actor health loop identifies missed heartbeats and restarts/reassigns within configured limits.
+- Errors are structured-log events; repeated service failure changes project state rather than claiming progress.
+
+Pause stops claims while retaining durable state. Resume health-checks stores/providers, reclaims expired leases, restarts missing services/workers, and continues from cursors/checkpoints.
+
+## 12. Configuration model
+
+Configuration has three layers:
+
+1. typed environment settings in `settings.py` for deployments/secrets/ceilings;
+2. versioned YAML for providers, roles, governance, execution, memory, and loop tuning;
+3. generated, persisted runtime configuration for actual detected capacity and per-agent allocation.
+
+YAML expansion supports `${NAME}` and `${NAME:-default}` without evaluating arbitrary shell syntax. The safe loader accepts only bounded `.yml`/`.yaml` files, contains normal reads to the package config directory unless an explicit provider-registry path is configured, and caches parsed results. `safe_snapshot()` redacts secret fields before persistence.
+
+Production validation covers placeholder credentials, authentication, TLS for external stores, separate sandbox database, resource ranges, pool bounds, budget/concurrency bounds, and path/config consistency.
+
+## 13. Deployment architecture
+
+Compose services:
+
+- PostgreSQL control database;
+- physically separate tmpfs sandbox PostgreSQL;
+- DragonflyDB with explicit two-thread limit;
+- authenticated MongoDB;
+- versioned MinIO;
+- etcd and standalone Milvus;
+- restricted Docker socket proxy;
+- AgentOS runtime connected to internal and egress networks.
+
+Persistent services have named volumes, health checks, no-new-privileges, CPU/memory ceilings, and non-default localhost bindings where exposed. The internal network is isolated. The AgentOS image runs as UID/GID 10001, has a minimal production target without development tools, and receives secrets through environment injection. `.dockerignore` excludes local secrets and build/runtime artifacts.
+
+This is a single-host production-oriented deployment. High availability, multi-node Milvus/MinIO/PostgreSQL, secret-manager integration, backups, and disaster-recovery automation are deployment responsibilities, not silently simulated by this repository.
+
+## 14. Direct delivery semantics
+
+There is no canary/staging completion mode. Worktree isolation is an engineering safety boundary, not a lower-quality deployment tier. The one integration path requires the same artifact/review/test/evidence gates for every task.
+
+External live deployment is not an execution driver. Adding one requires a new explicit action type, credential/target policy, independent approval, backup/rollback evidence, and provider-neutral audit behavior.
+
+## 15. Verification strategy
+
+Static gates:
 
 ```text
-STARTING
- ↓
-RESTORE_FROM_POSTGRES
- ↓
-SUBSCRIBE_TO_EVENTS
- ↓
-IDLE
- ↓
-TRIGGERED
- ↓
-CATCH_UP
- ↓
-DECIDE_NEXT_ACTION
- ↓
-REQUEST_LOCKS
- ↓
-SUBMIT_ACTION_REQUEST
- ↓
-EXECUTION_SUPERVISOR_RUNS_IF_ALLOWED
- ↓
-PUBLISH_OUTPUT
- ↓
-CHECKPOINT
- ↓
-SUMMARIZE_IF_NEEDED
- ↓
-TRIGGER_RELATED_AGENTS
- ↓
-IDLE
+ruff format --check agentos
+ruff check agentos
+mypy agentos
+python -m compileall -q agentos
 ```
 
-## 10. Event-driven execution model
-
-The system should not rely on a rigid static graph. Agents are independent actors triggered by events.
-
-Event flow:
-
-```text
-Event occurs
- ↓
-Event is persisted
- ↓
-Trigger Engine identifies impacted agents
- ↓
-Memory Broker builds catch-up packets
- ↓
-Agent decides next best action
- ↓
-Action Guardrails classify and approve/deny/escalate
- ↓
-Execution Supervisor performs allowed work
- ↓
-Artifacts/events/checkpoints/summaries are written
- ↓
-More agents are triggered
-```
-
-## 11. Communication architecture
-
-Agents communicate through typed messages and topics, not raw uncontrolled chat.
-
-Message categories:
-
-- TASK_PROPOSAL
-- TASK_UPDATE
-- CONTRACT_CHANGE
-- BLOCKER
-- REVIEW_REQUEST
-- REVIEW_RESULT
-- TEST_RESULT
-- SECURITY_ALERT
-- CHECKPOINT
-- SUMMARY
-- ACTION_REQUEST
-- APPROVAL_REQUEST
-
-Communication guardrails validate:
-
-- sender identity
-- receiver permission
-- topic
-- message type
-- payload schema
-- sensitivity
-- trigger permission
-- privilege escalation attempts
-- unsafe embedded instructions
-- conflict with accepted decisions
-
-## 12. Topics and routing
-
-Example topic categories:
-
-```text
-project.{project_id}.events
-project.{project_id}.tasks
-project.{project_id}.contracts
-project.{project_id}.reviews
-project.{project_id}.tests
-project.{project_id}.blockers
-project.{project_id}.checkpoints
-project.{project_id}.summaries
-squad.backend.events
-squad.frontend.events
-squad.platform.events
-squad.qa.events
-agent.{agent_id}.inbox
-```
-
-Dragonfly Streams should be used for catchable events. Pub/Sub should be used only for live wakeup notifications.
-
-## 13. Team formation
-
-The team is identified by the bootstrap PM/Tech Lead agent.
-
-The team plan includes:
-
-- roles
-- number of agents per role
-- responsibilities
-- memory scopes
-- allowed actions
-- ownership domains
-- subscriptions
-
-Runtime validation enforces:
-
-- max total agents
-- max active agents
-- max parallel code tasks
-- role-specific caps
-- required minimum safety roles
-
-Example team for a complex ecommerce project:
-
-- 1 PM/Tech Lead
-- 2 Solution Architects
-- 4 Backend Developers
-- 3 Frontend Developers
-- 2 Platform Engineers
-- 2 QA Engineers
-- 1 Security Reviewer
-- 1 Code Reviewer
-
-## 14. Parallelism and conflict prevention
-
-Agents must work in parallel without duplicating or conflicting.
-
-Rules:
-
-```text
-Parallelize by domain.
-Serialize by shared artifact.
-```
-
-Agents can work in parallel when:
-
-- tasks have no dependency conflict
-- ownership paths do not overlap
-- contracts are not exclusively locked
-- shared resources are not locked
-- agent capacity is available
-- policy allows the work
-
-Conflict prevention layers:
-
-1. ownership boundaries
-2. allowed paths
-3. resource locks
-4. branch-per-task
-5. contract ownership
-6. review gates
-7. merge queue
-8. CI/test validation
-
-## 15. Ownership model
-
-Each task has:
-
-- owner agent
-- allowed paths
-- blocked paths
-- dependencies
-- expected outputs
-- required reviewers
-- affected contracts
-- risk level
-
-Agents cannot modify outside their allowed paths without escalation.
-
-## 16. Guardrails and security architecture
-
-AgentOS Local uses a zero-trust agent runtime.
-
-No agent is trusted by default.
-No message is trusted by default.
-No tool call is trusted by default.
-No memory read is trusted by default.
-No provider output is trusted by default.
-
-### 16.1 Governance layer
-
-```text
-Agent Governance Layer
-├── Identity & Role Registry
-├── Communication Guardrails
-├── Memory Access Guardrails
-├── Action/Tool Guardrails
-├── Filesystem Guardrails
-├── Database Safety Guardrails
-├── Network Egress Guardrails
-├── Provider Input/Output Guardrails
-├── Approval Matrix
-├── Quarantine Manager
-├── Audit Log
-└── Safety Review Agents
-```
-
-### 16.2 Risk levels
-
-LOW:
-
-- read allowed files
-- search allowed memory
-- run unit tests
-- create summary
-
-MEDIUM:
-
-- edit owned files
-- create branch
-- update documentation
-- publish artifact
-
-HIGH:
-
-- add dependency
-- modify CI/CD
-- change authentication code
-- run database migration in sandbox
-- modify Docker files
-
-CRITICAL:
-
-- drop database
-- drop table
-- truncate persistent data
-- delete repository
-- delete checkpoints
-- delete audit logs
-- disable guardrails
-- expose secrets
-- modify provider keys
-- deploy to production
-
-### 16.3 Guardrail decisions
-
-- ALLOW
-- DENY
-- ALLOW_WITH_CONSTRAINTS
-- REQUIRE_REVIEW
-- REQUIRE_HUMAN_APPROVAL
-- REQUIRE_SANDBOX_ONLY
-- REQUIRE_BACKUP_FIRST
-- REQUIRE_SECURITY_REVIEW
-- QUARANTINE_AGENT
-
-### 16.4 Database safety
-
-Separate:
-
-- AgentOS control database
-- generated application sandbox/test database
-
-Agents must never directly write to the AgentOS control database.
-
-Allowed autonomously:
-
-- create migration file
-- run migration against disposable test database
-- create test data
-- reset disposable sandbox database
-
-Blocked or approval-required:
-
-- drop persistent database
-- drop table
-- truncate non-test table
-- delete migration history
-- remove backups
-- modify production-like database
-
-### 16.5 Filesystem safety
-
-Agents receive allowed paths. Sensitive paths are blocked.
-
-Blocked or approval-required:
-
-- `.env`
-- secrets directories
-- provider keys
-- audit logs
-- checkpoint files
-- CI security gates
-- Docker socket configuration
-- policy files
-
-### 16.6 Command safety
-
-Agents cannot run commands directly. They submit action requests.
-
-Safe:
-
-- run tests
-- run lint
-- inspect git diff
-- list files
-- read logs
-
-Controlled:
-
-- install dependency
-- docker build
-- docker compose up
-- run database migration in sandbox
-
-Blocked or approval-required:
-
-- rm -rf
-- sudo
-- curl | sh
-- wget | sh
-- chmod/chown sensitive paths
-- drop database
-- disable logs
-- access host secrets
-
-### 16.7 Provider safety
-
-All external AI calls go through ProviderGateway.
-
-ProviderGateway responsibilities:
-
-- redaction
-- budget checks
-- model routing
-- fallback
-- request/response audit
-- output validation
-- prompt-injection detection hooks
-- sensitive data filtering
-
-## 17. Memory architecture
-
-Memory is scoped. Agents share some memory, not all.
-
-### 17.1 Short-term memory
-
-Backed by Dragonfly.
-
-Used for:
-
-- hot event notifications
-- active task leases
-- locks
-- heartbeats
-- active context
-- provider counters
-- temporary coordination
-
-Dragonfly is not the source of truth.
-
-### 17.2 Long-term memory
-
-Backed by PostgreSQL.
-
-Used for:
-
-- events
-- tasks
-- decisions
-- artifacts
-- checkpoints
-- summaries
-- DoD checks
-- provider audit records
-- memory items
-- semantic embeddings
-
-### 17.3 Memory scopes
-
-- private_agent_memory
-- squad_memory
-- project_memory
-- contract_memory
-- decision_memory
-- security_memory
-- provider_audit_memory
-- execution_memory
-- global_patterns
-
-### 17.4 Vector index with pgvector
-
-The vector index is a semantic recall layer, not the brain and not the source of truth.
-
-Use pgvector for:
-
-1. agent catch-up
-2. relevant memory retrieval
-3. duplicate task detection
-4. similar failure lookup
-5. codebase semantic map
-6. contract impact analysis
-7. agent trigger routing
-8. long-term lessons learned
-9. DoD gap similarity
-10. context compression
-
-Do not embed:
-
-- secrets
-- API keys
-- credentials
-- raw full logs
-- raw provider prompts
-- raw chain-of-thought
-- full repository dumps
-- generated vendor files
-- node_modules
-- lock files unless summarized
-- binary files
-
-Store structured records first. Use embeddings for retrieval handles and summaries.
-
-### 17.5 Retrieval pipeline
-
-Memory retrieval should be hybrid:
-
-1. access-control filters
-2. project filters
-3. scope filters
-4. lexical search
-5. vector similarity
-6. recency scoring
-7. importance scoring
-8. reranking
-9. summary compression
-
-Agents should never query pgvector directly. All retrieval must pass through MemoryBroker.
-
-## 18. Checkpoint and summary architecture
-
-Checkpoint after meaningful achievements:
-
-- task claimed
-- task completed
-- code patch generated
-- tests passed
-- tests failed
-- review completed
-- contract published
-- architecture decision accepted
-- blocker opened
-- blocker resolved
-- merge completed
-- DoD gap closed
-
-Summary levels:
-
-1. agent local summary
-2. squad summary
-3. project executive summary
-
-Summaries are the primary context for future prompts. Raw logs are evidence, not primary prompt context.
-
-## 19. DoD model
-
-The project is DoD-bound.
-
-Each DoD item has:
-
-- id
-- description
-- owner
-- verification method
-- required artifacts
-- status
-- evidence
-- last checked timestamp
-
-Statuses:
-
-- NOT_STARTED
-- IN_PROGRESS
-- IMPLEMENTED
-- UNDER_REVIEW
-- FAILED_VERIFICATION
-- SATISFIED
-- WAIVED_BY_HUMAN
-
-No item becomes SATISFIED without evidence.
-
-## 20. Run-to-DoD policy
-
-Project states:
-
-- INITIALIZING
-- PLANNING
-- TEAM_FORMING
-- RUNNING
-- REPLANNING
-- INTEGRATING
-- VERIFYING
-- BLOCKED_REQUIRES_APPROVAL
-- BLOCKED_REQUIRES_INPUT
-- DOD_SATISFIED
-- FAILED_BY_POLICY
-- STOPPED_BY_USER
-
-Only terminal states:
-
-- DOD_SATISFIED
-- FAILED_BY_POLICY
-- STOPPED_BY_USER
-
-If the system reaches no active tasks and DoD is incomplete, it must trigger replanning.
-
-## 21. Watchdogs
-
-### 21.1 DoD Watchdog
-
-Detects incomplete DoD with no active work.
-
-Action:
-
-- trigger gap analysis
-- trigger PM/Tech Lead
-- create new work
-
-### 21.2 Stagnation Watchdog
-
-Detects repeated failures or no progress.
-
-Signals:
-
-- same test repeatedly fails
-- same files repeatedly rewritten
-- no checkpoint for long period
-- repeated circular handoffs
-
-Action:
-
-- freeze affected stream
-- summarize issue
-- trigger architect/reviewer/PM
-
-### 21.3 Deadlock Watchdog
-
-Detects dependency cycles.
-
-Action:
-
-- trigger PM/Architect to break dependency cycle
-
-### 21.4 Safety Watchdog
-
-Detects dangerous behavior.
-
-Action:
-
-- block action
-- quarantine agent if needed
-- notify security agent
-
-## 22. Persistence architecture
-
-PostgreSQL stores:
-
-- projects
-- agents
-- events
-- tasks
-- task dependencies
-- artifacts
-- checkpoints
-- summaries
-- memory items
-- embeddings
-- provider calls
-- audit events
-
-Dragonfly stores:
-
-- locks
-- leases
-- heartbeats
-- live event notifications
-- short-lived queues
-- budget counters
-
-## 23. Deployment architecture
-
-Local Docker Compose services:
-
-- agentos application container
-- ray-head
-- postgres with pgvector
-- dragonfly
-
-Future services:
-
-- Ray worker containers
-- sandbox worker service
-- optional observability stack
-- optional artifact storage service
-
-## 24. CLI architecture
-
-Required commands:
-
-- init
-- plan
-- run
-- status
-- logs
-- inspect
-- pause
-- resume
-- approve
-- reject
-- guardrail-check
-
-Starter scaffold includes:
-
-- init
-- plan
-- run
-- status
-- guardrail-check
-
-## 25. Implementation plan
-
-### Phase 1: Foundation
-
-- complete PostgreSQL repositories
-- add Alembic migrations
-- persist runtime state
-- persist agents, events, checkpoints, summaries
-- connect Docker Compose fully
-
-### Phase 2: Event and trigger runtime
-
-- implement Dragonfly Streams consumer groups
-- implement EventStore backed by PostgreSQL
-- implement TriggerEngine
-- implement subscriptions
-- implement agent inboxes
-
-### Phase 3: Provider Gateway
-
-- integrate LiteLLM
-- add redaction
-- add budget checks
-- add provider audit logging
-- add output guardrails
-- add retry/fallback policy
-
-### Phase 4: Memory
-
-- implement memory ACLs
-- implement memory promotion
-- implement embedding creation
-- implement pgvector retrieval
-- implement catch-up packet generation
-
-### Phase 5: Task planning
-
-- implement task graph
-- implement ownership boundaries
-- implement dependency detection
-- implement duplicate task detection
-- implement parallel scheduling policies
-
-### Phase 6: Execution
-
-- implement Git workspace manager
-- implement branch-per-task
-- implement patch application
-- implement Docker sandbox commands
-- implement test/lint/build runners
-- enforce filesystem and command policies
-
-### Phase 7: Review and QA
-
-- implement reviewer agents
-- implement QA agents
-- implement security reviewer flow
-- implement evidence collection
-- implement DoD evaluation
-
-### Phase 8: Run-to-DoD
-
-- implement DoD watchdog
-- implement stagnation watchdog
-- implement deadlock watchdog
-- implement replanning
-- implement terminal state validation
-
-### Phase 9: Hardening
-
-- append-only audit logs
-- agent quarantine
-- provider egress policy
-- secret scanning
-- dependency risk checks
-- observability and traces
-
-## 26. Engineering principles
-
-- agents produce artifacts, not just messages
-- all high-risk work requires review
-- all execution is supervised
-- all memory access is scoped
-- all provider access is routed through gateway
-- all important events are logged
-- all meaningful achievements are checkpointed
-- all completion claims require evidence
-- all destructive actions are denied or escalated
-- PostgreSQL is truth
-- Dragonfly is coordination
-- pgvector is semantic recall
-- Ray actors are execution units
-- Docker is sandboxing and local deployment base
-
-## 27. Starter skeleton map
-
-```text
-agentos/
-├── actors/
-│   ├── base.py
-│   └── bootstrap.py
-├── checkpoints/
-│   └── manager.py
-├── cli/
-│   └── main.py
-├── config/
-│   └── settings.py
-├── dod/
-│   └── evaluator.py
-├── execution/
-│   └── supervisor.py
-├── governance/
-│   ├── models.py
-│   └── policy_engine.py
-├── memory/
-│   └── broker.py
-├── messaging/
-│   ├── dragonfly_bus.py
-│   └── events.py
-├── provider/
-│   └── gateway.py
-├── runtime/
-│   ├── supervisor.py
-│   └── team_plan.py
-├── storage/
-│   └── schema.sql
-└── watchdogs/
-    └── runtime_watchdogs.py
-```
-
-## 28. Final architecture commitment
-
-AgentOS Local will be built as a guarded, local-first, Ray-powered autonomous software delivery platform that dynamically forms an IT/development agent team, runs agents as event-driven actors, coordinates them through Dragonfly and PostgreSQL, gives them scoped memory with pgvector semantic recall, executes work only through controlled supervisors, logs and checkpoints everything, and continues until the project DoD is fully satisfied.
+Unit/contract gates cover settings, resource envelopes, all provider profiles, plan role ownership, event validation, policy tamper/cross-project/path checks, Git worktrees, schema shape, Compose service/resource contracts, and packaged config/schema data.
+
+Live integration on a fresh Compose project initializes and round-trips:
+
+- PostgreSQL schema/health/query;
+- Dragonfly health/set/get;
+- MongoDB indexes/write/scoped read;
+- MinIO bucket/versioned put/get;
+- Milvus collection/upsert/strong-consistency filtered search.
+- native PostgreSQL JSON codecs plus transactional event/outbox insertion;
+- project-isolation trigger rejection for a cross-project artifact;
+- the lossless PostgreSQL-MinIO-MongoDB memory write/hydration path;
+- a network-disabled, read-only-root, non-root Docker sandbox command.
+
+`agentos init` proves packaged schema/config plus client initialization. `agentos doctor` proves the runtime actor and all required storage clients from the built image.
+
+## 16. Traceability to requested outcomes
+
+| Requested outcome | Architecture owner |
+|---|---|
+| Totally independent agents | Ray workers + individual client/state/inbox/lease boundaries |
+| Frequent communication | outbox, streams, inboxes, collaboration/heartbeat/checkpoint events |
+| Shared long/mid-term memories | PostgreSQL/MinIO/Milvus and MongoDB through Memory Broker |
+| Five requested databases/clients | `storage/clients` plus live integration |
+| Do not consume all cores | ResourcePlanner + infrastructure actor + Ray/thread/container limits |
+| Infrastructure agent alongside supervisor | mandatory role and service actor with persisted allocation |
+| Nine AI providers | ProviderRegistry/YAML/LiteLLM gateway |
+| Different workers/models by complexity | role/purpose/complexity routing and per-agent allocation |
+| Enhanced config/runtime/models | typed settings, versioned YAML, generated RuntimeConfig |
+| Production safe, no canary/staging | one fail-closed review/test/evidence integration path |
+| Updated documentation | README, goal, this plan, and subsystem documents |
+
+## 17. Remaining operator responsibilities
+
+Implementation completeness does not eliminate operational inputs. Before real use, the operator must:
+
+- supply real non-placeholder credentials and at least one provider/Ollama endpoint;
+- select provider models available to that account/region and override YAML defaults if needed;
+- size host memory and Compose ceilings for the planned team;
+- configure backup/restore and retention policies;
+- monitor provider cost/rate limits and storage capacity;
+- define any authorized external deployment integration separately;
+- perform organization-specific threat modeling and compliance review.
+
+The runtime reports these missing inputs as blocked configuration, not as implementation success.

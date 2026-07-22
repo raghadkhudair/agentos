@@ -1,58 +1,68 @@
 from __future__ import annotations
 
+import asyncio
+import fnmatch
 import json
 import re
-import asyncio
-import uuid
-from uuid import uuid4
+import time
+from typing import Any
+from uuid import UUID
+
 import ray
 import structlog
 
-from agentos.checkpoints.manager import Checkpoint, CheckpointManager
+from agentos.checkpoints.manager import Checkpoint
+from agentos.config.loader import runtime_tuning
+from agentos.config.runtime import TaskComplexity
 from agentos.config.settings import Settings
 from agentos.governance.models import ActionRequest, AgentIdentity
-from agentos.memory.broker import MemoryBroker
-from agentos.storage.database import DatabaseManager
-from agentos.messaging.events import Event, EventType
 from agentos.messaging.dragonfly_bus import DragonflyBus
+from agentos.messaging.events import Event, EventType
+from agentos.provider.gateway import ProviderRequest
+from agentos.storage.clients.mongodb import MongoDocumentClient
+from agentos.storage.clients.postgres import PostgresClient
 from agentos.storage.repositories import (
-    MemoryRepository,
-    ProviderCallRepository, 
-    TaskRepository, 
-    AuditEventRepository, 
-    ArtifactRepository,
-    SummaryRepository,
-    AgentRepository
+    AgentRepository,
+    DoDRepository,
+    EventRepository,
+    TaskRepository,
 )
-from agentos.provider.gateway import  ProviderRequest
-from agentos.config.loader import runtime_tuning
-cfg = runtime_tuning()["agent_inbox_loop"]
 
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer()
-    ]
-)
 logger = structlog.get_logger()
 
 
-@ray.remote(max_restarts=-1, max_task_retries=3)
+@ray.remote(max_restarts=5, max_task_retries=2)
 class AgentWorkerActor:
+    """Independent, project-scoped worker that collaborates only through governed services."""
 
-    def __init__(self, agent_id: str, role: str, project_id: str, settings: dict, spec_payload: dict):
+    def __init__(
+        self,
+        agent_id: str,
+        role: str,
+        project_id: str,
+        settings: dict[str, Any],
+        spec_payload: dict[str, Any],
+        service_names: dict[str, str],
+    ):
         self.agent_id = agent_id
         self.role = role
         self.project_id = project_id
-        self.settings = Settings(**settings) if settings else Settings()
-        
-        self.squad = spec_payload.get("squad", "engineering")
-        self.permissions = spec_payload.get("permissions", ["low_risk"])
-        self.memory_scopes = spec_payload.get("memory_scopes", ["project"])
-        self.allowed_actions = spec_payload.get("allowed_actions", ["implement"])
-        self.ownership_domains = spec_payload.get("ownership_domains", [])
-        self.event_subscriptions = spec_payload.get("event_subscriptions", [])
-        self.last_checkpoint_pointer = spec_payload.get("last_checkpoint_pointer", None)
+        self.settings = Settings(**settings)
+        self.squad = str(spec_payload.get("squad", "engineering"))
+        self.memory_scopes = list(spec_payload.get("memory_scopes", []))
+        self.allowed_actions = list(spec_payload.get("allowed_actions", []))
+        self.ownership_domains = list(spec_payload.get("ownership_domains", []))
+        self.event_subscriptions = list(spec_payload.get("event_subscriptions", []))
+        self.provider_assignment = dict(spec_payload.get("provider_assignment", {}))
+        self.resource_allocation = dict(spec_payload.get("resource_allocation", {}))
+        runtime_limits = dict(spec_payload.get("runtime_limits", {}))
+        self.max_active_agents = int(
+            runtime_limits.get("max_active_agents", self.settings.max_active_agents)
+        )
+        self.max_parallel_code_tasks = int(
+            runtime_limits.get("max_parallel_code_tasks", self.settings.max_parallel_code_tasks)
+        )
+        self.service_names = service_names
         self.identity = AgentIdentity(
             agent_id=agent_id,
             role=role,
@@ -60,584 +70,812 @@ class AgentWorkerActor:
             squad=self.squad,
             memory_scopes=self.memory_scopes,
             allowed_actions=self.allowed_actions,
-            allowed_paths=[],
+            ownership_domains=self.ownership_domains,
         )
-        self.db_manager = DatabaseManager(self.settings)
-        self.provider = None
-        
+        self.db = PostgresClient(self.settings)
+        self.mongo = MongoDocumentClient(self.settings)
+        self.agents = AgentRepository(self.db)
+        self.tasks = TaskRepository(self.db)
+        self.dod = DoDRepository(self.db)
+        self.events = EventRepository(self.db)
+        self.bus = DragonflyBus(self.settings)
         self.status = "STARTING"
-        self.current_task_id = None
-        self.is_running = False
+        self.current_task_id: str | None = None
+        self.running = False
         self.action_counter = 0
+        self._processing_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._background_tasks: list[asyncio.Task[Any]] = []
+        self._inbox_consumer_name: str | None = None
+        self._inbox_group: str | None = None
+        self.inbox_tuning = runtime_tuning()["agent_inbox_loop"]
 
-    async def start(self) -> dict:
-        from agentos.execution.supervisor import ExecutionSupervisor
+    _ACQUIRE_SLOT = """
+    redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
+    if redis.call('zcard', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
+    redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])
+    redis.call('expire', KEYS[1], tonumber(ARGV[5]))
+    return 1
+    """
 
-        await self.db_manager.connect()
-        self.memory_broker = ray.get_actor("memory_broker", namespace="agentos")
-        self.supervisor = ray.get_actor("execution_supervisor", namespace="agentos")
-        self.checkpoints = ray.get_actor("checkpoint_manager", namespace="agentos") 
-        self.summary_manager = ray.get_actor("summary_manager", namespace="agentos")
-        self.bus = DragonflyBus(self.settings.dragonfly_url)
-        self.task_repo = TaskRepository(self.db_manager)
-        self.audit_repo = AuditEventRepository(self.db_manager)
-        self.artifact_repo = ArtifactRepository(self.db_manager)
-        self.summary_repo = SummaryRepository(self.db_manager)
-        self.agent_repo = AgentRepository(self.db_manager)
-        await self.agent_repo.register_agent(self.agent_id, self.project_id, self.role, self.squad)
-        self.provider = ray.get_actor("provider_gateway", namespace="agentos")
-        
-        from redis.asyncio import Redis
-        self.redis_client = Redis.from_url(self.settings.dragonfly_url, decode_responses=True)
-        self.pubsub = self.redis_client.pubsub()
-        
-        await self.memory_broker.register_agent_identity.remote(self.identity.model_dump())
-        
-        self.status = "REGISTRATION"
-        try:
-            await self.supervisor.register_agent_identity.remote(self.identity.model_dump())
-            logger.info("agent_identity_registered_with_supervisor", agent_id=self.agent_id)
-        except Exception as e:
-            logger.error("identity_registration_failed", agent_id=self.agent_id, error=str(e))
+    async def _acquire_capacity(self, category: str, limit: int, ttl_seconds: int = 900) -> bool:
+        now = int(time.time())
+        key = self.bus.client.key("capacity", self.project_id, category)
+        return bool(
+            await self.bus.redis.eval(
+                self._ACQUIRE_SLOT,
+                1,
+                key,
+                now,
+                limit,
+                now + ttl_seconds,
+                self.agent_id,
+                ttl_seconds,
+            )
+        )
 
-        self.status = "RESTORE_FROM_POSTGRES"
-        try:
-            restored_state = await self.checkpoints.recover_agent_state.remote(self.project_id, self.agent_id)
-            if restored_state:
-                snapshot = restored_state.get("agent_state_snapshot", {})
-                self.current_task_id = snapshot.get("current_task_id")
-                self.last_checkpoint_pointer = restored_state.get("checkpoint_id")
-                logger.info("agent_state_restored", agent_id=self.agent_id, checkpoint_id=self.last_checkpoint_pointer)
-        except Exception as e:
-            logger.error("failed_to_restore_from_postgres", agent_id=self.agent_id, error=str(e))
-        
-        self.status = "SUBSCRIBE_TO_EVENTS"
-        wakeup_channel = f"agent:{self.agent_id}:wakeup"
-        await self.pubsub.subscribe(wakeup_channel) 
-        
+    async def _release_capacity(self, category: str) -> None:
+        await self.bus.redis.zrem(
+            self.bus.client.key("capacity", self.project_id, category), self.agent_id
+        )
+
+    async def start(self) -> dict[str, Any]:
+        async with self._start_lock:
+            if self.running:
+                return self.snapshot()
+            return await self._start_once()
+
+    async def _start_once(self) -> dict[str, Any]:
+        self.provider = ray.get_actor(self.service_names["provider"], namespace="agentos")
+        self.memory = ray.get_actor(self.service_names["memory"], namespace="agentos")
+        self.execution = ray.get_actor(self.service_names["execution"], namespace="agentos")
+        self.checkpoints = ray.get_actor(self.service_names["checkpoints"], namespace="agentos")
+        self.summaries = ray.get_actor(self.service_names["summaries"], namespace="agentos")
+        self.trigger = ray.get_actor(self.service_names["trigger"], namespace="agentos")
+        self.reviewer = ray.get_actor(self.service_names["reviewer"], namespace="agentos")
+        self.safety = ray.get_actor(self.service_names["safety"], namespace="agentos")
+        await self.mongo.initialize()
+        await self.agents.register_agent(
+            self.agent_id,
+            self.project_id,
+            self.role,
+            self.squad,
+            memory_scopes=self.memory_scopes,
+            permissions={
+                "allowed_actions": self.allowed_actions,
+                "ownership_domains": self.ownership_domains,
+                "event_subscriptions": self.event_subscriptions,
+            },
+            provider_assignment=self.provider_assignment,
+            resource_allocation=self.resource_allocation,
+        )
+        await self.memory.register_agent_identity.remote(self.identity.model_dump(mode="json"))
+        await self.execution.register_agent_identity.remote(self.identity.model_dump(mode="json"))
+        await self.trigger.register_agent.remote(
+            self.agent_id,
+            self.event_subscriptions,
+            [
+                EventType.TASK_CREATED.value,
+                EventType.TASK_COMPLETED.value,
+                EventType.TASK_UPDATE.value,
+                EventType.REVIEW_REQUESTED.value,
+                EventType.TEST_RESULT.value,
+                EventType.CHECKPOINT_CREATED.value,
+                EventType.COLLABORATION_UPDATE.value,
+                EventType.BLOCKER_CREATED.value,
+            ],
+            coordinator=self.role == "pm_tech_lead",
+        )
+        restored = await self.checkpoints.recover_agent_state.remote(self.project_id, self.agent_id)
+        if restored:
+            state = restored.get("agent_state_snapshot", restored)
+            self.current_task_id = state.get("current_task_id")
+        local_state = await self.mongo.load_agent_state(
+            project_id=self.project_id, agent_id=self.agent_id
+        )
+        if local_state:
+            self.current_task_id = local_state.get("current_task_id", self.current_task_id)
+        self._inbox_group = await self.bus.ensure_inbox_group(self.project_id, self.agent_id)
+        self._inbox_consumer_name = f"{self.agent_id}-{time.time_ns()}"
         self.status = "IDLE"
-        self.is_running = True
-        
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        self._inbox_task = asyncio.create_task(self._inbox_listening_loop())
-        
-        logger.info("agent_started", agent_id=self.agent_id, role=self.role, project_id=self.project_id)
+        self.running = True
+        self._background_tasks = [
+            asyncio.create_task(self._inbox_loop()),
+            asyncio.create_task(self._heartbeat_loop()),
+            asyncio.create_task(self._collaboration_loop()),
+            asyncio.create_task(self._work_poll_loop()),
+        ]
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
         return {
             "agent_id": self.agent_id,
             "role": self.role,
             "project_id": self.project_id,
+            "squad": self.squad,
             "status": self.status,
-            "squad": self.squad
+            "current_task_id": self.current_task_id,
+            "provider_assignment": self.provider_assignment,
+            "resource_allocation": self.resource_allocation,
+            "running": self.running,
         }
 
-    async def _inbox_listening_loop(self) -> None:
-        inbox_key = f"agent:{self.agent_id}:inbox"
-
-        while self.is_running:
+    async def _inbox_loop(self) -> None:
+        if self._inbox_consumer_name is None or self._inbox_group is None:
+            raise RuntimeError("agent inbox consumer was not initialized")
+        consumer_name = self._inbox_consumer_name
+        group = self._inbox_group
+        batch_size = int(self.inbox_tuning["batch_size"])
+        block_milliseconds = int(self.inbox_tuning["stream_block_milliseconds"])
+        lease_seconds = int(self.inbox_tuning["processing_lease_seconds"])
+        while self.running:
             try:
-                raw_event_data = await self.redis_client.lpop(inbox_key)
-                if not raw_event_data:
-                    message = await self.pubsub.get_message(
-                        ignore_subscribe_messages=True, 
-                        timeout=cfg["pubsub_poll_timeout_seconds"]
+                messages = await self.bus.reclaim_inbox(
+                    self.project_id,
+                    self.agent_id,
+                    consumer_name,
+                    min_idle_milliseconds=lease_seconds * 1000,
+                    count=batch_size,
+                )
+                if not messages:
+                    messages = await self.bus.read_inbox(
+                        self.project_id,
+                        self.agent_id,
+                        consumer_name,
+                        count=batch_size,
+                        block_milliseconds=block_milliseconds,
                     )
-                    if message and message["data"] == "NEW_EVENT":
-                        continue
-                    await asyncio.sleep(cfg["empty_inbox_sleep_seconds"])
-                    continue
-
-                event_dict = json.loads(raw_event_data)
-                self.status = "TRIGGERED"
-                asyncio.create_task(self.process_next_step(event_dict.get("event_id")))
-            except Exception as e:
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    logger.info("actor_loop_terminating_stopping_inbox", agent_id=self.agent_id)
-                    self.is_running = False
-                    break
-
-                logger.error("inbox_loop_error", agent_id=self.agent_id, error=str(e))
-                await asyncio.sleep(cfg["error_backoff_sleep_seconds"])
-
-    async def process_next_step(self, event_id: str) -> dict:
-        self.status = "CATCH_UP"
-        
-        packet = await self.memory_broker.build_catchup_packet.remote(
-            project_id=self.project_id,
-            agent_id=self.agent_id,
-            trigger_event_id=event_id,
-            provider_gateway=self.provider
-        )
-
-        active_tasks = await self.task_repo.get_active_tasks(self.project_id)
-        
-        uncompleted_task_ids = {t["id"] for t in active_tasks}
-        runnable_tasks = []
-        for t in active_tasks:
-            if t.get("status") == "IN_PROGRESS":
-                continue
-                
-            dependencies = t.get("dependencies", [])
-            unsatisfied = [dep for dep in dependencies if dep in uncompleted_task_ids]
-            if not unsatisfied:
-                runnable_tasks.append(t)
-
-        self.status = "DECIDE_NEXT_ACTION"
-
-        failure_hints = []
-        if self.provider:
-            try:
-                from agentos.storage.repositories import MemoryRepository
-                memory_repo = MemoryRepository(self.db_manager)
-                trigger_text = str(event_id)
-                err_vector = await self.provider.get_embedding.remote(trigger_text, self.project_id)
-                past_failures = await memory_repo.find_similar_failures(self.project_id, err_vector)
-                for pf in past_failures:
-                    failure_hints.append(f"⚠️ Past Similar Failure ({pf['title']}): {pf['content']}")
-            except Exception as e:
-                logger.warning("failure_lookup_bypassed", error=str(e))
-                
-        failure_context_str = "\n".join(failure_hints) if failure_hints else "No prior matching failures found."
-
-        system_prompt = (
-            f"You are {self.agent_id}, a {self.role} in the {self.squad} squad.\n"
-            f"Your ownership domains are: {json.dumps(self.ownership_domains)}.\n"
-            f"Your allowed action capabilities are: {json.dumps(self.allowed_actions)}.\n"
-            f"Historical Failure Lessons:\n{failure_context_str}\n"
-            f"Here are the uncompleted tasks for this project that are ready to work:\n{json.dumps(runnable_tasks)}\n"
-            "Choose the most critical task from the list above that matches your role boundaries.\n"
-            "CRITICAL: You must return the exact 'target_task_id' you are working on in your JSON response.\n\n"
-            "If there are NO runnable tasks left matching your capabilities, you must choose action_type 'wait'. "
-            "Do not invent new milestones autonomously.\n\n"
-            "SCHEMA LAYOUT:\n"
-            "{\n"
-            "  \"target_task_id\": \"string-uuid or null (null only when action_type is 'create_task')\",\n"
-            "  \"action_type\": \"write_file\" | \"read_file\" | \"shell_command\" | \"create_task\" | \"execute_db_operation\" | \"wait\",\n"
-            "  \"description\": \"Objective summary\",\n"
-            "  \"payload\": {\n"
-            "     \"query\": \"CREATE TABLE users (...)\",\n"
-            "     \"parameters\": [],\n"
-            "     \"file_path\": \"src/app.py\", \n"
-            "     \"content\": \"...\",\n"
-            "     \"title\": \"New task title (create_task only)\",\n"
-            "     \"task_description\": \"Description (create_task only)\",\n"
-            "     \"priority\": 1-5,\n"
-            "     \"risk_level\": \"LOW\" | \"MEDIUM\" | \"HIGH\" | \"CRITICAL\",\n"
-            "     \"acceptance_criteria\": [\"conditions\"],\n"
-            "     \"allowed_paths\": [\"paths/\"],\n"
-            "     \"blocked_paths\": [\"paths/\"],\n"
-            "     \"expected_outputs\": [\"files\"]\n"
-            "  }\n"
-            "}"
-        )
-
-        request = ProviderRequest(
-            purpose="decide_next_action",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Context Packet:\n{packet}"}],
-            budget_key=self.project_id
-        )
-        
-        response_dict = await self.provider.get_completion.remote(
-            request, 
-            response_format={"type": "json_object"}
-        )
-        clean_content = response_dict["content"].strip()
-        if clean_content.startswith("```"):
-            clean_content = re.sub(r"^```json\s*|^```\s*", "", clean_content, flags=re.MULTILINE)
-            clean_content = re.sub(r"\s*```$", "", clean_content, flags=re.MULTILINE).strip()
-
-        try:
-            decision = json.loads(clean_content)
-            target_task_id = decision.get("target_task_id")
-            action_type = decision.get("action_type", "wait")
-            description = decision.get("description", "")
-            payload = decision.get("payload", {})
-            
-            if action_type != "wait" and action_type not in self.identity.allowed_actions:
-                logger.warning("hallucinated_or_unauthorized_tool_rejected_locally", agent_id=self.agent_id, action_type=action_type)
-                action_type = "wait"
-                target_task_id = None
-                payload = {}
-        except Exception:
-            action_type = "wait"
-            target_task_id = None
-            description = "Failed to parse choice structural template response."
-            payload = {}
-
-        if action_type == "create_task":
-            self.status = "CREATE_NEW_TASK"
-            new_title = payload.get("title", "Untitled follow-up task")
-            new_description = payload.get("task_description", description)
-            new_priority = int(payload.get("priority", 3))
-
-            task_text_to_embed = f"{new_title}: {new_description}"
-            task_embedding = None
-            if self.provider:
-                try:
-                    task_embedding = await self.provider.get_embedding.remote(task_text_to_embed, self.project_id)
-                except Exception as e:
-                    logger.warning("failed_to_generate_task_embedding", error=str(e))
-
-            if task_embedding:
-                similar_task = await self.task_repo.find_similar_task(self.project_id, task_embedding)
-                if similar_task:
-                    logger.info(
-                        "duplicate_task_creation_blocked", 
-                        agent_id=self.agent_id, 
-                        existing_task_id=similar_task["id"],
-                        distance=similar_task["distance"]
+                for message_id, fields in messages:
+                    await self._handle_inbox_message(
+                        message_id,
+                        fields,
+                        group=group,
+                        consumer_name=consumer_name,
+                        lease_seconds=lease_seconds,
                     )
-                    self.status = "IDLE"
-                    return {"status": "SKIPPED_DUPLICATE", "existing_task_id": similar_task["id"]}
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(
+                    "agent_inbox_error", agent_id=self.agent_id, error_type=type(error).__name__
+                )
+                await asyncio.sleep(float(self.inbox_tuning["error_backoff_seconds"]))
 
-            new_task_id = await self.task_repo.create_task(
-                project_id=self.project_id,
-                title=new_title,
-                description=new_description,
-                owner_agent_id=None,
-                parent_task_id=self.current_task_id,
-                priority=new_priority,
-                acceptance_criteria=payload.get("acceptance_criteria", []),
-                allowed_paths=payload.get("allowed_paths", []),
-                blocked_paths=payload.get("blocked_paths", []),
-                expected_outputs=payload.get("expected_outputs", []),
-                risk_level=payload.get("risk_level", "LOW"),
-                embedding=task_embedding  
+    async def _handle_inbox_message(
+        self,
+        message_id: str,
+        fields: dict[str, str],
+        *,
+        group: str,
+        consumer_name: str,
+        lease_seconds: int,
+    ) -> bool:
+        del group
+        raw = fields.get("event")
+        if not raw:
+            return False
+        event = Event.model_validate_json(raw)
+        if event.project_id != self.project_id:
+            raise PermissionError("inbox event belongs to another project")
+        event_id = str(event.event_id)
+        status = await self.events.event_receipt_status(self.project_id, event_id, self.agent_id)
+        if status is None:
+            await self.events.record_event_delivery(
+                self.project_id, event_id, self.agent_id, message_id
             )
-            logger.info("new_task_created_by_agent", agent_id=self.agent_id, task_id=new_task_id, title=new_title)
-            
-            success_checkpoint_data = Checkpoint(
-                checkpoint_id=str(uuid4()),
-                project_id=self.project_id,
+            status = await self.events.event_receipt_status(
+                self.project_id, event_id, self.agent_id
+            )
+        if status == "PROCESSED":
+            await self.bus.acknowledge_inbox(self.project_id, self.agent_id, message_id)
+            return True
+        claimed = await self.events.claim_event_receipt(
+            self.project_id,
+            event_id,
+            self.agent_id,
+            consumer_name,
+            lease_seconds,
+        )
+        if not claimed:
+            return False
+        try:
+            result = await self._process_event(event)
+            result_status = str(result.get("status", ""))
+            if result_status in {"BUSY", "THROTTLED"}:
+                await self.events.fail_event_receipt(
+                    self.project_id,
+                    event_id,
+                    self.agent_id,
+                    consumer_name,
+                    result_status,
+                )
+                return False
+            completed = await self.events.complete_event_receipt(
+                self.project_id, event_id, self.agent_id, consumer_name
+            )
+            if not completed:
+                return False
+            await self.bus.acknowledge_inbox(self.project_id, self.agent_id, message_id)
+            return True
+        except Exception as error:
+            await self.events.fail_event_receipt(
+                self.project_id,
+                event_id,
+                self.agent_id,
+                consumer_name,
+                type(error).__name__,
+            )
+            logger.error(
+                "agent_inbox_processing_failed",
                 agent_id=self.agent_id,
-                achievement="task_created",
-                summary=f"Created new task '{new_title}' to close a detected DoD gap.",
-                agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-            ).model_dump()
+                event_id=event_id,
+                error_type=type(error).__name__,
+            )
+            return False
 
-            self.status = "CHECKPOINT"
-            checkpoint_res = await self.checkpoints.create.remote(success_checkpoint_data)
-            self.last_checkpoint_pointer = checkpoint_res["checkpoint_id"]
+    @staticmethod
+    def _clean_json(content: str) -> dict[str, Any]:
+        clean = content.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean, flags=re.IGNORECASE)
+        result = json.loads(clean)
+        if not isinstance(result, dict):
+            raise ValueError("decision must be a JSON object")
+        return result
 
-            self.status = "IDLE"
-            return {"status": "SUCCESS", "checkpoint_id": checkpoint_res["checkpoint_id"], "new_task_id": new_task_id}
-   
-        if action_type != "wait":
-            self.status = "REQUEST_LOCKS"
-            lock_acquired = False
-            lock_key = f"project:{self.project_id}:lock:{target_task_id or 'global'}"
-            lease_key = f"agent:{self.agent_id}:processing_lease"
-            
+    async def process_next_step(self, event_id: str) -> dict[str, Any]:
+        row = await self.events.get_event(event_id)
+        if row:
+            event = Event(
+                event_id=row["id"],
+                project_id=str(row["project_id"]),
+                event_type=row["event_type"],
+                producer_agent_id=row["producer_agent_id"],
+                target_agent_id=row["target_agent_id"],
+                topic=row["topic"],
+                payload=row["payload"],
+                correlation_id=row["correlation_id"],
+                causation_id=row["causation_id"],
+                created_at=row["created_at"],
+            )
+        else:
+            event = Event(
+                project_id=self.project_id,
+                event_type=EventType.AGENT_TRIGGERED,
+                producer_agent_id="runtime_supervisor",
+                target_agent_id=self.agent_id,
+                payload={"event_id": event_id},
+            )
+        return await self._process_event(event)
+
+    async def _process_event(self, event: Event) -> dict[str, Any]:
+        if self._processing_lock.locked():
+            return {"status": "BUSY"}
+        if await self.bus.redis.exists(
+            self.bus.client.key("project", self.project_id, "claims_paused")
+        ):
+            return {"status": "THROTTLED", "reason": "project claims are paused"}
+        async with self._processing_lock:
+            if not await self._acquire_capacity("active_agents", self.max_active_agents):
+                return {"status": "THROTTLED"}
             try:
-                await self.redis_client.set(lease_key, "ACTIVE", ex=60)
-                lock_acquired = await self.redis_client.set(lock_key, self.agent_id, nx=True, ex=120)
-                if not lock_acquired:
-                    logger.warning("failed_to_acquire_task_lock", agent_id=self.agent_id, target_task_id=target_task_id)
-                    self.status = "IDLE"
-                    await self.redis_client.delete(lease_key)
-                    return {"status": "LOCK_ACQUISITION_FAILED"}
-            except Exception as e:
-                logger.error("lock_infrastructure_error", agent_id=self.agent_id, error=str(e))
-                self.status = "IDLE"
-                await self.redis_client.delete(lease_key)
-                return {"status": "LOCK_ERROR"}
+                return await self._process_event_with_capacity(event)
+            finally:
+                await self._release_capacity("active_agents")
 
-            # Set database task status to IN_PROGRESS and log claimed state checkpoint
-            if target_task_id:
-                self.current_task_id = target_task_id
-                await self.task_repo.update_task_status(target_task_id, "IN_PROGRESS")
-                
-                claim_checkpoint = Checkpoint(
-                    checkpoint_id=str(uuid4()),
+    async def _process_event_with_capacity(self, event: Event) -> dict[str, Any]:
+        task = await self.tasks.claim_next(self.project_id, self.agent_id, self.role)
+        if task is None:
+            if self.role == "pm_tech_lead" and event.event_type == EventType.REPLANNING_TRIGGERED:
+                self.status = "CATCH_UP"
+                query_text = str(
+                    event.payload.get("message") or json.dumps(event.payload, default=str)
+                )
+                packet = await self.memory.build_catchup_packet.remote(
                     project_id=self.project_id,
                     agent_id=self.agent_id,
-                    task_id=target_task_id,
-                    achievement="task_claimed",
-                    summary=f"Claimed task '{target_task_id}' and locked processing boundaries.",
-                    agent_state_snapshot={"current_task_id": self.current_task_id, "status": "EXECUTING"}
-                ).model_dump()
-                await self.checkpoints.create.remote(claim_checkpoint)
-
-            self.status = "SUBMIT_ACTION_REQUEST"
-            action_req = ActionRequest(
-                project_id=self.project_id, 
-                agent_id=self.identity.agent_id, 
-                action_type=action_type, 
-                description=description, 
-                payload=payload
-            )
-            
-            self.status = "EXECUTION_SUPERVISOR_RUNS_IF_ALLOWED"
-            exec_res = await self.supervisor.request_execution.remote(action_req.model_dump())
-            
-            if not exec_res.get("executed"):
-                error_msg = exec_res.get("error") or exec_res.get("reason") or "Execution blocked by supervisor guardrails"
-                try:
-                    from agentos.storage.repositories import MemoryRepository
-                    memory_repo = MemoryRepository(self.db_manager)
-                    
-                    mem_id = await memory_repo.save_memory_item(
-                        project_id=self.project_id,
-                        scope="execution_memory",
-                        owner_agent_id=self.agent_id,
-                        memory_type="execution_failure",
-                        title=f"Failure during {action_type}",
-                        content=f"Action: {action_type} | Description: {description} | Error: {error_msg}"
-                    )
-                    
-                    err_vector = await self.provider.get_embedding.remote(error_msg, self.project_id)
-                    async with self.db_manager.pool.acquire() as conn:
-                        await conn.execute(
-                            "INSERT INTO memory_embeddings (memory_item_id, embedding) VALUES ($1, $2::vector)",
-                            uuid.UUID(mem_id), err_vector
-                        )
-                    logger.info("execution_failure_memory_saved", agent_id=self.agent_id)
-                    blocker_cp = Checkpoint(
-                        checkpoint_id=str(uuid4()),
-                        project_id=self.project_id,
-                        agent_id=self.agent_id,
-                        task_id=target_task_id,
-                        achievement="blocker_opened",
-                        summary=f"Execution blocked during {action_type}: {error_msg}",
-                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": "BLOCKED"}
-                    ).model_dump()
-                    await self.checkpoints.create.remote(blocker_cp)
-                    if target_task_id:
-                        await self.task_repo.update_status(target_task_id, "BLOCKED")
-                except Exception as e:
-                    logger.error("failed_to_log_execution_failure_memory", error=str(e))
-
-            current_task_status = next((t["status"] for t in active_tasks if str(t["id"]) == str(target_task_id)), None)
-            if current_task_status == "BLOCKED" and exec_res.get("executed"):
-                try:
-                    resolved_cp = Checkpoint(
-                        checkpoint_id=str(uuid4()),
-                        project_id=self.project_id,
-                        agent_id=self.agent_id,
-                        task_id=target_task_id,
-                        achievement="blocker_resolved",
-                        summary=f"Previously blocked task succeeded on action: {action_type}",
-                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-                    ).model_dump()
-                    await self.checkpoints.create.remote(resolved_cp)
-                except Exception as e:
-                    logger.error("failed_to_save_blocker_resolved_checkpoint", error=str(e))
-                    
-            if action_type in {"write_file", "write_code"} and exec_res.get("executed"):
-                self.status = "PUBLISH_OUTPUT"
-                try:
-                    patch_cp = Checkpoint(
-                        checkpoint_id=str(uuid4()),
-                        project_id=self.project_id,
-                        agent_id=self.agent_id,
-                        task_id=target_task_id,
-                        achievement="code_patch_generated",
-                        summary=f"Generated code patch for file '{payload.get('file_path', 'code_file')}'",
-                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-                    ).model_dump()
-                    await self.checkpoints.create.remote(patch_cp)
-                except Exception as e:
-                    logger.error("failed_to_save_code_patch_checkpoint", error=str(e))
-
-                code_reviewer = ray.get_actor("code_reviewer", namespace="agentos")
-                review_result = await code_reviewer.review_code_patch.remote(
-                    payload.get("file_path", "unknown_file"), payload.get("content", "")
+                    trigger_event_id=str(event.event_id),
+                    provider_gateway=self.provider,
+                    query_text=query_text[:8000],
                 )
-                try:
-                    review_cp = Checkpoint(
-                        checkpoint_id=str(uuid4()),
-                        project_id=self.project_id,
-                        agent_id=self.agent_id,
-                        task_id=target_task_id,
-                        achievement="review_completed",
-                        summary=f"Code review result: approved={review_result.get('approved')}",
-                        agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-                    ).model_dump()
-                    await self.checkpoints.create.remote(review_cp)
-                except Exception as e:
-                    logger.error("failed_to_save_review_checkpoint", error=str(e))
-
-            if exec_res.get("executed") and target_task_id:
-                self.status = "PUBLISH_OUTPUT"
-                file_path = payload.get("file_path", "unknown_file")
-                file_content = payload.get("content", "")
-
-                affected_contracts = []
-                if self.provider and (file_content or description):
-                    try:
-                        from agentos.storage.repositories import MemoryRepository
-                        memory_repo = MemoryRepository(self.db_manager)
-                        
-                        change_text = f"File: {file_path}\nDescription: {description}\nContent: {file_content[:500]}"
-                        change_vector = await self.provider.get_embedding.remote(change_text, self.project_id)
-                        
-                        affected_contracts = await memory_repo.find_affected_contracts(self.project_id, change_vector)
-                        if affected_contracts:
-                            await self.task_repo.update_task_affected_contracts(target_task_id, affected_contracts)
-                            logger.info("contract_impact_detected", task_id=target_task_id, affected=affected_contracts)
-                            contract_cp = Checkpoint(
-                                checkpoint_id=str(uuid4()),
-                                project_id=self.project_id,
-                                agent_id=self.agent_id,
-                                task_id=target_task_id,
-                                achievement="contract_published",
-                                summary=f"Contract impact published for contracts: {', '.join(affected_contracts)}",
-                                agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-                            ).model_dump()
-                            await self.checkpoints.create.remote(contract_cp)
-                    
-                    except Exception as e:
-                        logger.error("contract_impact_analysis_failed", error=str(e))
-
-                if action_type == "write_file":
-                    await self.artifact_repo.create_artifact(
-                        project_id=self.project_id,
-                        task_id=target_task_id,
-                        artifact_type="FILE",
-                        title=file_path,
-                        uri=file_path
-                    )
-
-                if file_content and self.provider:
-                        try:
-                            from agentos.storage.repositories import CodebaseMapRepository
-                            code_repo = CodebaseMapRepository(self.db_manager)
-                            
-                            await code_repo.clear_file_index(self.project_id, file_path)
-                            
-                            snippet_to_embed = f"File: {file_path}\nContent:\n{file_content[:1500]}"
-                            code_vector = await self.provider.get_embedding.remote(snippet_to_embed, self.project_id)
-                            
-                            await code_repo.index_file_chunk(
-                                project_id=self.project_id,
-                                file_path=file_path,
-                                chunk_identifier="file_content",
-                                code_snippet=file_content[:2000],
-                                embedding=code_vector
-                            )
-                            logger.info("codebase_semantic_map_updated", file_path=file_path)
-                        except Exception as e:
-                            logger.error("failed_to_index_codebase_semantic_map", file_path=file_path, error=str(e))
-
-                
-                await self.task_repo.update_task_status(target_task_id, "COMPLETED")
-                self.current_task_id = None
-                try:
-                    completed_cp = Checkpoint(
-                        checkpoint_id=str(uuid4()),
-                        project_id=self.project_id,
-                        agent_id=self.agent_id,
-                        task_id=target_task_id,
-                        achievement="task_completed",
-                        summary=f"Successfully completed task '{target_task_id}': {description}",
-                        agent_state_snapshot={"current_task_id": None, "status": "COMPLETED"}
-                    ).model_dump()
-                    await self.checkpoints.create.remote(completed_cp)
-                except Exception as e:
-                    logger.error("failed_to_save_task_completed_checkpoint", error=str(e))
-
-                logger.info("task_completed_by_agent", agent_id=self.agent_id, task_id=target_task_id)
-
-                unified_stream_key = f"project:{self.project_id}:events"
-                completion_event = Event(
-                    project_id=self.project_id,
-                    event_type=EventType.TASK_COMPLETED,
-                    producer_agent_id=self.identity.agent_id,
-                    topic=unified_stream_key,
-                    payload={
-                        "task_id": target_task_id,
-                        "message": f"Task '{target_task_id}' completed by agent {self.identity.agent_id}.",
-                        "file_path": file_path
-                    }
-                )
-                try:
-                    from agentos.storage.repositories import MemoryRepository
-                    memory_repo = MemoryRepository(self.db_manager)
-                    memory_content = f"Task '{target_task_id}' completed by {self.agent_id}: {description}"
-                    
-                    target_scope = "execution_memory" if action_type in {"write_file", "shell_command"} else "project_memory"
-
-                    mem_id = await memory_repo.save_memory_item(
-                        project_id=self.project_id,
-                        scope=target_scope,
-                        owner_agent_id=self.agent_id,
-                        memory_type="task_completion",
-                        title=file_path if action_type == "write_file" else description[:80],
-                        content=memory_content,
-                    )
-                    embedding_vector = await self.provider.get_embedding.remote(memory_content, self.project_id)
-                    async with self.db_manager.pool.acquire() as conn:
-                        await conn.execute(
-                            "INSERT INTO memory_embeddings (memory_item_id, embedding) VALUES ($1, $2::vector)",
-                            uuid.UUID(mem_id), embedding_vector
-                        )
-                    logger.info("execution_memory_saved", agent_id=self.agent_id, scope=target_scope)
-                except Exception as e:
-                    logger.error("failed_to_write_memory_item", agent_id=self.agent_id, error=str(e))
-
-
-                merge_result = await self.supervisor.merge_and_finalize_branch.remote(self.agent_id)
-                if merge_result.get("success"):
-                    try:
-                        merge_cp = Checkpoint(
-                            checkpoint_id=str(uuid4()),
-                            project_id=self.project_id,
-                            agent_id=self.agent_id,
-                            achievement="merge_completed",
-                            summary=f"Branch changes successfully merged to main for agent {self.agent_id}",
-                            agent_state_snapshot={"current_task_id": None, "status": "IDLE"}
-                        ).model_dump()
-                        await self.checkpoints.create.remote(merge_cp)
-                    except Exception as e:
-                        logger.error("failed_to_save_merge_completed_checkpoint", error=str(e))
-                else:
-                    logger.warning("branch_merge_failed", agent_id=self.agent_id, error=merge_result.get("error"))
-
-            
-            elif not exec_res.get("executed") and target_task_id:
-                # Fall back status to PENDING if guardrail filters or runtime execution blocks the call
-                await self.task_repo.update_task_status(target_task_id, "PENDING")
-                self.current_task_id = None
-                    
-            await self.redis_client.delete(lock_key)
-            await self.redis_client.delete(lease_key)
-
-        success_checkpoint_data = Checkpoint(
-            checkpoint_id=str(uuid4()),
+                created = await self._replan_gaps(list(event.payload.get("gaps", [])), packet)
+                self.status = "IDLE"
+                return {"status": "REPLANNED", "created_tasks": created}
+            self.status = "IDLE"
+            return {"status": "IDLE", "reason": "no runnable task"}
+        self.status = "CATCH_UP"
+        query_text = str(event.payload.get("message") or json.dumps(event.payload, default=str))
+        packet = await self.memory.build_catchup_packet.remote(
             project_id=self.project_id,
             agent_id=self.agent_id,
-            achievement="action_processed",
-            summary=description,
-            agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status}
-        ).model_dump() 
-        
-        self.status = "CHECKPOINT"
-        checkpoint_res = await self.checkpoints.create.remote(success_checkpoint_data)
-        self.last_checkpoint_pointer = checkpoint_res["checkpoint_id"]
-        
-        self.action_counter += 1
-        self.status = "SUMMARIZE_IF_NEEDED"
-        if self.action_counter % 5 == 0:
-            try:
-                summary_text = await self.summary_manager.generate_local_agent_summary.remote(
-                    self.project_id, self.agent_id, self.provider
-                )
-                await self.summary_repo.save_summary(self.project_id, "agent_local", self.agent_id, summary_text)
-                logger.info("local_agent_summary_generated", agent_id=self.agent_id)
-            except Exception as e:
-                logger.error("failed_to_generate_periodic_summary", agent_id=self.agent_id, error=str(e))
-
+            trigger_event_id=str(event.event_id),
+            provider_gateway=self.provider,
+            query_text=query_text[:8000],
+        )
+        task_id = str(task["id"])
+        self.current_task_id = task_id
+        await self.tasks.update_task_status(task_id, "IN_PROGRESS")
+        self.status = "DECIDE_NEXT_ACTION"
+        complexity = TaskComplexity(str(task.get("complexity") or "standard"))
+        prompt = {
+            "identity": self.identity.model_dump(mode="json"),
+            "task": json.loads(json.dumps(task, default=str)),
+            "context": packet,
+            "response_schema": {
+                "action_type": self.allowed_actions,
+                "description": "string",
+                "payload": {
+                    "file_path": "relative path for write/read",
+                    "content": "complete file content for write_file",
+                    "test_command": ["executable", "argument"],
+                },
+            },
+            "rules": [
+                "Choose one allowed action only.",
+                "Never use shell strings; test_command is a token array.",
+                "Use only task allowed_paths and expected_outputs.",
+                "Do not claim completion; review, test, evidence, and merge gates decide it.",
+            ],
+        }
+        request = ProviderRequest(
+            purpose="decide_next_action",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Act as the assigned software-delivery worker. Return JSON only.",
+                },
+                {"role": "user", "content": json.dumps(prompt, default=str)},
+            ],
+            budget_key=UUID(self.project_id),
+            agent_id=self.agent_id,
+            agent_role=self.role,
+            complexity=complexity,
+            preferred_provider=self.provider_assignment.get("provider"),
+            preferred_model=dict(self.provider_assignment.get("model_routes", {})).get(
+                complexity.value, self.provider_assignment.get("model")
+            ),
+            required_capabilities={"chat", "json"},
+        )
+        try:
+            response = await self.provider.get_completion.remote(
+                request.model_dump(mode="json"), response_format={"type": "json_object"}
+            )
+            decision = self._clean_json(response["content"])
+            action_type = str(decision.get("action_type", "wait"))
+            description = str(decision.get("description", "No description"))
+            payload = decision.get("payload") or {}
+            if action_type not in self.allowed_actions:
+                raise PermissionError("provider proposed an action outside the role capability")
+            result = await self._execute_decision(task, action_type, description, payload)
+        except Exception as error:
+            await self.tasks.update_task_status(task_id, "PENDING")
+            result = {"status": "FAILED", "error": type(error).__name__}
+        await self._checkpoint_and_share(task_id, result)
+        self.current_task_id = None
         self.status = "IDLE"
-        return {"status": "SUCCESS", "checkpoint_id": checkpoint_res["checkpoint_id"]}
+        return result
+
+    async def _replan_gaps(self, gaps: list[str], packet: dict[str, Any]) -> list[str]:
+        if not gaps:
+            return []
+        request = ProviderRequest(
+            purpose="bootstrap_team_planning",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Create the smallest safe backlog that closes the supplied DoD gaps. Return JSON "
+                        '{"tasks":[{"title":str,"description":str,"priority":1-5,'
+                        '"risk_level":"LOW|MEDIUM|HIGH|CRITICAL","complexity":'
+                        '"low|standard|high|critical","allowed_paths":[str],'
+                        '"blocked_paths":[str],"expected_outputs":[str],'
+                        '"acceptance_criteria":[str],"owner_role":"ROLE_NAME",'
+                        '"dod_criteria":[str]}]}.'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"gaps": gaps, "context": packet}, default=str),
+                },
+            ],
+            budget_key=UUID(self.project_id),
+            agent_id=self.agent_id,
+            agent_role=self.role,
+            complexity=TaskComplexity.HIGH,
+            required_capabilities={"chat", "json"},
+        )
+        response = await self.provider.get_completion.remote(
+            request.model_dump(mode="json"), response_format={"type": "json_object"}
+        )
+        data = self._clean_json(response["content"])
+        created: list[str] = []
+        for item in data.get("tasks", []):
+            criteria = list(item.get("dod_criteria", []))
+            if not criteria or not set(criteria).issubset(set(gaps)):
+                raise ValueError("replanned task must map only to current DoD gaps")
+            task_id = await self.tasks.create_task(
+                self.project_id,
+                str(item["title"]),
+                str(item["description"]),
+                owner_role=str(item.get("owner_role") or self.role),
+                priority=int(item.get("priority", 3)),
+                acceptance_criteria=list(item.get("acceptance_criteria", [])),
+                allowed_paths=list(item.get("allowed_paths", [])),
+                blocked_paths=list(item.get("blocked_paths", [])),
+                expected_outputs=list(item.get("expected_outputs", [])),
+                dod_criteria=criteria,
+                risk_level=str(item.get("risk_level", "LOW")),
+                complexity=str(item.get("complexity", "standard")),
+            )
+            created.append(task_id)
+            await self.events.save_event(
+                self.project_id,
+                Event(
+                    project_id=self.project_id,
+                    event_type=EventType.TASK_CREATED,
+                    producer_agent_id=self.agent_id,
+                    payload={"task_id": task_id, "source": "replanning"},
+                ),
+            )
+        return created
+
+    async def _execute_decision(
+        self, task: dict[str, Any], action_type: str, description: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        task_id = str(task["id"])
+        if action_type == "wait":
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "WAIT"}
+        if action_type == "create_task":
+            new_id = await self.tasks.create_task(
+                self.project_id,
+                str(payload["title"]),
+                str(payload["description"]),
+                owner_role=str(payload.get("owner_role") or self.role),
+                priority=int(payload.get("priority", 3)),
+                acceptance_criteria=list(payload.get("acceptance_criteria", [])),
+                allowed_paths=list(payload.get("allowed_paths", [])),
+                blocked_paths=list(payload.get("blocked_paths", [])),
+                expected_outputs=list(payload.get("expected_outputs", [])),
+                required_reviewers=list(payload.get("required_reviewers", [])),
+                dod_criteria=list(payload.get("dod_criteria", [])),
+                risk_level=str(payload.get("risk_level", "LOW")),
+                complexity=str(payload.get("complexity", "standard")),
+            )
+            await self.events.save_event(
+                self.project_id,
+                Event(
+                    project_id=self.project_id,
+                    event_type=EventType.TASK_CREATED,
+                    producer_agent_id=self.agent_id,
+                    payload={"task_id": new_id, "parent_task_id": task_id},
+                ),
+            )
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "TASK_CREATED", "task_id": new_id}
+
+        action = ActionRequest(
+            project_id=self.project_id,
+            agent_id=self.agent_id,
+            task_id=task_id,
+            action_type=action_type,
+            description=description,
+            target_paths=[str(payload["file_path"])] if payload.get("file_path") else [],
+            command=payload.get("command") if isinstance(payload.get("command"), list) else None,
+            database_operation=payload.get("query")
+            if action_type == "execute_db_operation"
+            else None,
+            payload=payload,
+        )
+        code_slot = False
+        if action_type in {"write_file", "write_code"}:
+            code_slot = await self._acquire_capacity(
+                "parallel_code_tasks", self.max_parallel_code_tasks
+            )
+            if not code_slot:
+                await self.tasks.update_task_status(task_id, "PENDING")
+                return {"status": "THROTTLED", "reason": "parallel code task limit reached"}
+        try:
+            execution = await self.execution.request_execution.remote(
+                action.model_dump(mode="json")
+            )
+        finally:
+            if code_slot:
+                await self._release_capacity("parallel_code_tasks")
+        if not execution.get("executed"):
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "BLOCKED", "execution": execution}
+        if action_type not in {"write_file", "write_code"}:
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "ACTION_EXECUTED", "execution": execution}
+
+        result = execution["result"]
+        criteria = list(task.get("dod_criteria") or [])
+        if not criteria:
+            await self.tasks.update_task_status(task_id, "FAILED_VERIFICATION")
+            return {"status": "FAILED_VERIFICATION", "reason": "task has no DoD criterion mapping"}
+        for criterion_id in criteria:
+            await self.dod.add_evidence(
+                self.project_id,
+                criterion_id,
+                "artifact",
+                self.agent_id,
+                summary=f"Artifact {result['path']} stored with checksum {result['checksum_sha256']}",
+                passed=True,
+                artifact_id=result["artifact_id"],
+                checksum_sha256=result["checksum_sha256"],
+                metadata={"task_id": task_id},
+            )
+
+        expected_outputs = [
+            str(item).replace("\\", "/") for item in task.get("expected_outputs") or []
+        ]
+        actual_outputs = [
+            item.replace("\\", "/") for item in await self.tasks.artifact_titles(task_id)
+        ]
+        missing_outputs = [
+            pattern
+            for pattern in expected_outputs
+            if not any(fnmatch.fnmatch(output, pattern) for output in actual_outputs)
+        ]
+        review = await self.reviewer.review_code_patch.remote(
+            project_id=self.project_id,
+            task_id=task_id,
+            criterion_ids=criteria,
+            artifact_id=result["artifact_id"],
+            file_path=result["path"],
+            code_content=str(result.get("review_content", "")),
+        )
+        if not review.get("approved"):
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "FAILED_REVIEW", "review": review}
+
+        security_review: dict[str, Any] | None = None
+        security_required = str(task.get("risk_level")) in {
+            "HIGH",
+            "CRITICAL",
+        } or "security_reviewer" in set(task.get("required_reviewers") or [])
+        if security_required:
+            security_review = await self.safety.review_code_change.remote(
+                project_id=self.project_id,
+                task_id=task_id,
+                criterion_ids=criteria,
+                artifact_id=result["artifact_id"],
+                file_path=result["path"],
+                diff_content=str(result.get("review_content", "")),
+                risk_level=str(task.get("risk_level", "HIGH")),
+            )
+            if not security_review.get("safe"):
+                await self.tasks.update_task_status(task_id, "PENDING")
+                return {
+                    "status": "FAILED_SECURITY_REVIEW",
+                    "review": review,
+                    "security_review": security_review,
+                }
+
+        if missing_outputs:
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {
+                "status": "PARTIAL_OUTPUT",
+                "artifact": result,
+                "review": review,
+                "security_review": security_review,
+                "missing_expected_outputs": missing_outputs,
+            }
+
+        configured_checks = {
+            str(item["criterion_id"]): item
+            for item in await self.dod.get_checks(self.project_id, criteria)
+        }
+        proposed_command = payload.get("test_command")
+        default_command = (
+            [str(token) for token in proposed_command]
+            if isinstance(proposed_command, list) and proposed_command
+            else []
+        )
+        configured_commands = [
+            [str(token) for token in item.get("verification_command", [])]
+            for item in configured_checks.values()
+            if item.get("verification_command")
+        ]
+        if not default_command and configured_commands:
+            default_command = configured_commands[0]
+        criterion_commands = {
+            criterion_id: [
+                str(token)
+                for token in configured_checks.get(criterion_id, {}).get("verification_command", [])
+            ]
+            or default_command
+            for criterion_id in criteria
+        }
+        commands = list(
+            dict.fromkeys(tuple(command) for command in criterion_commands.values() if command)
+        )
+        if not commands:
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "ARTIFACT_REVIEWED", "reason": "test command required before merge"}
+        test_results: dict[tuple[str, ...], dict[str, Any]] = {}
+        for command in commands:
+            command_list = list(command)
+            test_action = ActionRequest(
+                project_id=self.project_id,
+                agent_id=self.agent_id,
+                task_id=task_id,
+                action_type="shell_command",
+                description=f"Verify task {task_id}",
+                command=command_list,
+                payload={"command": command_list},
+            )
+            test_results[command] = await self.execution.request_execution.remote(
+                test_action.model_dump(mode="json")
+            )
+        passed = True
+        for criterion_id in criteria:
+            test_command = criterion_commands[criterion_id]
+            test = test_results.get(tuple(test_command), {})
+            criterion_passed = bool(
+                test.get("executed") and test.get("result", {}).get("exit_code") == 0
+            )
+            passed = passed and criterion_passed
+            await self.dod.add_evidence(
+                self.project_id,
+                criterion_id,
+                "test",
+                self.agent_id,
+                summary=(
+                    f"Command {json.dumps(test_command)} "
+                    f"{'passed' if criterion_passed else 'failed'}"
+                ),
+                passed=criterion_passed,
+                command=json.dumps(test_command),
+                exit_code=test.get("result", {}).get("exit_code") if test.get("executed") else None,
+                metadata={"task_id": task_id},
+            )
+        if not passed:
+            await self.tasks.update_task_status(task_id, "PENDING")
+            return {"status": "FAILED_TEST", "tests": list(test_results.values())}
+        merge = await self.execution.merge_and_finalize_branch.remote(self.agent_id, task_id)
+        if not merge.get("success"):
+            await self.tasks.update_task_status(task_id, "BLOCKED")
+            return {"status": "MERGE_BLOCKED", "merge": merge}
+        completion = Event(
+            project_id=self.project_id,
+            event_type=EventType.TASK_COMPLETED,
+            producer_agent_id=self.agent_id,
+            payload={"task_id": task_id, "artifact_id": result["artifact_id"]},
+        )
+        await self.events.save_event(self.project_id, completion)
+        return {
+            "status": "COMPLETED",
+            "artifact": result,
+            "review": review,
+            "security_review": security_review,
+            "tests": list(test_results.values()),
+            "merge": merge,
+        }
+
+    async def _checkpoint_and_share(self, task_id: str, result: dict[str, Any]) -> None:
+        checkpoint = Checkpoint(
+            project_id=self.project_id,
+            agent_id=self.agent_id,
+            task_id=task_id,
+            achievement=str(result.get("status", "ACTION_PROCESSED")).lower(),
+            summary=json.dumps(result, default=str)[:4000],
+            agent_state_snapshot={"current_task_id": self.current_task_id, "status": self.status},
+        )
+        await self.checkpoints.create.remote(checkpoint.model_dump(mode="json"))
+        await self.mongo.save_agent_state(
+            project_id=self.project_id,
+            agent_id=self.agent_id,
+            state={
+                "current_task_id": self.current_task_id,
+                "status": self.status,
+                "action_counter": self.action_counter,
+            },
+        )
+        try:
+            await self.memory.record_memory.remote(
+                project_id=self.project_id,
+                agent_id=self.agent_id,
+                scope="project_memory",
+                kind="collaboration_update",
+                title=f"Task {task_id} update",
+                content=json.dumps(result, default=str),
+                importance=3,
+                provider_gateway=self.provider,
+                metadata={"task_id": task_id},
+                promote_long_term=True,
+            )
+        except Exception as error:
+            logger.error(
+                "memory_promotion_failed",
+                agent_id=self.agent_id,
+                error_type=type(error).__name__,
+            )
+        event = Event(
+            project_id=self.project_id,
+            event_type=EventType.COLLABORATION_UPDATE,
+            producer_agent_id=self.agent_id,
+            payload={"task_id": task_id, "status": result.get("status")},
+        )
+        await self.events.save_event(self.project_id, event)
+        self.action_counter += 1
+        if self.action_counter % 5 == 0:
+            await self.summaries.generate_local_agent_summary.remote(
+                self.project_id, self.agent_id, self.provider
+            )
 
     async def _heartbeat_loop(self) -> None:
-        """Periodically updates a short-lived heartbeat key in Dragonfly."""
-        heartbeat_key = f"agent:{self.agent_id}:heartbeat"
-        while self.is_running:
+        while self.running:
             try:
-                await self.redis_client.set(heartbeat_key, "ALIVE", ex=30)
+                await self.agents.heartbeat(self.project_id, self.agent_id, self.status)
+                if self.current_task_id:
+                    await self.tasks.renew_lease(self.current_task_id, self.agent_id)
+                key = self.bus.client.key("agent", self.project_id, self.agent_id, "heartbeat")
+                await self.bus.redis.set(key, self.status, ex=30)
                 await asyncio.sleep(10)
-            except Exception as e:
-                logger.warning("heartbeat_failed", agent_id=self.agent_id, error=str(e))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "agent_heartbeat_failed",
+                    agent_id=self.agent_id,
+                    error_type=type(error).__name__,
+                )
                 await asyncio.sleep(5)
+
+    async def _collaboration_loop(self) -> None:
+        interval = self.settings.collaboration_interval_seconds
+        while self.running:
+            try:
+                await asyncio.sleep(interval)
+                event = Event(
+                    project_id=self.project_id,
+                    event_type=EventType.COLLABORATION_UPDATE,
+                    producer_agent_id=self.agent_id,
+                    payload={"status": self.status, "current_task_id": self.current_task_id},
+                )
+                await self.events.save_event(self.project_id, event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "collaboration_update_failed",
+                    agent_id=self.agent_id,
+                    error_type=type(error).__name__,
+                )
+
+    async def _work_poll_loop(self) -> None:
+        """Claim durable work even when no new stream event arrives."""
+
+        interval = max(5, min(15, self.settings.collaboration_interval_seconds))
+        while self.running:
+            try:
+                await asyncio.sleep(interval)
+                if self.status != "IDLE" or self._processing_lock.locked():
+                    continue
+                event = Event(
+                    project_id=self.project_id,
+                    event_type=EventType.AGENT_TRIGGERED,
+                    producer_agent_id="runtime_supervisor",
+                    target_agent_id=self.agent_id,
+                    payload={"reason": "durable_work_poll"},
+                )
+                await self._process_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "agent_work_poll_failed",
+                    agent_id=self.agent_id,
+                    error_type=type(error).__name__,
+                )
+
+    async def stop(self) -> None:
+        self.running = False
+        for task in self._background_tasks:
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        await self.db.disconnect()
+        await self.mongo.close()
+        await self.bus.close()

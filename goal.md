@@ -1,261 +1,138 @@
-# AgentOS Local Goal and Vision
+# AgentOS Local: Product Goal and Acceptance Contract
+
+## Goal
 
-## 1. Project vision
+Given a software or IT delivery request, AgentOS must form a bounded specialist team, execute work through controlled production-grade tooling, collaborate through durable scoped state, and continue until every mandatory Definition of Done criterion has current independently verifiable evidence.
 
-AgentOS Local is a local-first autonomous software delivery platform designed to behave like a dedicated engineering organization running inside a developer-controlled environment.
+The system is an autonomous software-delivery runtime, not a chatbot and not a collection of agents sharing one implicit conversation.
 
-The platform's goal is simple and ambitious:
+## Required product behavior
 
-```text
-Given a software or IT delivery request, dynamically form a specialized team of agents and keep working until the project Definition of Done is fully satisfied with evidence.
-```
+1. A bootstrap PM/Tech Lead converts the request into measurable DoD criteria, a dependency-aware backlog, bounded file ownership, required outputs, and a role plan.
+2. The plan always contains PM, infrastructure, QA, code-review, and security-review responsibility. Role caps and total-agent caps are enforced before actor creation.
+3. An infrastructure agent detects available capacity, preserves host headroom, and distributes CPU, memory, concurrency, provider, and model allocations among agents.
+4. Every working agent is an independent Ray actor with its own actor state, database client, event-bus client, memory cursor, heartbeat, inbox, permissions, and task lease.
+5. Agents communicate frequently through typed events, a durable outbox, per-agent consumer groups, and durable idempotent receipt leases. They share long-term and mid-term memory through explicit scopes, never through shared mutable Python objects.
+6. Workers can use different providers/models. Selection responds to role, purpose, capability, and `low`, `standard`, `high`, or `critical` task complexity.
+7. All provider calls pass through one gateway with a durable pre-egress intent, redaction, egress policy, concurrency, budget, retry/fallback, circuit-breaker, and linked append-only audit enforcement.
+8. All writes and commands pass through governance and execution supervisors. An optional real local Git source is cloned into an isolated managed repository, source work occurs in task-specific Git worktrees, commands run in a bounded network-disabled Docker sandbox, and database actions use a physically separate sandbox database.
+9. Code cannot merge without required outputs, checksummed artifacts, independent review, passing tests/commands, and recorded DoD evidence.
+10. Completion is controlled by the evaluator, not by an agent statement. The evaluator uses the latest evidence for each criterion/evidence type, validates object existence/checksum, and rejects missing or failed evidence.
+11. Empty queues with incomplete DoD trigger replanning. Stagnation, deadlocks, expired leases, unhealthy agents, unsafe behavior, and service failures trigger bounded recovery or a visible blocked state.
+12. The operator can initialize, plan, run, detach, inspect, pause, resume, approve, reject, and diagnose the system from the CLI.
 
-This is not a chatbot. It is not a generic assistant. It is not a task reminder. It is a software delivery operating system for autonomous IT and development work.
+## Data-system contract
 
-## 2. Business problem
+The implementation must use all of these systems through dedicated production clients:
 
-Modern software delivery involves many specialized responsibilities:
+| System | Authority and purpose |
+|---|---|
+| PostgreSQL | Durable source of truth for projects, plans, agents, tasks, event log/outbox, artifacts, DoD/evidence, approvals, provider calls, audit chain, checkpoints, summaries, resource plans, runtime snapshots, and long-term memory metadata |
+| DragonflyDB | Disposable hot coordination: streams, per-agent inboxes, locks, leases, heartbeats, counters, budgets, circuit breakers, and capacity semaphores |
+| MongoDB | Expiring mid-term working memory and recoverable agent runtime state, with project/scope/agent access filters and TTL indexes |
+| MinIO | Versioned object bodies for artifacts and large memory payloads, including SHA-256 metadata |
+| Milvus | Semantic vector lookup over scoped metadata and durable content references; never the source of truth and never sufficient completion evidence |
+
+The runtime must degrade safely: loss of semantic embedding must not erase durable memory; loss of required durable services must block work instead of silently switching to an in-memory substitute.
 
-- product understanding
-- architecture
-- backend development
-- frontend development
-- infrastructure
-- database design
-- QA
-- security
-- documentation
-- CI/CD
-- integration
-- deployment readiness
+## Provider contract
 
-Today, these responsibilities require continuous coordination between people, tools, tickets, repositories, meetings, and review cycles. AI coding assistants help individual developers write code faster, but they do not fully own delivery coordination, cross-agent collaboration, verification, safety, memory, or completion accountability.
+Supported provider families:
 
-AgentOS Local addresses this gap by creating an autonomous engineering team model rather than a single coding assistant model.
+- OpenAI
+- Anthropic / Claude
+- Google Gemini
+- DeepSeek
+- Moonshot AI / Kimi
+- Alibaba AI / Qwen through DashScope
+- Z.AI / GLM
+- MiniMax
+- Ollama
 
-## 3. Product positioning
+Provider support means: a registered profile, credential/base-URL discovery, allowed egress hosts, capability declaration, four complexity-tier model routes, role preferences, and use through the common gateway. It does not mean bundling credentials or claiming a provider call passed without operator credentials.
 
-AgentOS Local should be positioned as:
+The provider registry is configuration-driven. Current default IDs are operational defaults, not hard-coded business logic, and may be overridden without source changes.
 
-```text
-A local autonomous software delivery platform that creates, coordinates, supervises, and governs specialized AI development agents until a project is complete.
-```
+## Resource and independence contract
 
-It is built for:
+Agent independence is structural:
 
-- technical leaders
-- software architects
-- platform engineers
-- startup founders
-- engineering teams
-- internal innovation teams
-- developers who want autonomous delivery support
-- organizations exploring agentic software engineering
+- no worker invokes another worker's methods to perform its task;
+- no worker receives another worker's mutable state;
+- task ownership is acquired transactionally by role and lease;
+- each worker consumes its own inbox and maintains its own cursor/state;
+- shared facts are written to PostgreSQL/MongoDB/MinIO/Milvus and announced via events;
+- collaboration is periodic and achievement-triggered;
+- detached named actors can survive the initiating driver and are explicitly supervised.
 
-## 4. Core value proposition
+Resource safety is layered:
 
-AgentOS Local provides value by enabling:
+- the envelope leaves at least one detected CPU core unused when more than one exists;
+- configured fractions, reserved cores/memory, and absolute maxima are all respected;
+- the infrastructure agent allocates per-agent CPU/memory/concurrency within the envelope;
+- Ray admission control prevents oversubscription at actor scheduling time;
+- thread environment variables prevent numerical libraries from multiplying threads;
+- application semaphores limit active agents, code tasks, and provider calls;
+- Compose and sandbox containers impose CPU, memory, PID, shared-memory, capability, filesystem, and network boundaries.
 
-1. **Autonomous delivery, not just code generation**  
-   The system plans, coordinates, executes, reviews, tests, documents, and verifies.
+If the requested independent team cannot safely fit, planning fails closed instead of silently oversubscribing the host.
 
-2. **Parallel agent execution**  
-   Multiple specialized agents work at the same time without intentionally duplicating or overwriting each other's work.
+## Safety contract
 
-3. **Dynamic team formation**  
-   The first bootstrap PM/Tech Lead agent determines the required team based on the project request.
+- Production credentials must be non-placeholder and injected externally.
+- Requests are sealed with an integrity hash and authenticated against a project-bound `AgentIdentity`.
+- Paths are both task-owned and traversal-safe. Git metadata, environment secrets, provider-key areas, audit stores, and Docker sockets are globally protected.
+- Shell input is a token array; no shell-string execution is accepted.
+- Executables and sandbox images are allowlisted.
+- Sandboxes have no network, no Linux capabilities, no privilege escalation, bounded PIDs/CPU/memory, a read-only root filesystem, and a bounded temporary filesystem.
+- Destructive action patterns are denied by default. Approval records are project-bound, expiring, integrity-bound, and human-attributed.
+- Provider prompts redact recognized credentials and provider responses are schema-validated when JSON is required.
+- Audit and provider-call tables are append-only through database triggers and audit rows form a hash chain.
+- Storage/client failures and watchdog errors are visible; no silent success path exists.
 
-4. **Run-to-DoD execution**  
-   The platform keeps working until the project Definition of Done is satisfied.
+## Completion contract
 
-5. **Safety-first autonomy**  
-   Agents can propose actions, but the runtime decides what is allowed.
+A project reaches `DOD_SATISFIED` only when all mandatory criteria pass. For each criterion, the evaluator requires its configured evidence types and artifacts. Evidence may include:
 
-6. **Local-first control**  
-   The platform runs locally through CLI and Docker, keeping the operator in control.
+- a MinIO artifact whose object exists and whose SHA-256 matches PostgreSQL metadata;
+- a sandbox command with a zero exit code;
+- an independent code/security review with a passing decision;
+- a required path/output produced by the owning task;
+- task completion after successful Git integration.
 
-7. **Provider independence**  
-   AI providers are external and abstracted behind a gateway.
+When retries occur, the latest evidence for a criterion/type/task supersedes earlier attempts. A stale failed test therefore does not permanently poison a repaired task, and a stale passing test cannot override a newer failure.
 
-8. **Persistent memory and auditability**  
-   The platform logs events, checkpoints progress, summarizes achievements, and remembers validated decisions.
+## Production delivery stance
 
-## 5. Target user journey
+AgentOS implements one gated delivery path. It does not use canary or staging branches as substitutes for correctness. Task work is isolated until it passes production-quality review/test/evidence gates, then it merges into the project integration branch.
 
-A technical user starts with a request:
+AgentOS does not autonomously deploy to an external live environment. External production promotion requires a separately authorized deployment integration because credentials, traffic, rollback, regulatory, and blast-radius choices are outside the local delivery request.
 
-```text
-Build an ecommerce website.
-```
+## Acceptance matrix
 
-AgentOS Local should then:
+| Requirement | Implemented proof surface |
+|---|---|
+| Independent agents | Named Ray workers, per-agent clients/state/inboxes, role task claims, leases and heartbeats |
+| Frequent communication | Collaboration/work timers, typed events, PostgreSQL outbox/receipts, Dragonfly streams/per-agent consumer groups |
+| Long/mid-term memories | Lossless PostgreSQL + versioned MinIO + Milvus long-term pipeline; MongoDB TTL working memory |
+| Milvus/Postgres/Dragonfly/MinIO/MongoDB clients | `agentos/storage/clients/` and live integration test |
+| Do not use all cores | `ResourcePlanner`, generated `ResourceEnvelope`, thread limits, Ray and Compose ceilings |
+| Infrastructure agent | `InfrastructureAgentActor` plus persisted resource plan/runtime snapshot |
+| All requested AI providers | `providers.yaml`, `ProviderRegistry`, gateway routing and registry tests |
+| Complexity/model switching | `TaskComplexity`, purpose map, role preference order, per-agent assignments and fallback |
+| Enhanced configuration/models | Typed `Settings`, YAML schema versions, safe expansion, validation, generated runtime config |
+| Production-safe direct path | fail-closed secrets/dependencies, sandbox, review/test/DoD gates, no canary/staging completion path |
+| Documentation | README, architecture plan, goal contract, and subsystem documents aligned to live code |
 
-1. Understand the request.
-2. Define assumptions and scope.
-3. Create an explicit Definition of Done.
-4. Generate a team of specialized agents.
-5. Assign domains, permissions, and memory scopes.
-6. Start agents as Ray actors.
-7. Let agents collaborate through guarded events.
-8. Let agents build, review, test, and refine.
-9. Detect gaps, failures, blockers, and conflicts.
-10. Replan automatically when needed.
-11. Continue until DoD is fully satisfied.
-12. Produce a final delivery package with evidence.
+## Explicit non-goals
 
-## 6. Why this matters
+- Hosted SaaS or enterprise multi-tenancy
+- A web dashboard or public API
+- Fabricated provider credentials or offline provider-success simulation
+- Unreviewed live-environment deployment
+- General personal-assistant/non-IT workflows
+- Treating semantic similarity, checkpoints, or agent confidence as proof of delivery
 
-The next wave of software delivery will not be only about asking an AI tool to write one file or complete one ticket. The larger opportunity is autonomous project execution with:
+## Final success condition
 
-- multiple specialized agents
-- shared but controlled memory
-- durable state
-- evidence-based completion
-- human approval boundaries
-- safety policies
-- real execution environments
-- software delivery discipline
-
-AgentOS Local is designed around that future.
-
-## 7. Product philosophy
-
-### 7.1 DoD-bound, not time-bound
-
-The platform should not stop just because time passed, an agent finished a subtask, or the current queue is empty.
-
-It stops only when:
-
-```text
-All mandatory DoD items are satisfied with evidence.
-```
-
-### 7.2 Autonomous but governed
-
-Agents should be able to decide their next best action, trigger other agents, publish artifacts, and continue delivery.
-
-However, they must not be able to bypass safety.
-
-The rule is:
-
-```text
-Infinite persistence toward the goal.
-Finite permissions for every action.
-```
-
-### 7.3 Local-first by default
-
-The first version should run locally with:
-
-- CLI
-- Docker Compose
-- Ray
-- PostgreSQL
-- Dragonfly
-- local workspaces
-- external AI provider gateway
-
-No UI or public API is required for the first stage.
-
-### 7.4 Agents are workers, not authorities
-
-Agents may reason, propose, and collaborate. They are not trusted authorities.
-
-The runtime owns:
-
-- permissions
-- safety
-- execution
-- memory access
-- approvals
-- audit
-- final DoD status
-
-## 8. Business outcomes
-
-If successful, AgentOS Local should reduce the operational effort required to turn a high-level software request into a working local application.
-
-Expected outcomes:
-
-- faster project bootstrapping
-- less manual coordination
-- better traceability of agent work
-- continuous testing and review
-- clear delivery evidence
-- reduced duplicated effort across agents
-- safer autonomous execution
-- reusable memory and engineering patterns
-
-## 9. Differentiation
-
-AgentOS Local is different from simple coding assistants because it is built around:
-
-- team-level autonomy
-- Ray actor-based long-running agents
-- dynamic team creation
-- scoped shared memory
-- event-driven communication
-- PostgreSQL durability
-- Dragonfly coordination
-- pgvector semantic recall
-- Docker execution isolation
-- guardrails and safety policies
-- continuous checkpoints and summaries
-- DoD-based completion
-
-The product is not only about generating code. It is about managing autonomous software delivery.
-
-## 10. Business constraints
-
-The first version should remain focused.
-
-It should not attempt to solve:
-
-- enterprise multi-tenant access
-- web dashboards
-- hosted SaaS deployment
-- production deployment automation
-- legal/compliance automation
-- general-purpose personal agents
-- non-IT workflows
-
-Those can be future expansions after the local autonomous delivery loop is proven.
-
-## 11. First milestone definition
-
-The first meaningful milestone is not a beautiful UI or a broad marketplace of agents.
-
-The first milestone is:
-
-```text
-A local CLI platform that can create a dynamic Ray-based agent team, persist its state, route guarded events, checkpoint achievements, and safely continue toward a software project DoD.
-```
-
-## 12. Example future success scenario
-
-A user runs:
-
-```text
-agentos run "Build a production-ready ecommerce website with auth, catalog, cart, checkout, admin panel, tests, Docker setup, and documentation."
-```
-
-The platform:
-
-- creates a team
-- defines DoD
-- creates architecture
-- builds backend and frontend in parallel
-- creates contracts
-- runs tests
-- resolves failures
-- reviews security-sensitive areas
-- documents setup
-- runs local deployment
-- verifies all DoD items
-- produces final evidence
-
-The user receives a project that is not merely generated, but verified against the agreed DoD.
-
-## 13. Final goal statement
-
-AgentOS Local exists to become a reliable autonomous software delivery engine: a local, guarded, Ray-powered team of AI development agents that can take a high-level IT/software request, organize itself, collaborate safely, execute in parallel, remember what matters, recover from failures, and keep working until the agreed Definition of Done is fully completed.
+The product goal is satisfied when the runtime can safely turn a software-delivery request into a persisted, resource-bounded, provider-routed independent agent team; execute through real storage, messaging, memory, Git, and sandbox clients; and report completion only from independently verified evidence.

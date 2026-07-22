@@ -1,434 +1,159 @@
 # AgentOS Local
 
-AgentOS Local is a local-first, Python-based autonomous software delivery platform. It is designed to run a dedicated team of IT and development agents that work in parallel, communicate through guarded events, use scoped memory, execute through controlled supervisors, and continue operating until the project Definition of Done is satisfied.
+AgentOS Local is a production-oriented, local-first autonomous software-delivery runtime. A bootstrap PM creates an evidence-bound plan, an infrastructure agent computes a bounded resource envelope, independent Ray actors execute role-owned tasks, and the supervisor continues until every mandatory Definition of Done (DoD) criterion has current passing evidence.
 
-This repository is a starter scaffold. It establishes the architecture, package structure, runtime boundaries, guardrail model, Docker deployment base, PostgreSQL/pgvector schema, Dragonfly coordination layer, Ray actor model, and CLI entry points.
+This repository contains the implemented runtime, not a starter scaffold.
 
-## Vision
+## What is implemented
 
-AgentOS Local is not a general assistant, chatbot, or generic automation tool. It is a specialized software engineering platform. A user should be able to provide a request such as:
+- Independent, restartable Ray worker actors with private runtime state, independent database/bus clients, role-specific permissions, inboxes, task leases, heartbeats, checkpoints, and frequent collaboration events.
+- Supervisor and infrastructure-agent separation. The infrastructure agent detects CPU and memory, preserves host headroom, assigns per-agent CPU/memory/concurrency/provider/model capacity, and persists the generated runtime configuration.
+- PostgreSQL as the durable system of record; DragonflyDB for hot coordination; MongoDB for expiring mid-term memory; MinIO for versioned objects; Milvus for semantic indexes and references.
+- Real client classes for every data system under `agentos/storage/clients/`, used by runtime services rather than merely declared as dependencies.
+- Provider-neutral LiteLLM gateway for OpenAI, Anthropic/Claude, Gemini, DeepSeek, Moonshot/Kimi, Alibaba/Qwen, Z.AI/GLM, MiniMax, and Ollama.
+- Complexity- and role-aware model selection, provider fallback, concurrency caps, budgets, credential redaction, egress-host validation, audit records, and circuit breakers.
+- Git worktree isolation, atomic file writes, versioned MinIO artifacts, sandboxed commands, a physically separate sandbox database, independent code/security review, and test-before-merge enforcement.
+- Transactional PostgreSQL event outbox, Dragonfly Streams delivery, per-agent consumer groups, durable receipt/lease state, stale-message reclaim, scoped shared memory, and catch-up packets.
+- Strict DoD evaluation based on latest artifact, command/test, review, checksum, and required-output evidence. Text similarity cannot mark work complete.
+- Pause, resume, approval, rejection, status, logs, inspection, dependency health, runtime configuration, and guardrail CLI surfaces.
 
-```text
-Build an ecommerce website.
-```
-
-The platform should then:
-
-1. Start a bootstrap PM/Tech Lead agent.
-2. Let that agent define the project DoD, assumptions, team roles, memory scopes, ownership boundaries, and initial plan.
-3. Validate the requested team against configured limits.
-4. Start Ray actor workers for the approved agents.
-5. Let agents communicate through guarded events.
-6. Let agents decide their next best action from events, memory, and DoD gaps.
-7. Execute work only through guarded supervisors.
-8. Checkpoint and summarize progress after achievements.
-9. Continuously evaluate DoD completion.
-10. Continue until all mandatory DoD items are verified with evidence.
-
-## Current scope
-
-This starter version provides:
-
-- Python project skeleton.
-- Typer CLI.
-- Ray actor bootstrap.
-- Bootstrap PM/Tech Lead actor.
-- Generic Agent Worker actor.
-- Runtime supervisor.
-- Governance and policy engine skeleton.
-- Provider gateway placeholder.
-- Memory broker placeholder.
-- Checkpoint manager placeholder.
-- DoD evaluator placeholder.
-- Execution supervisor placeholder.
-- PostgreSQL schema with pgvector support.
-- Dragonfly event bus helper.
-- Dockerfile and Docker Compose.
-- Architecture and business documentation.
-
-It does not yet implement the full autonomous coding loop. The next implementation phase should connect provider calls, persistent repositories, Git workspaces, Docker sandbox execution, event routing, task management, semantic memory retrieval, and DoD verification.
-
-## Core architecture
+## Architecture
 
 ```text
 CLI
- ↓
-Runtime Supervisor Actor
- ↓
-Bootstrap PM/Tech Lead Agent
- ↓
-Validated Dynamic Team Plan
- ↓
-Ray Agent Worker Actors
- ↓
-Agent Governance Layer
- ↓
-Guarded Communication Bus
- ↓
-Scoped Memory Broker
- ↓
-Guarded Action Requests
- ↓
-Execution Supervisor
- ↓
-Docker Sandbox / Git Workspace / Test Database
- ↓
-Checkpoints + Summaries + Audit Logs
- ↓
-DoD Evaluator
- ↓
-Continue until DoD is satisfied
+  -> Runtime Supervisor (lifecycle and policy)
+      -> Bootstrap PM (team, backlog, measurable DoD)
+      -> Infrastructure Agent (resource and provider allocation)
+      -> Independent Ray Workers (role-owned task execution)
+      -> Provider Gateway (all model calls, budgets, failover)
+      -> Memory Broker (Dragonfly + MongoDB + PostgreSQL + MinIO + Milvus)
+      -> Execution Supervisor (policy + Git + Docker sandbox + test DB)
+      -> Reviewer / Security Reviewer / QA evidence
+      -> DoD Evaluator and watchdogs
 ```
 
-## Technology stack
+The supervisor coordinates; it does not share mutable in-process worker state. PostgreSQL and the durable outbox are the cross-process truth. Dragonfly is disposable coordination state, MongoDB is TTL-bound working memory, MinIO stores large/versioned payloads, and Milvus stores semantic vectors plus references. Milvus is not an authority for completion.
 
-| Layer | Technology |
-|---|---|
-| Language | Python 3.11+ |
-| CLI | Typer + Rich |
-| Actor runtime | Ray actors |
-| Durable storage | PostgreSQL |
-| Semantic memory | pgvector inside PostgreSQL |
-| Hot coordination | Dragonfly, Redis-compatible |
-| External AI provider | Provider Gateway, planned LiteLLM adapter |
-| Execution isolation | Docker |
-| Source control integration | Git workspaces and branches, planned |
-| Logging | Structured logs, planned |
-| Guardrails | Runtime policy engine, communication/action/memory guardrails |
+## Required services
 
-## Repository structure
+| Service | Responsibility | Client |
+|---|---|---|
+| PostgreSQL 16 | Projects, plans, agents, tasks, events/outbox, evidence, audit, checkpoints, summaries, memory metadata, runtime snapshots | `PostgresClient` / `asyncpg` |
+| DragonflyDB | Streams, inboxes, locks, leases, budgets, circuit breakers, hot state | `DragonflyClient` / Redis protocol |
+| MongoDB 8 | Mid-term working memory and recoverable agent state with TTL indexes | `MongoDocumentClient` / `AsyncMongoClient` |
+| MinIO | Versioned artifacts and large memory bodies | `MinioObjectClient` / MinIO SDK |
+| Milvus 2.6 | Strong-consistency semantic lookup over scoped references | `MilvusVectorClient` / `MilvusClient` |
 
-```text
-agentos_local/
-├── agentos/
-│   ├── actors/              # Ray actor definitions
-│   ├── checkpoints/         # Achievement checkpoints
-│   ├── cli/                 # Typer CLI
-│   ├── config/              # Settings and environment loading
-│   ├── dod/                 # Definition of Done evaluation
-│   ├── execution/           # Guarded execution supervisor
-│   ├── governance/          # Policy engine and guardrail models
-│   ├── memory/              # Scoped memory broker
-│   ├── messaging/           # Event schemas and Dragonfly helper
-│   ├── provider/            # External AI provider gateway
-│   ├── runtime/             # Runtime supervisor and team plan models
-│   ├── storage/             # PostgreSQL schema
-│   └── watchdogs/           # DoD, stagnation, and safety watchdogs
-├── prompts/                 # Future agent prompt templates
-├── examples/                # Example project requests
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── arch_plan.md
-├── goal.md
-└── README.md
-```
+## Quick start
 
-## Runtime concepts
-
-### 1. Bootstrap agent
-
-The first agent is always the Bootstrap PM/Tech Lead agent. It creates the initial project plan and proposes the team composition. The runtime validates the plan before creating any additional agent actors.
-
-### 2. Ray actors
-
-Each agent worker is a Ray actor. Agents are long-running, stateful workers that can be restarted and restored from durable state. Actor memory is runtime state only. PostgreSQL is the source of truth.
-
-### 3. Event-driven execution
-
-The intended model is not a fixed loop. Agents are triggered by events, catch up from scoped memory, decide the next best action, submit an action request, publish artifacts, checkpoint, summarize, and return to idle.
-
-### 4. Guarded execution
-
-Agents do not directly run shell commands, delete files, modify databases, or call external providers. They propose actions. Supervisors and policy engines decide whether those actions are allowed.
-
-### 5. Run-to-DoD
-
-The platform is DoD-bound, not time-bound. It should run while the DoD is incomplete, and stop only when mandatory DoD items are verified with evidence, or when a safety/approval boundary blocks progress.
-
-## Installation
-
-### Prerequisites
-
-- Docker
-- Docker Compose
-- Python 3.11+
-- Git
-
-### Local Python setup
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install -e .
-```
-
-### Environment setup
+Prerequisites: Docker with Compose, Git, and enough memory for Milvus. The default container ceilings are 4 CPUs and 6 GiB, while the runtime still reserves host CPU/memory headroom.
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and add any required external provider keys. Do not commit `.env`.
-
-## Running with Docker Compose
-
-Start the supporting services:
+Replace every `CHANGE_ME` value, configure at least one AI provider, and never commit `.env`. Set `AGENTOS_SOURCE_REPOSITORY` to an existing Git worktree visible to the runtime process when a run must begin from real source; the execution service clones that source into its managed repository before creating task worktrees. Under Compose, seed the repository inside the `/workspaces` volume or add an explicit read-only bind mount and use its container path. Then:
 
 ```bash
-docker compose up -d postgres dragonfly
+docker compose config --quiet
+docker compose up -d postgres sandbox-postgres dragonfly mongodb minio etcd milvus docker-proxy
+docker compose run --rm agentos doctor
+docker compose run --rm agentos init my-project
+docker compose run --rm agentos runtime-config
+docker compose run --rm agentos run "Build the requested production software"
 ```
 
-Build the application image:
+`doctor` verifies all five required stores. A missing provider does not make storage unhealthy, but `run` persists the plan and enters `BLOCKED_REQUIRES_INPUT` instead of inventing credentials or pretending workers ran.
 
-```bash
-docker compose build agentos
-```
+The Compose stack binds developer-facing service ports to nonstandard localhost defaults (`55432`, `56380`, `57017`, `59000`, `59001`) to avoid common local collisions. Internal service traffic stays on an isolated Docker network.
 
-Check status:
+## Direct production policy
 
-```bash
-docker compose run --rm agentos status
-```
+AgentOS has one delivery path. There is no canary/staging implementation that can be mistaken for completion. Each task is developed on an isolated Git worktree and reaches the integration branch only after artifact checks, independent review, sandbox verification, and evidence gates pass. Deployment to an external production environment is intentionally outside this runtime; AgentOS produces production-grade source and delivery evidence, not unapproved infrastructure promotion.
 
-Run a bootstrap plan:
+Production configuration fails closed when credentials are missing, default/placeholder passwords remain, the sandbox database equals the control database, or an external MinIO/Milvus connection is configured without required TLS/authentication.
 
-```bash
-docker compose run --rm agentos plan "Build an ecommerce website"
-```
+## Provider configuration
 
-Start a starter runtime run:
+Configure one or more:
 
-```bash
-docker compose run --rm agentos run "Build an ecommerce website"
-```
+| Provider | Credential |
+|---|---|
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic / Claude | `ANTHROPIC_API_KEY` |
+| Google Gemini | `GEMINI_API_KEY` |
+| DeepSeek | `DEEPSEEK_API_KEY` |
+| Moonshot / Kimi | `MOONSHOT_API_KEY` |
+| Alibaba / Qwen | `DASHSCOPE_API_KEY` |
+| Z.AI / GLM | `ZAI_API_KEY` |
+| MiniMax | `MINIMAX_API_KEY` |
+| Ollama | `OLLAMA_API_BASE` |
 
-## Running locally without Docker for the Python process
+Default model routes and role preferences live in `agentos/config/providers.yaml`. Override any tier with variables such as `OPENAI_MODEL_LOW`, `OPENAI_MODEL_STANDARD`, `OPENAI_MODEL_HIGH`, and `OPENAI_MODEL_CRITICAL`. Every model identifier includes the provider prefix required by LiteLLM.
 
-Start Postgres, Dragonfly, and Ray through Docker Compose:
+Provider calls never happen directly from workers. Before egress, the gateway persists an append-only call intent, validates availability/capabilities and the egress destination, selects by task complexity, redacts credentials, and reserves budget atomically. It then applies timeouts/concurrency limits, records hashes and usage against the intent, and fails over only to eligible configured providers.
 
-```bash
-docker compose up -d postgres dragonfly ray-head
-```
+## Resource controls
 
-Then run:
+Important environment variables:
 
-```bash
-agentos status
-agentos plan "Build an ecommerce website"
-agentos run "Build an ecommerce website"
-```
+- `AGENTOS_CPU_USAGE_FRACTION`, `AGENTOS_RESERVED_CPU_CORES`, `AGENTOS_MAX_CPU_CORES`
+- `AGENTOS_MEMORY_USAGE_FRACTION`, `AGENTOS_RESERVED_MEMORY_BYTES`, `AGENTOS_MAX_MEMORY_BYTES`
+- `AGENTOS_WORKER_CPU`, `AGENTOS_WORKER_MEMORY_BYTES`, `AGENTOS_MAX_ACTIVE_AGENTS`
+- `AGENTOS_MAX_PARALLEL_CODE_TASKS`, `AGENTOS_MAX_THREADS_PER_AGENT`
+- `AGENTOS_CONTAINER_CPUS`, `AGENTOS_CONTAINER_MEMORY`, `AGENTOS_SHM_SIZE`
 
-For local Ray without the Ray container, unset `RAY_ADDRESS` and the supervisor will initialize an embedded local Ray runtime.
+The planner always leaves at least one detected core unallocated on multi-core hosts. Ray resources are admission-control quantities, so the runtime also sets BLAS/OpenMP thread ceilings, enforces concurrency semaphores, and relies on container CPU/memory/PID limits for hard execution boundaries.
 
-## CLI commands
-
-### Initialize a project workspace
-
-```bash
-agentos init ecommerce-demo
-```
-
-Creates:
+## CLI
 
 ```text
-workspace/ecommerce-demo/
-├── source/
-├── artifacts/
-├── logs/
-├── summaries/
-├── checkpoints/
-└── .agentos/project.json
+agentos init PROJECT_NAME
+agentos plan REQUEST
+agentos run REQUEST [--detach]
+agentos runtime-config [--agent ROLE ...] [--output FILE]
+agentos doctor
+agentos status [--project-id UUID]
+agentos logs PROJECT_ID [--limit N]
+agentos inspect PROJECT_ID
+agentos pause PROJECT_ID
+agentos resume PROJECT_ID
+agentos approve APPROVAL_ID --approver NAME
+agentos reject APPROVAL_ID --approver NAME --reason TEXT
+agentos guardrail-check TEXT
 ```
-## Running tests
+
+`run` waits for evidence-backed completion by default. `--detach` uses named detached Ray actors; status is persisted in PostgreSQL. `resume` rechecks dependencies and provider availability before worker execution resumes.
+
+## Development and verification
 
 ```bash
-pytest
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pip install -e .
+ruff format --check agentos
+ruff check agentos
+mypy agentos
+pytest -q -m "not integration"
+python -m compileall -q agentos
 ```
-## Known limitations
 
-This is a starter scaffold. A few things are defined but not fully wired up yet:
-
-- `StagnationWatchdog` currently fails silently every cycle due to a query
-  string bug (missing `f`-string prefix), so loop/stagnation detection does
-  not actually run yet.
-- `REQUIRE_HUMAN_APPROVAL` / `REQUIRE_REVIEW` policy decisions are returned
-  by the guardrail engine, but nothing yet routes these to an actual human
-  reviewer — they currently just block the action for that round.
-- `TRIGGER_REPLANNING` (from `DoDWatchdog`) is detected but no automatic
-  replanning logic consumes it yet.
-- `AgentIdentity` model is defined but not yet constructed/used anywhere.
-
-### Preview the bootstrap plan
+Run the real storage round-trip against Compose:
 
 ```bash
-agentos plan "Build an ecommerce website"
+RUN_AGENTOS_INTEGRATION=1 pytest -q -m integration
 ```
 
-This starts the bootstrap actor, creates a deterministic starter team plan, validates it against configured max agents, and creates starter Ray actors.
+The integration test initializes and round-trips PostgreSQL, DragonflyDB, MongoDB, MinIO, and Milvus through the production client classes. It also proves native JSON codecs/outbox insertion, cross-project trigger rejection, the lossless PostgreSQL-MinIO-MongoDB memory saga, and a restricted Docker sandbox command. The runtime Docker image excludes development tooling; build the test target with `docker build --target test -t agentos-local:test .`.
 
-### Start the runtime
+## Operational cautions
 
-```bash
-agentos run "Build an ecommerce website"
-```
+- This is a single-host local runtime, not a multi-tenant hosted control plane.
+- Store secrets only in environment/secret injection. The gateway redacts prompt material but cannot make a leaked repository secret safe.
+- Back up PostgreSQL, MongoDB, MinIO, and Milvus volumes according to your recovery objectives.
+- Changing `AGENTOS_EMBEDDING_DIMENSION` requires a new compatible Milvus collection.
+- Legacy pre-polyglot schemas are rejected; AgentOS will not perform a destructive in-place migration.
+- No provider credential is bundled. Provider availability and billing remain operator responsibilities.
 
-The starter scaffold creates the agent team. Future iterations should continue from here into event routing, task creation, Git branches, sandboxed execution, review, tests, and DoD evaluation.
-
-### Inspect configuration status
-
-```bash
-agentos status
-```
-
-### Test guardrail classification
-
-```bash
-agentos guardrail-check "drop database ecommerce"
-```
-
-Expected behavior: the policy engine classifies this as critical and denies it unless destructive actions are explicitly allowed and approved.
-
-## Safety model
-
-AgentOS Local follows a zero-trust agent runtime model.
-
-Rules:
-
-- Agents may reason freely.
-- Agents may communicate through guarded event envelopes.
-- Agents may propose actions.
-- Agents may not execute sensitive actions directly.
-- The runtime decides what is allowed.
-- Destructive actions are denied or escalated.
-- Memory access is scoped.
-- Provider calls go through the gateway.
-- Audit logs are append-only in the target design.
-
-Examples of blocked or approval-required actions:
-
-- Drop database.
-- Drop table.
-- Truncate persistent data.
-- Delete checkpoints.
-- Delete audit logs.
-- Disable guardrails.
-- Disable tests silently.
-- Modify provider keys.
-- Access secrets without policy.
-- Self-approve critical actions.
-
-## Memory model
-
-AgentOS Local uses two memory categories:
-
-### Short-term memory
-
-Backed by Dragonfly. Intended for:
-
-- active events
-- locks
-- leases
-- heartbeats
-- hot context
-- active work state
-- budget counters
-
-### Long-term memory
-
-Backed by PostgreSQL. Intended for:
-
-- events
-- checkpoints
-- summaries
-- decisions
-- tasks
-- artifacts
-- DoD evidence
-- provider call audit records
-- memory items
-- embeddings through pgvector
-
-### Vector index
-
-The vector index is a semantic recall layer, not the source of truth. It should store summaries and retrieval handles, not raw secrets, raw logs, or full repository dumps.
-
-Use pgvector for:
-
-- catch-up packet retrieval
-- duplicate task detection
-- similar failure lookup
-- semantic code map
-- contract impact analysis
-- DoD gap similarity
-- long-term lessons learned
-
-## Development roadmap
-
-### Phase 1: Foundation
-
-- Finish PostgreSQL repository layer.
-- Add database migrations.
-- Persist projects, agents, events, checkpoints, and summaries.
-- Connect Dragonfly streams to Trigger Engine.
-- Add structured logging.
-
-### Phase 2: Provider integration
-
-- Implement LiteLLM adapter.
-- Add budget tracking.
-- Add redaction policy.
-- Add provider call audit records.
-- Add output safety checks.
-
-### Phase 3: Memory retrieval
-
-- Implement memory ACLs.
-- Add embeddings creation pipeline.
-- Add pgvector retrieval.
-- Add catch-up packet generation.
-- Add memory promotion from raw events to validated long-term memories.
-
-### Phase 4: Task and event runtime
-
-- Implement event router.
-- Implement trigger engine.
-- Implement task model and dependency handling.
-- Add ownership locks.
-- Add agent subscriptions.
-
-### Phase 5: Execution layer
-
-- Add Git branch/worktree manager.
-- Add Docker sandbox runner.
-- Add patch application workflow.
-- Add test/lint/build runners.
-- Enforce allowed paths and command policies.
-
-### Phase 6: Review and DoD loop
-
-- Add reviewer agent flows.
-- Add QA agent flows.
-- Add DoD evidence model.
-- Add DoD watchdog.
-- Add stagnation and deadlock detection.
-- Implement run-until-DoD runtime behavior.
-
-## Development standards
-
-- Keep agents domain-restricted to IT and software development.
-- Every action must be logged.
-- Every meaningful achievement must create a checkpoint.
-- Every completed checkpoint should create or update a summary.
-- Do not allow raw agent execution of shell/database/file operations.
-- Use PostgreSQL as truth and Dragonfly as coordination/cache.
-- Use pgvector only for semantic recall.
-- Use deterministic guardrails for known-dangerous actions.
-- Use reviewer/safety agents for ambiguous engineering risk.
-- Require evidence for every DoD item.
-
-## License
-
-Add your preferred license before public release.
+See [arch_plan.md](arch_plan.md) for the implementation contract, [goal.md](goal.md) for acceptance criteria, and `docs/` for subsystem details.

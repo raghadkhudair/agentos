@@ -1,71 +1,105 @@
+schema_version: 2
+
 team_constraints:
   role_caps:
     PM_TECH_LEAD: 1
+    INFRASTRUCTURE_AGENT: 1
     SOLUTION_ARCHITECT: 2
-  mandatory_safety_additions:
-    if_roles_present: ["BACKEND_DEVELOPER", "FRONTEND_DEVELOPER"]
-    inject_roles: ["PM_TECH_LEAD", "SECURITY_REVIEWER"]
-    
+    SECURITY_REVIEWER: 2
+    CODE_REVIEWER: 3
+  mandatory_roles: [PM_TECH_LEAD, INFRASTRUCTURE_AGENT, SECURITY_REVIEWER, CODE_REVIEWER, QA_ENGINEER]
+
 roles:
   - role: PM_TECH_LEAD
-    description: "Owns planning, coordination, and overall delivery gating."
-    default_memory_scopes: ["project_memory", "decision_memory", "execution_memory"]
-    allowed_action_categories: ["plan", "summarize", "assign", "evaluate_dod"]
-    default_event_subscriptions: ["PROJECT_CREATED", "TASK_COMPLETED", "CHECKPOINT_CREATED", "BLOCKER_CREATED"]
+    description: Owns planning, coordination, replanning, and final delivery gating.
+    default_memory_scopes: [project_memory, decision_memory, execution_memory, squad_memory]
+    allowed_action_categories: [create_task, publish_event, create_summary, evaluate_dod, wait]
+    default_event_subscriptions: [PROJECT_CREATED, TASK_COMPLETED, CHECKPOINT_CREATED, BLOCKER_CREATED, RESOURCE_PLAN_UPDATED]
+    provider_preferences: [openai, anthropic, gemini]
+
+  - role: INFRASTRUCTURE_AGENT
+    description: Determines resource needs and distributes bounded CPU, memory, concurrency, and provider capacity.
+    default_memory_scopes: [project_memory, decision_memory, execution_memory, infrastructure_memory]
+    allowed_action_categories: [publish_event, create_summary, inspect_resources, propose_resource_plan, wait]
+    default_event_subscriptions: [PROJECT_CREATED, AGENT_HEALTH_CHANGED, RESOURCE_PRESSURE]
+    provider_preferences: [deepseek, openai, alibaba, ollama]
 
   - role: SOLUTION_ARCHITECT
-    description: "Designs API contracts, system components, and architectural records."
-    default_memory_scopes: ["project_memory", "decision_memory", "contract_memory"]
-    allowed_action_categories: ["design", "review", "publish_contract"]
-    default_event_subscriptions: ["PROJECT_CREATED", "CONTRACT_CHANGE", "REVIEW_REQUEST"]
+    description: Designs contracts, system components, integration boundaries, and architecture decisions.
+    default_memory_scopes: [project_memory, decision_memory, contract_memory, squad_memory]
+    allowed_action_categories: [read_file, write_file, create_task, publish_event, create_summary, wait]
+    default_event_subscriptions: [PROJECT_CREATED, CONTRACT_CHANGE, REVIEW_REQUEST, BLOCKER_CREATED]
+    provider_preferences: [anthropic, openai, gemini, deepseek]
 
   - role: BACKEND_DEVELOPER
-    description: "Writes backend logic, code modules, databases, and structural asserts."
-    default_memory_scopes: ["project_memory", "squad_memory", "contract_memory", "decision_memory", "private_agent_memory"]
-    allowed_action_categories: ["implement", "test", "publish_artifact"]
-    default_event_subscriptions: ["PROJECT_CREATED", "TASK_CREATED", "CONTRACT_CHANGE"]
+    description: Implements backend logic, APIs, data access, migrations, and tests within task boundaries.
+    default_memory_scopes: [project_memory, squad_memory, contract_memory, decision_memory, private_agent_memory, execution_memory]
+    allowed_action_categories: [read_file, write_file, shell_command, create_task, publish_event, wait]
+    default_event_subscriptions: [PROJECT_CREATED, TASK_CREATED, CONTRACT_CHANGE, REVIEW_RESULT, TEST_RESULT]
+    provider_preferences: [deepseek, alibaba, openai, ollama]
 
   - role: FRONTEND_DEVELOPER
-    description: "Crafts client application elements, layout systems, and views."
-    default_memory_scopes: ["project_memory", "squad_memory", "contract_memory", "decision_memory", "private_agent_memory"]
-    allowed_action_categories: ["implement", "test", "publish_artifact"]
-    default_event_subscriptions: ["PROJECT_CREATED", "TASK_CREATED", "CONTRACT_CHANGE"]
+    description: Implements accessible client interfaces and tests within task ownership boundaries.
+    default_memory_scopes: [project_memory, squad_memory, contract_memory, decision_memory, private_agent_memory, execution_memory]
+    allowed_action_categories: [read_file, write_file, shell_command, create_task, publish_event, wait]
+    default_event_subscriptions: [PROJECT_CREATED, TASK_CREATED, CONTRACT_CHANGE, REVIEW_RESULT, TEST_RESULT]
+    provider_preferences: [anthropic, gemini, openai, alibaba]
 
   - role: PLATFORM_ENGINEER
-    description: "Builds Docker wrappers, sandboxes, and integration lifecycles."
-    default_memory_scopes: ["project_memory", "squad_memory", "decision_memory", "private_agent_memory"]
-    allowed_action_categories: ["configure", "test", "publish_artifact"]
-    default_event_subscriptions: ["PROJECT_CREATED", "TASK_CREATED", "SECURITY_ALERT"]
+    description: Implements deployment, observability, sandbox, and CI assets through controlled execution.
+    default_memory_scopes: [project_memory, squad_memory, decision_memory, private_agent_memory, infrastructure_memory, execution_memory]
+    allowed_action_categories: [read_file, write_file, shell_command, create_task, publish_event, wait]
+    default_event_subscriptions: [PROJECT_CREATED, TASK_CREATED, SECURITY_ALERT, RESOURCE_PLAN_UPDATED]
+    provider_preferences: [deepseek, openai, alibaba, ollama]
 
   - role: QA_ENGINEER
-    description: "Asserts acceptance criteria and collects delivery execution proof."
-    default_memory_scopes: ["project_memory", "squad_memory", "contract_memory", "execution_memory"]
-    allowed_action_categories: ["test", "verify", "publish_report"]
-    default_event_subscriptions: ["PROJECT_CREATED", "REVIEW_REQUEST", "TEST_RESULT"]
+    description: Executes acceptance checks and records immutable delivery evidence.
+    default_memory_scopes: [project_memory, squad_memory, contract_memory, execution_memory]
+    allowed_action_categories: [read_file, shell_command, publish_event, submit_evidence, wait]
+    default_event_subscriptions: [PROJECT_CREATED, REVIEW_REQUEST, TEST_RESULT, TASK_COMPLETED]
+    provider_preferences: [gemini, openai, deepseek, ollama]
 
   - role: CODE_REVIEWER
-    description: "Reviews code patches for quality, correctness, and maintainability before merge."
-    default_memory_scopes: ["project_memory", "contract_memory", "decision_memory"]
-    allowed_action_categories: ["review", "approve_patch", "request_changes"]
-    default_event_subscriptions: ["PROJECT_CREATED", "REVIEW_REQUEST"]
-    
-  - role: SECURITY_REVIEWER
-    description: "Inspects logic paths for vulnerabilities or safety boundary violations."
-    default_memory_scopes: ["project_memory", "security_memory", "decision_memory"]
-    allowed_action_categories: ["review", "block", "quarantine_recommendation"]
-    default_event_subscriptions: ["PROJECT_CREATED", "ACTION_REQUEST", "SECURITY_ALERT"]
+    description: Reviews patches for correctness and maintainability before integration.
+    default_memory_scopes: [project_memory, contract_memory, decision_memory, execution_memory]
+    allowed_action_categories: [read_file, publish_event, submit_evidence, wait]
+    default_event_subscriptions: [PROJECT_CREATED, REVIEW_REQUEST, TASK_COMPLETED]
+    provider_preferences: [anthropic, openai, gemini, deepseek]
 
-# Used only if the LLM bootstrap call fails and create_team_plan() must fall back
-# to a deterministic minimal team instead of crashing the whole run.
+  - role: SECURITY_REVIEWER
+    description: Reviews security-sensitive behavior and can recommend quarantine without executing work.
+    default_memory_scopes: [project_memory, security_memory, decision_memory, execution_memory]
+    allowed_action_categories: [read_file, publish_event, submit_evidence, quarantine_recommendation, wait]
+    default_event_subscriptions: [PROJECT_CREATED, ACTION_REQUESTED, SECURITY_ALERT, REVIEW_REQUEST]
+    provider_preferences: [openai, anthropic, deepseek, gemini]
+
 fallback_team:
-  project_name: "emergency-fallback-project"
+  project_name: emergency-fallback-project
+  high_level_architecture: Guarded local delivery runtime using the configured production services.
   dod:
-    - "Code base executes"
-    - "Verify output standards"
-  assumptions:
-    - "Fallback mode active"
+    - criterion_id: runtime-health
+      description: All required runtime services pass their health checks.
+      verification_type: composite
+      required_evidence_types: [test, review]
+    - criterion_id: delivery-evidence
+      description: Requested artifacts and verification evidence are present.
+      verification_type: composite
+      required_evidence_types: [artifact, test, review]
+  assumptions: [Provider planning failed; deterministic safety roster activated.]
   agents:
     - role: PM_TECH_LEAD
       count: 1
-      description: "Fallback coordinator"
-      
+      description: Fallback coordinator.
+    - role: INFRASTRUCTURE_AGENT
+      count: 1
+      description: Fallback resource planner.
+    - role: SECURITY_REVIEWER
+      count: 1
+      description: Fallback security gate.
+    - role: CODE_REVIEWER
+      count: 1
+      description: Fallback review gate.
+    - role: QA_ENGINEER
+      count: 1
+      description: Fallback evidence gate.
+  initial_backlog: []

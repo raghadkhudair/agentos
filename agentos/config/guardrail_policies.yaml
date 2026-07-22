@@ -62,14 +62,14 @@ medium_risk_shell_action_types:
   - "shell_command"
   - "run_command"
   - "edit_file"
+  - "write_file"
+  - "write_code"
   - "create_branch"
   - "update_documentation"
   - "publish_artifact"
 
 low_risk_action_types:
   - "read_file"
-  - "write_file"
-  - "write_code"
   - "run_tests"
   - "create_summary"
   - "search_memory"
@@ -78,18 +78,11 @@ low_risk_action_types:
 filesystem_safety:
   blocked_global_paths:
     - ".env"
-    - "schema.sql"
-    - "guardrail_policies.yaml"
-    - "settings.py"
     - "secrets"
-    - "logs"
     - "provider_keys"
     - "audit_logs"
-    - "checkpoints"
-    - ".github/workflows"
-    - ".gitlab-ci.yml"
+    - ".git"
     - "docker.sock"
-    - "policy_engine.py"
 
 
 safety_watchdog:
@@ -102,6 +95,7 @@ stagnation_watchdog:
   
 prompt_sanitization_patterns:
   - '\.env'
+  - '(?i)(api[_-]?key|access[_-]?key|secret[_-]?key|password)\s*[:=]'
   - 'ignore\s+previous\s+instructions'
   - 'disable\s+guardrails'
   - 'system_policies'

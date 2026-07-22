@@ -1,46 +1,287 @@
+name: agentos
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - agentos_internal
+
 services:
-  agentos:
-    build: .
-    container_name: agentos-local
-    shm_size: "2gb"
-    env_file:
-      - .env
-    working_dir: /app
-    volumes:
-      - ./:/app
-      - ../agentos_sandbox_mirrors:/tmp/agentos_sandbox
-      - ./data:/data
-      - ./logs:/logs
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - postgres
-      - dragonfly
-    entrypoint: ["tail", "-f", "/dev/null"]
-
-
   postgres:
-    image: pgvector/pgvector:pg16
-    container_name: agentos-postgres
+    <<: *service-defaults
+    image: postgres:16.9-alpine
     environment:
-      POSTGRES_DB: agentos
-      POSTGRES_USER: agentos
-      POSTGRES_PASSWORD: agentos
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
     volumes:
-      - postgresdata:/var/lib/postgresql/data
-      - ./agentos/storage/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+      - ./agentos/storage/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    ports:
+      - "127.0.0.1:${AGENTOS_POSTGRES_HOST_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    cpus: 1.0
+    mem_limit: 1g
+
+  sandbox-postgres:
+    <<: *service-defaults
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: agentos_sandbox
+      POSTGRES_USER: agentos_sandbox
+      POSTGRES_PASSWORD: ${SANDBOX_POSTGRES_PASSWORD:?required}
+    tmpfs:
+      - /var/lib/postgresql/data:size=1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentos_sandbox -d agentos_sandbox"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    cpus: 0.75
+    mem_limit: 1g
 
   dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
-    container_name: agentos-dragonfly
-    ports:
-      - "6380:6379"  # Kept on 6380 so it doesn't conflict with Ray's 6379 port!
-    ulimits:
-      memlock: -1
+    <<: *service-defaults
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.30.3
+    command:
+      - "--requirepass=${DRAGONFLY_PASSWORD:?required}"
+      - "--maxmemory=1gb"
+      - "--proactor_threads=2"
     volumes:
-      - dragonflydata:/data
+      - dragonfly_data:/data
+    ports:
+      - "127.0.0.1:${AGENTOS_DRAGONFLY_HOST_PORT:-56380}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$DRAGONFLY_PASSWORD ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      DRAGONFLY_PASSWORD: ${DRAGONFLY_PASSWORD:?required}
+    cpus: 1.0
+    mem_limit: 1250m
+
+  mongodb:
+    <<: *service-defaults
+    image: mongo:8.0.12
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?required}
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "127.0.0.1:${AGENTOS_MONGODB_HOST_PORT:-57017}:27017"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep 1"]
+      interval: 10s
+      timeout: 8s
+      retries: 15
+    cpus: 1.0
+    mem_limit: 1500m
+
+  minio:
+    <<: *service-defaults
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:${AGENTOS_MINIO_API_HOST_PORT:-59000}:9000"
+      - "127.0.0.1:${AGENTOS_MINIO_CONSOLE_HOST_PORT:-59001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    cpus: 1.0
+    mem_limit: 1250m
+
+  etcd:
+    <<: *service-defaults
+    image: quay.io/coreos/etcd:v3.5.18
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    cpus: 0.5
+    mem_limit: 512m
+
+  milvus:
+    <<: *service-defaults
+    image: milvusdb/milvus:v2.6.4
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?required}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?required}
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 8s
+      retries: 20
+    cpus: 2.0
+    mem_limit: 3g
+
+  docker-proxy:
+    <<: *service-defaults
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      INFO: 1
+      POST: 1
+      DELETE: 1
+      NETWORKS: 0
+      VOLUMES: 0
+      BUILD: 0
+      EXEC: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    tmpfs:
+      - /run
+      - /tmp
+    cpus: 0.25
+    mem_limit: 128m
+
+  agentos:
+    <<: *service-defaults
+    restart: "no"
+    build:
+      context: .
+      target: runtime
+    init: true
+    shm_size: ${AGENTOS_SHM_SIZE:-512m}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AGENTOS_ENV: ${AGENTOS_ENV:-production}
+      AGENTOS_PROJECT_NAME: ${AGENTOS_PROJECT_NAME:-agentos-project}
+      AGENTOS_WORKSPACE: /workspaces
+      AGENTOS_CPU_USAGE_FRACTION: ${AGENTOS_CPU_USAGE_FRACTION:-0.70}
+      AGENTOS_RESERVED_CPU_CORES: ${AGENTOS_RESERVED_CPU_CORES:-1}
+      AGENTOS_MAX_CPU_CORES: ${AGENTOS_MAX_CPU_CORES:-4}
+      AGENTOS_MAX_MEMORY_BYTES: ${AGENTOS_MAX_MEMORY_BYTES:-4294967296}
+      DATABASE_URL: ${DATABASE_URL:?required}
+      DRAGONFLY_URL: ${DRAGONFLY_URL:?required}
+      MONGODB_URL: ${MONGODB_URL:?required}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-agentos}
+      MILVUS_URI: http://milvus:19530
+      MILVUS_DATABASE: ${MILVUS_DATABASE:-default}
+      MILVUS_TOKEN: ${MILVUS_TOKEN:-}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?required}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?required}
+      MINIO_SECURE: "false"
+      SANDBOX_DATABASE_URL: ${SANDBOX_DATABASE_URL:?required}
+      DOCKER_HOST: tcp://docker-proxy:2375
+      AGENTOS_SANDBOX_WORKSPACE_VOLUME: agentos_workspaces
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      ZAI_API_KEY: ${ZAI_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      OLLAMA_API_BASE: ${OLLAMA_API_BASE:-}
+      AGENTOS_EMBEDDING_MODEL: ${AGENTOS_EMBEDDING_MODEL:-openai/text-embedding-3-small}
+      AGENTOS_EMBEDDING_DIMENSION: ${AGENTOS_EMBEDDING_DIMENSION:-1536}
+    command: ["run", "${AGENTOS_REQUEST:?Set AGENTOS_REQUEST in .env}"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      sandbox-postgres: {condition: service_healthy}
+      dragonfly: {condition: service_healthy}
+      mongodb: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      milvus: {condition: service_healthy}
+      docker-proxy: {condition: service_started}
+    volumes:
+      - agentos_workspaces:/workspaces
+    networks:
+      - agentos_internal
+      - agentos_egress
+    cpus: ${AGENTOS_CONTAINER_CPUS:-4.0}
+    mem_limit: ${AGENTOS_CONTAINER_MEMORY:-6g}
+
+  integration-test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    init: true
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["-q", "-m", "integration"]
+    environment:
+      AGENTOS_ENV: test
+      AGENTOS_WORKSPACE: /workspaces
+      RUN_AGENTOS_INTEGRATION: "1"
+      DATABASE_URL: ${DATABASE_URL:?required}
+      POSTGRES_POOL_MIN_SIZE: 1
+      POSTGRES_POOL_MAX_SIZE: 2
+      DRAGONFLY_URL: ${DRAGONFLY_URL:?required}
+      MONGODB_URL: ${MONGODB_URL:?required}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-agentos}
+      MILVUS_URI: http://milvus:19530
+      MILVUS_DATABASE: ${MILVUS_DATABASE:-default}
+      MILVUS_TOKEN: ${MILVUS_TOKEN:-}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?required}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?required}
+      MINIO_SECURE: "false"
+      SANDBOX_DATABASE_URL: ${SANDBOX_DATABASE_URL:?required}
+      DOCKER_HOST: tcp://docker-proxy:2375
+      AGENTOS_SANDBOX_WORKSPACE_VOLUME: agentos_workspaces
+    depends_on:
+      postgres: {condition: service_healthy}
+      sandbox-postgres: {condition: service_healthy}
+      dragonfly: {condition: service_healthy}
+      mongodb: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      milvus: {condition: service_healthy}
+      docker-proxy: {condition: service_started}
+    volumes:
+      - agentos_workspaces:/workspaces
+    networks:
+      - agentos_internal
+    cpus: 2.0
+    mem_limit: 3g
+
+networks:
+  agentos_internal:
+    internal: true
+  agentos_egress:
 
 volumes:
-  postgresdata:
-  dragonflydata:
+  postgres_data:
+  dragonfly_data:
+  mongodb_data:
+  minio_data:
+  etcd_data:
+  milvus_data:
+  agentos_workspaces:
+    name: agentos_workspaces

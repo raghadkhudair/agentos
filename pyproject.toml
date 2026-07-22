@@ -4,20 +4,55 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentos-local"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local-first Ray-powered autonomous software delivery agent platform."
 requires-python = ">=3.11"
 readme = "README.md"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.4,<9",
+    "pytest-asyncio>=1,<2",
+    "pytest-cov>=6,<7",
+    "ruff>=0.12,<1",
+    "mypy>=1.16,<2",
+    "black>=25.1,<26",
+    "packaging>=24,<27",
+    "setuptools>=68,<82",
+]
 
 [project.scripts]
 agentos = "agentos.cli.main:app"
 
 [tool.setuptools.packages.find]
 include = ["agentos*"]
+exclude = ["agentos.tests*"]
+
+[tool.setuptools.package-data]
+"agentos.config" = ["*.yaml", "*.yml"]
+"agentos.storage" = ["schema.sql"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["E501", "S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"agentos/tests/*" = ["S106"]
+"agentos/tests/test_packaging.py" = ["S603"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["agentos/tests"]
+markers = ["integration: requires the Docker Compose service stack"]
+addopts = "--strict-markers"
 
 [tool.black]
 line-length = 100
@@ -25,7 +60,9 @@ line-length = 100
 target-version = ["py311"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
 warn_unused_ignores = true
 warn_return_any = true
+exclude = ["agentos/tests"]

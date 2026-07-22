@@ -1,26 +1,41 @@
+schema_version: 2
+
 ray:
-  num_cpus: 1                                
-  object_store_memory:   100000000           
-  gcs_rpc_server_reconnect_timeout_s: 60
+  dashboard_enabled: false
+  health_check_interval_seconds: 15
+  actor_restart_limit: 5
 
 watchdog_loop:
   interval_seconds: 30
 
 agent_inbox_loop:
-  pubsub_poll_timeout_seconds: 1.0
-  empty_inbox_sleep_seconds: 0.1
-  error_backoff_sleep_seconds: 1.0
+  stream_block_milliseconds: 1000
+  batch_size: 10
+  error_backoff_seconds: 1.0
+  processing_lease_seconds: 120
 
-models:
-  primary: "gemini/gemini-3.5-flash"
-  fallback: "gemini/gemini-pro-latest"
-  embedding: "gemini/gemini-embedding-001"
+collaboration:
+  interval_seconds: ${AGENTOS_COLLABORATION_INTERVAL_SECONDS:-30}
+  summary_every_actions: 5
+  event_stream_max_length: 100000
+  inbox_max_length: 10000
 
-agent_limits:
-  max_agents_total: 2                       
-  max_active_agents: 2
-  max_threads_per_agent: 2  
-  max_parallel_code_tasks: 2
+memory:
+  recent_event_limit: 20
+  recent_midterm_limit: 20
+  semantic_result_limit: 8
+  max_prompt_memory_characters: 16000
+  long_term_promotion_importance: 3
 
-embedding:
-  dimension: 768
+provider:
+  initial_budget_reservation_usd: 0.25
+  circuit_breaker_failure_threshold: 3
+  circuit_breaker_recovery_seconds: 120
+
+execution:
+  command_timeout_seconds: 120
+  max_output_characters: 100000
+  allowed_executables: [python, python3, pytest, ruff, mypy, npm, npx, node, git]
+  allowed_sandbox_images:
+    - python:3.12.11-slim-bookworm
+    - node:22.17.0-bookworm-slim

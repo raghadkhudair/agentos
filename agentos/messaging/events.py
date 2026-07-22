@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+import re
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+_TOPIC = re.compile(
+    r"^(project\.[A-Za-z0-9-]+\.(events|tasks|contracts|reviews|tests|blockers|checkpoints|summaries|resources)|"
+    r"squad\.[a-z0-9_-]+\.events|agent\.[A-Za-z0-9_-]+\.inbox)$"
+)
 
 
 class EventType(StrEnum):
@@ -13,6 +20,9 @@ class EventType(StrEnum):
     TEAM_PLAN_CREATED = "TEAM_PLAN_CREATED"
     AGENT_CREATED = "AGENT_CREATED"
     AGENT_TRIGGERED = "AGENT_TRIGGERED"
+    AGENT_HEARTBEAT = "AGENT_HEARTBEAT"
+    AGENT_HEALTH_CHANGED = "AGENT_HEALTH_CHANGED"
+    COLLABORATION_UPDATE = "COLLABORATION_UPDATE"
     ACTION_REQUESTED = "ACTION_REQUESTED"
     ACTION_ALLOWED = "ACTION_ALLOWED"
     ACTION_DENIED = "ACTION_DENIED"
@@ -41,6 +51,9 @@ class EventType(StrEnum):
     ACTION_REQUEST = "ACTION_REQUEST"
     APPROVAL_REQUEST = "APPROVAL_REQUEST"
     REPLANNING_TRIGGERED = "REPLANNING_TRIGGERED"
+    RESOURCE_PLAN_CREATED = "RESOURCE_PLAN_CREATED"
+    RESOURCE_PLAN_UPDATED = "RESOURCE_PLAN_UPDATED"
+    RESOURCE_PRESSURE = "RESOURCE_PRESSURE"
 
 
 class Event(BaseModel):
@@ -49,48 +62,78 @@ class Event(BaseModel):
     event_type: EventType
     producer_agent_id: str | None = None
     target_agent_id: str | None = None
-    topic: str
+    topic: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    payload_object_uri: str | None = None
     correlation_id: str | None = None
     causation_id: str | None = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    schema_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("project_id")
+    @classmethod
+    def _project_is_uuid(cls, value: str) -> str:
+        return str(UUID(str(value)))
+
+    @model_validator(mode="after")
+    def _resolve_and_validate_topic(self) -> Event:
+        expected = self.get_target_topic()
+        if self.topic is None:
+            self.topic = expected
+        if not _TOPIC.fullmatch(self.topic):
+            raise ValueError(f"invalid event topic: {self.topic}")
+        if self.topic.startswith("project.") and not self.topic.startswith(
+            f"project.{self.project_id}."
+        ):
+            raise ValueError("event topic project does not match event project_id")
+        inline_size = len(json.dumps(self.payload, default=str).encode("utf-8"))
+        if inline_size > 64 * 1024 and not self.payload_object_uri:
+            raise ValueError("event payloads above 64 KiB must be stored in MinIO")
+        return self
 
     def get_target_topic(self) -> str:
-        t_type = self.event_type
-        p_id = self.project_id
+        project = self.project_id
+        event_type = self.event_type
+        if event_type in {
+            EventType.TASK_CREATED,
+            EventType.TASK_CLAIMED,
+            EventType.TASK_COMPLETED,
+            EventType.TASK_PROPOSAL,
+            EventType.TASK_UPDATE,
+        }:
+            suffix = "tasks"
+        elif event_type in {EventType.CONTRACT_PUBLISHED, EventType.CONTRACT_CHANGE}:
+            suffix = "contracts"
+        elif event_type in {
+            EventType.REVIEW_REQUESTED,
+            EventType.REVIEW_REQUEST,
+            EventType.REVIEW_RESULT,
+        }:
+            suffix = "reviews"
+        elif event_type is EventType.TEST_RESULT:
+            suffix = "tests"
+        elif event_type in {EventType.BLOCKER_CREATED, EventType.BLOCKER}:
+            suffix = "blockers"
+        elif event_type in {EventType.CHECKPOINT_CREATED, EventType.CHECKPOINT}:
+            suffix = "checkpoints"
+        elif event_type in {EventType.SUMMARY_CREATED, EventType.SUMMARY}:
+            suffix = "summaries"
+        elif event_type in {
+            EventType.RESOURCE_PLAN_CREATED,
+            EventType.RESOURCE_PLAN_UPDATED,
+            EventType.RESOURCE_PRESSURE,
+        }:
+            suffix = "resources"
+        else:
+            suffix = "events"
+        return f"project.{project}.{suffix}"
 
-        if t_type in {EventType.TASK_CREATED, EventType.TASK_CLAIMED, EventType.TASK_COMPLETED, EventType.TASK_PROPOSAL, EventType.TASK_UPDATE}:
-            return f"project.{p_id}.tasks"
-        elif t_type in {EventType.CONTRACT_PUBLISHED, EventType.CONTRACT_CHANGE}:
-            return f"project.{p_id}.contracts"
-        elif t_type in {EventType.REVIEW_REQUESTED, EventType.REVIEW_REQUEST, EventType.REVIEW_RESULT}:
-            return f"project.{p_id}.reviews"
-        elif t_type == EventType.TEST_RESULT:
-            return f"project.{p_id}.tests"
-        elif t_type in {EventType.BLOCKER_CREATED, EventType.BLOCKER}:
-            return f"project.{p_id}.blockers"
-        elif t_type in {EventType.CHECKPOINT_CREATED, EventType.CHECKPOINT}:
-            return f"project.{p_id}.checkpoints"
-        elif t_type in {EventType.SUMMARY_CREATED, EventType.SUMMARY}:
-            return f"project.{p_id}.summaries"
 
-        if self.producer_agent_id:
-            role = self.producer_agent_id.lower()
-            if "backend" in role:
-                return f"squad.backend.events"
-            elif "frontend" in role:
-                return f"squad.frontend.events"
-            elif "platform" in role or "infra" in role:
-                return f"squad.platform.events"
-            elif "qa" in role:
-                return f"squad.qa.events"
-
-        return f"project.{p_id}.events"
-    
-    def validate_event(event: "Event", claimed_agent_id: str | None = None) -> tuple[bool, str]:
-        """Basic communication guardrail: catches spoofed sender IDs and malformed topics."""
-        if claimed_agent_id and event.producer_agent_id and event.producer_agent_id != claimed_agent_id:
-            return False, f"Sender mismatch: event claims producer '{event.producer_agent_id}' but caller is '{claimed_agent_id}'."
-        if not event.topic or not event.topic.strip():
-            return False, "Event rejected: empty topic."
-        return True, ""
+def validate_event(event: Event, claimed_agent_id: str | None = None) -> tuple[bool, str]:
+    if claimed_agent_id and event.producer_agent_id != claimed_agent_id:
+        return False, "producer identity does not match authenticated caller"
+    if event.target_agent_id and event.topic and event.topic.startswith("agent."):
+        expected = f"agent.{event.target_agent_id}.inbox"
+        if event.topic != expected:
+            return False, "direct-message topic does not match target agent"
+    return True, ""

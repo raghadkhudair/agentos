@@ -2,337 +2,373 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
+from typing import Annotated, Any, cast
+from uuid import UUID
 
+import ray
 import typer
 from rich.console import Console
 from rich.table import Table
-import ray
-from agentos.dod.evaluator import DoDEvaluatorActor
 
-from agentos.config.settings import load_settings
+from agentos.config.runtime import ResourcePlanner
+from agentos.config.settings import Settings, load_settings
+from agentos.governance.models import ActionRequest, AgentIdentity
+from agentos.governance.policy_engine import PolicyEngine
 from agentos.runtime.supervisor import RuntimeSupervisorActor
-from agentos.storage.database import DatabaseManager
-from agentos.config.loader import runtime_tuning
+from agentos.storage.clients import (
+    DragonflyClient,
+    MilvusVectorClient,
+    MinioObjectClient,
+    MongoDocumentClient,
+    PostgresClient,
+)
 
-app = typer.Typer(no_args_is_help=True, help="AgentOS Local CLI")
+app = typer.Typer(no_args_is_help=True, help="AgentOS production CLI")
 console = Console()
 
-def _start_ray_and_get_supervisor(settings):
-    tuning_cfg = runtime_tuning()
-    if not ray.is_initialized():
-        ray.init(
-            ignore_reinit_error=True,
-            num_cpus=tuning_cfg["ray"]["num_cpus"],
-            namespace="agentos",
-            include_dashboard=False,
-            object_store_memory=tuning_cfg["ray"]["object_store_memory"],
+
+async def _await_ref(reference: Any) -> Any:
+    return await reference
+
+
+def _ensure_ray(settings: Settings) -> None:
+    if ray.is_initialized():
+        return
+    planner = ResourcePlanner(settings)
+    envelope = planner.build_envelope()
+    for key, value in planner.thread_environment().items():
+        os.environ[key] = value
+    kwargs: dict[str, Any] = {
+        "address": settings.ray_address,
+        "namespace": "agentos",
+        "ignore_reinit_error": True,
+        "include_dashboard": False,
+        "log_to_driver": True,
+    }
+    if not settings.ray_address:
+        kwargs.update(
+            num_cpus=envelope.allocated_cpu_cores,
+            object_store_memory=envelope.object_store_memory_bytes,
         )
-    return RuntimeSupervisorActor.options(namespace="agentos").remote(settings.model_dump(by_alias=False))
+    ray.init(**kwargs)
 
-@app.command()
-def init(project_name: str = typer.Argument(..., help="Local project name.")) -> None:
-    """Create a local project workspace skeleton and initialize the database."""
-    settings = load_settings()
-    root = Path(settings.workspace) / project_name
-    
-    for subdir in ["source", "artifacts", "logs", ".agentos", "summaries", "checkpoints"]:
-        (root / subdir).mkdir(parents=True, exist_ok=True)
-        
-    project_file = root / ".agentos" / "project.json"
-    project_file.write_text(json.dumps({"project_name": project_name, "status": "INITIALIZED"}, indent=2))
-    console.print(f"Initialized project workspace: {root}")
 
-    async def setup_db():
-        db = DatabaseManager(settings)
-        await db.connect()
-        await db.initialize_schema()
-        await db.disconnect()
-        
-    try:
-        asyncio.run(setup_db())
-        console.print("[bold green]Database schema initialized successfully with pgvector support.[/bold green]")
-    except Exception as e:
-        console.print(f"[bold red]Failed to initialize database: {e}[/bold red]")
-        console.print("Make sure your Docker compose stack (postgres) is running!")
-
-@app.command()
-def plan(request: str = typer.Argument(..., help="Project request, for example: Build an ecommerce website.")) -> None:
-    """Create a first deterministic bootstrap plan preview."""
-    settings = load_settings()
-    supervisor = _start_ray_and_get_supervisor(settings)
-    result = asyncio.run(supervisor.bootstrap_project.remote(request))
-    console.print_json(data=result["team_plan"])
+def _supervisor(settings: Settings) -> Any:
+    _ensure_ray(settings)
+    planner = ResourcePlanner(settings)
+    envelope = planner.build_envelope()
+    return RuntimeSupervisorActor.options(  # type: ignore[attr-defined]
+        name="runtime-supervisor",
+        namespace="agentos",
+        get_if_exists=True,
+        lifetime="detached",
+        num_cpus=planner.supervisor_cpu(envelope),
+        memory=max(16_777_216, envelope.system_memory_bytes // 5),
+        max_restarts=3,
+        max_task_retries=2,
+        runtime_env={"env_vars": planner.thread_environment()},
+    ).remote(settings.model_dump(mode="python"))
 
 
 @app.command()
-def run(request: str = typer.Argument(..., help="Project request to execute until DoD is satisfied.")) -> None:
-    """Start the runtime supervisor and create the first Ray agent team."""
+def init(project_name: str = typer.Argument(..., help="Local project workspace name.")) -> None:
+    """Initialize schema, all storage clients, and a local workspace."""
     settings = load_settings()
-    supervisor = _start_ray_and_get_supervisor(settings)
-    result = asyncio.run(supervisor.bootstrap_project.remote(request))
-    console.print("Runtime started. Starter scaffold creates and starts agent actors only.")
+    if settings.environment == "production":
+        settings.validate_production_secrets()
+    root = (settings.workspace / project_name).resolve()
+    for directory in ("repository", "worktrees", "exports"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+
+    async def initialize() -> dict[str, Any]:
+        postgres = PostgresClient(settings)
+        mongo = MongoDocumentClient(settings)
+        minio = MinioObjectClient(settings)
+        milvus = MilvusVectorClient(settings)
+        dragonfly = DragonflyClient(settings)
+        await postgres.connect()
+        await postgres.initialize_schema()
+        await mongo.initialize()
+        await minio.initialize()
+        await milvus.initialize()
+        health = {
+            "postgres": await postgres.healthcheck(),
+            "mongodb": await mongo.healthcheck(),
+            "minio": await minio.healthcheck(),
+            "milvus": await milvus.healthcheck(),
+            "dragonfly": await dragonfly.healthcheck(),
+        }
+        await postgres.disconnect()
+        await mongo.close()
+        await dragonfly.close()
+        return health
+
+    health = asyncio.run(initialize())
+    manifest = root / "agentos-project.json"
+    manifest.write_text(
+        json.dumps(
+            {"project_name": project_name, "workspace": str(root), "health": health}, indent=2
+        ),
+        encoding="utf-8",
+    )
+    console.print(
+        f"[green]Initialized all production storage clients and workspace:[/green] {root}"
+    )
+
+
+@app.command()
+def plan(request: str = typer.Argument(..., help="Software-delivery request.")) -> None:
+    """Generate and persist a validated team/resource plan without launching workers."""
+    settings = load_settings()
+    result = asyncio.run(_await_ref(_supervisor(settings).plan_project.remote(request)))
     console.print_json(data=result)
 
 
 @app.command()
-def status() -> None:
-    """Print local runtime configuration status."""
+def run(
+    request: str = typer.Argument(..., help="Software-delivery request."),
+    detach: bool = typer.Option(
+        False, "--detach", help="Return after startup instead of waiting for DoD."
+    ),
+) -> None:
+    """Launch the governed runtime and, by default, remain DoD-bound."""
     settings = load_settings()
-    table = Table(title="AgentOS Local Status")
+    result = asyncio.run(
+        _await_ref(
+            _supervisor(settings).bootstrap_project.remote(request, wait_for_completion=not detach)
+        )
+    )
+    console.print_json(data=result)
+
+
+@app.command("runtime-config")
+def runtime_config(
+    agents: Annotated[
+        list[str] | None,
+        typer.Option("--agent", help="Role name; may be repeated."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Optional JSON output path."),
+    ] = None,
+) -> None:
+    """Generate a bounded runtime configuration from current host resources."""
+    settings = load_settings()
+    selected_agents = agents or ["pm_tech_lead", "infrastructure_agent"]
+    role_counts: dict[str, int] = {}
+    identities: list[tuple[str, str]] = []
+    for role in selected_agents:
+        role_counts[role] = role_counts.get(role, 0) + 1
+        identities.append((f"{role}-{role_counts[role]}", role))
+    config = ResourcePlanner(settings).build_runtime_config(identities)
+    payload = config.model_dump(mode="json")
+    if output:
+        target = output.expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        console.print(f"[green]Wrote runtime configuration:[/green] {target}")
+    console.print_json(data=payload)
+
+
+@app.command()
+def doctor() -> None:
+    """Run live health checks for every required database and provider configuration."""
+    settings = load_settings()
+    result = asyncio.run(_await_ref(_supervisor(settings).dependency_health.remote()))
+    console.print_json(data=result)
+    if not result["healthy"]:
+        raise typer.Exit(1)
+
+
+@app.command()
+def status(project_id: str | None = typer.Argument(None, help="Optional project UUID.")) -> None:
+    """Show safe configuration and durable project state."""
+    settings = load_settings()
+
+    async def read_status() -> list[dict[str, Any]]:
+        db = PostgresClient(settings)
+        await db.connect()
+        if project_id:
+            rows = await db.fetch("SELECT * FROM projects WHERE id=$1", UUID(project_id))
+        else:
+            rows = await db.fetch("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
+        await db.disconnect()
+        return [json.loads(json.dumps(dict(row), default=str)) for row in rows]
+
+    table = Table(title="AgentOS runtime limits")
     table.add_column("Setting")
     table.add_column("Value")
-    table.add_row("Project", settings.project_name)
-    table.add_row("Workspace", settings.workspace)
-    table.add_row("Ray address", str(settings.ray_address))
-    table.add_row("Database", settings.database_url)
-    table.add_row("Dragonfly", settings.dragonfly_url)
-    limits = runtime_tuning()["agent_limits"]
-    table.add_row("Max agents", str(limits["max_agents_total"]))
-    table.add_row("Max active agents", str(limits["max_active_agents"]))
-    table.add_row("Destructive actions allowed", str(settings.allow_destructive_actions))
+    envelope = ResourcePlanner(settings).build_envelope()
+    table.add_row("Environment", settings.environment)
+    table.add_row("Workspace", str(settings.workspace))
+    table.add_row(
+        "Allocated / detected CPUs",
+        f"{envelope.allocated_cpu_cores} / {envelope.detected_cpu_cores}",
+    )
+    table.add_row("Reserved CPUs", str(envelope.reserved_cpu_cores))
+    table.add_row("Max active agents", str(envelope.max_active_agents))
+    table.add_row(
+        "Destructive actions",
+        "allowed with approval" if settings.allow_destructive_actions else "denied",
+    )
     console.print(table)
+    console.print_json(data={"projects": asyncio.run(read_status())})
+
+
+@app.command()
+def logs(
+    project_id: str = typer.Argument(..., help="Project UUID."),
+    limit: int = typer.Option(100, min=1, max=1000),
+) -> None:
+    """Read durable structured project events."""
+    settings = load_settings()
+
+    async def read() -> list[dict[str, Any]]:
+        db = PostgresClient(settings)
+        rows = await db.fetch(
+            "SELECT * FROM events WHERE project_id=$1 ORDER BY created_at DESC LIMIT $2",
+            UUID(project_id),
+            limit,
+        )
+        await db.disconnect()
+        return [json.loads(json.dumps(dict(row), default=str)) for row in rows]
+
+    console.print_json(data={"events": asyncio.run(read())})
+
+
+@app.command()
+def inspect(project_id: str = typer.Argument(..., help="Project UUID.")) -> None:
+    """Inspect tasks, agents, DoD, evidence, and active resource plan."""
+    settings = load_settings()
+
+    async def read() -> dict[str, Any]:
+        db = PostgresClient(settings)
+        pid = UUID(project_id)
+        data = {
+            "project": await db.fetchrow("SELECT * FROM projects WHERE id=$1", pid),
+            "agents": await db.fetch("SELECT * FROM agents WHERE project_id=$1 ORDER BY id", pid),
+            "tasks": await db.fetch(
+                "SELECT * FROM tasks WHERE project_id=$1 ORDER BY created_at", pid
+            ),
+            "dod": await db.fetch(
+                "SELECT * FROM dod_checks WHERE project_id=$1 ORDER BY created_at", pid
+            ),
+            "evidence": await db.fetch(
+                "SELECT * FROM dod_evidence WHERE project_id=$1 ORDER BY created_at", pid
+            ),
+            "resource_plan": await db.fetchrow(
+                "SELECT * FROM resource_plans WHERE project_id=$1 AND active", pid
+            ),
+        }
+        await db.disconnect()
+        return cast(dict[str, Any], json.loads(json.dumps(data, default=str)))
+
+    console.print_json(data=asyncio.run(read()))
+
+
+@app.command()
+def pause(project_id: str = typer.Argument(..., help="Project UUID.")) -> None:
+    settings = load_settings()
+    result = asyncio.run(_await_ref(_supervisor(settings).pause_project.remote(project_id)))
+    console.print_json(data=result)
+
+
+@app.command()
+def resume(project_id: str = typer.Argument(..., help="Project UUID.")) -> None:
+    settings = load_settings()
+    result = asyncio.run(_await_ref(_supervisor(settings).resume_project.remote(project_id)))
+    console.print_json(data=result)
+
+
+@app.command()
+def approve(
+    approval_id: str = typer.Argument(..., help="Approval request UUID."),
+    approver: str = typer.Option(..., "--approver", help="Human approver identity."),
+    reason: str = typer.Option(..., "--reason", help="Auditable approval reason."),
+) -> None:
+    settings = load_settings()
+
+    async def decide() -> dict[str, Any]:
+        db = PostgresClient(settings)
+        async with db.transaction() as connection:
+            row = await connection.fetchrow(
+                "SELECT * FROM approval_requests WHERE id=$1 FOR UPDATE", UUID(approval_id)
+            )
+            if (
+                row is None
+                or row["status"] != "PENDING"
+                or row["expires_at"].timestamp() <= __import__("time").time()
+            ):
+                raise ValueError("approval request is missing, expired, or already decided")
+            await connection.execute(
+                "UPDATE approval_requests SET status='APPROVED',decided_by=$2,decision_reason=$3,decided_at=now() WHERE id=$1",
+                UUID(approval_id),
+                approver,
+                reason,
+            )
+        suffix = str(row["project_id"]).replace("-", "")[:12]
+        execution = ray.get_actor(f"execution-{suffix}", namespace="agentos")
+        action = row["request_payload"]
+        result = await execution.execute_approved_action.remote(approval_id, action)
+        return cast(dict[str, Any], result)
+
+    _ensure_ray(settings)
+    console.print_json(data=asyncio.run(decide()))
+
+
+@app.command()
+def reject(
+    approval_id: str = typer.Argument(..., help="Approval request UUID."),
+    approver: str = typer.Option(..., "--approver"),
+    reason: str = typer.Option(..., "--reason"),
+) -> None:
+    settings = load_settings()
+
+    async def decide() -> dict[str, Any]:
+        db = PostgresClient(settings)
+        result = await db.execute(
+            """
+            UPDATE approval_requests SET status='REJECTED',decided_by=$2,decision_reason=$3,decided_at=now()
+            WHERE id=$1 AND status='PENDING'
+            """,
+            UUID(approval_id),
+            approver,
+            reason,
+        )
+        await db.disconnect()
+        if result != "UPDATE 1":
+            raise ValueError("approval request is missing or already decided")
+        return {"approval_id": approval_id, "status": "REJECTED"}
+
+    console.print_json(data=asyncio.run(decide()))
 
 
 @app.command("guardrail-check")
-def guardrail_check(action: str = typer.Argument(..., help="Action description to evaluate.")) -> None:
-    """Evaluate an example action against deterministic guardrails."""
-    from agentos.governance.models import ActionRequest
-    from agentos.governance.policy_engine import PolicyEngine
-
+def guardrail_check(
+    action: str = typer.Argument(..., help="Action description to evaluate."),
+) -> None:
     settings = load_settings()
-    engine = PolicyEngine(settings)
-    result = engine.evaluate_action(
-        ActionRequest(
-            project_id=settings.project_name,
-            agent_id="manual-check",
-            action_type="manual",
+
+    async def check() -> dict[str, Any]:
+        identity = AgentIdentity(
+            agent_id="cli-inspector",
+            role="security_reviewer",
+            project_id="00000000-0000-0000-0000-000000000000",
+            allowed_actions=["read_file"],
+        )
+        request = ActionRequest(
+            project_id=identity.project_id,
+            agent_id=identity.agent_id,
+            action_type="read_file",
             description=action,
         )
-    )
-    console.print_json(data=result.model_dump())
+        result = await PolicyEngine(settings).evaluate_action(request, identity)
+        return result.model_dump(mode="json")
 
-@app.command()
-def approve(event_id: str = typer.Argument(..., help="The approval event ID to approve.")) -> None:
-    """Approve a pending action request and execute it."""
-    from agentos.storage.database import DatabaseManager
-    from agentos.storage.repositories import EventRepository
-    from agentos.messaging.events import Event, EventType
-
-    settings = load_settings()
-
-    async def run():
-        db = DatabaseManager(settings)
-        await db.connect()
-        event_repo = EventRepository(db)
-        pending = await event_repo.get_event(event_id)
-        if not pending:
-            console.print("[red]No such approval event found.[/red]")
-            return
-
-        grant_event = Event(
-            project_id=str(pending["project_id"]),
-            event_type=EventType.APPROVAL_GRANTED,
-            topic=pending["topic"],
-            causation_id=event_id,
-        )
-        await event_repo.save_event(str(pending["project_id"]), grant_event)
-
-        import ray
-        ray.init(address="local", ignore_reinit_error=True, namespace="agentos")
-        exec_actor = ray.get_actor("execution_supervisor", namespace="agentos")
-        result = await exec_actor.execute_approved_action.remote(pending["payload"]["full_action"])
-        console.print_json(data=result)
-
-    asyncio.run(run())
+    console.print_json(data=asyncio.run(check()))
 
 
-@app.command()
-def reject(event_id: str = typer.Argument(..., help="The approval event ID to reject.")) -> None:
-    """Reject a pending action request."""
-    from agentos.storage.database import DatabaseManager
-    from agentos.storage.repositories import EventRepository
-    from agentos.messaging.events import Event, EventType
-
-    settings = load_settings()
-
-    async def run():
-        db = DatabaseManager(settings)
-        await db.connect()
-        event_repo = EventRepository(db)
-        pending = await event_repo.get_event(event_id)
-        if not pending:
-            console.print("[red]No such approval event found.[/red]")
-            return
-        deny_event = Event(
-            project_id=str(pending["project_id"]),
-            event_type=EventType.APPROVAL_DENIED,
-            topic=pending["topic"],
-            causation_id=event_id,
-        )
-        await event_repo.save_event(str(pending["project_id"]), deny_event)
-        console.print(f"[yellow]Rejected action from event {event_id}.[/yellow]")
-
-    asyncio.run(run())
-
-@app.command("test-agent")
-def test_agent() -> None:
-    """End-to-End test: Runs advanced multi-step software engineering task graphs and quality checks."""
-    import uuid
-    import asyncio
-    
-    from agentos.actors.base import AgentWorkerActor
-    from agentos.execution.supervisor import ExecutionSupervisorActor
-    from agentos.governance.models import ActionRequest
-    from agentos.storage.database import DatabaseManager
-    from agentos.storage.repositories import TaskRepository
-    
-    settings = load_settings()
-    console.print("[bold yellow]Initializing Advanced Multi-File Software Delivery Test Loop...[/bold yellow]")
-    
-    async def run_test():
-        db = DatabaseManager(settings)
-        await db.connect()
-        task_repo = TaskRepository(db)
-        evaluator = DoDEvaluatorActor(db)
-        
-        project_id = str(uuid.uuid4())
-        unique_project_name = f"SecureCalcAPI-{project_id[:8]}"
-        
-        project_dod = [
-            "calculator.py", 
-            "test_calculator.py", 
-            "verify code output standard"
-        ]
-        
-        await db.pool.execute(
-            "INSERT INTO projects (id, name, dod) VALUES ($1, $2, $3)", 
-            uuid.UUID(project_id), unique_project_name, json.dumps(project_dod)
-        )
-        
-        console.print(f"[bold green]Created Advanced Project Entry:[/bold green] {unique_project_name}")
-        console.print(f"[bold blue]Target Quality Contract (DoD):[/bold blue] {project_dod}")
-        
-        console.print("[cyan]Seeding engineering sub-tasks tree checklist into PostgreSQL database...[/cyan]")
-        
-        task_1_id = await task_repo.create_task(
-            project_id=project_id,
-            title="Implement Core Logic",
-            description="Create calculator.py containing add, subtract, multiply, and safe divide functions.",
-            priority=3
-        )
-        
-        task_2_id = await task_repo.create_task(
-            project_id=project_id,
-            title="Implement Verification Suite",
-            description="Create test_calculator.py containing assertion statements verifying calculation accuracy.",
-            priority=4,
-            parent_task_id=task_1_id
-        )
-        
-        await task_repo.add_dependency(task_id=task_2_id, depends_on_task_id=task_1_id)
-        
-        fake_event_id = str(uuid.uuid4())
-        await db.pool.execute(
-            "INSERT INTO events (id, project_id, event_type, topic, payload) VALUES ($1, $2, $3, $4, $5)",
-            uuid.UUID(fake_event_id), uuid.UUID(project_id), "UserRequest", "New Task Execution", 
-            json.dumps({
-                "message": (
-                    f"Build a production-ready, error-safe math processing module for project {unique_project_name}.\n"
-                    "STEP 1: Write 'calculator.py' with add, subtract, multiply, and divide logic.\n"
-                    "STEP 2: Write 'test_calculator.py' which imports 'calculator' and runs assert tests.\n"
-                    "STEP 3: CRITICAL MANDATE - Run 'python3 test_calculator.py' using a 'shell_command' to verify the code output standard."
-                )
-            })
-        )
-        
-        if hasattr(AgentWorkerActor, "__ray_metadata__"):
-            metadata = AgentWorkerActor.__ray_metadata__
-            underlying_class = getattr(metadata, "modified_class", getattr(metadata, "class_target", None))
-        else:
-            underlying_class = AgentWorkerActor
-
-        console.print("[cyan]Spawning Developer Agent worker persona...[/cyan]")
-        agent = underlying_class(
-            agent_id="dev-test-1", 
-            role="Senior Python Engineer", 
-            project_id=project_id, 
-            settings=settings.model_dump()
-        )
-        
-        await agent.start()
-        supervisor = ExecutionSupervisorActor(settings)
-        
-        max_iterations = 4
-        current_step = 1
-        
-        while current_step <= max_iterations:
-            console.print(f"\n[bold magenta]=== AUTONOMOUS LOOP ITERATION {current_step}/{max_iterations} ===[/bold magenta]")
-            console.print(f"[cyan]Evaluating active database task dependencies...[/cyan]")
-            
-            result = await agent.process_next_step(fake_event_id)
-            
-            action_type = result.get("action_type", "wait")
-            description = result.get("description", "")
-            
-            console.print(f"\n[green]Agent Decision: {action_type.upper()}[/green] - [dim]{description}[/dim]")
-            
-            if action_type == "wait":
-                console.print("[bold green]Agent entered IDLE state successfully.[/bold green]")
-                break
-                
-            console.print("[cyan]Routing action to Execution Supervisor sandbox...[/cyan]")
-            
-            action_request = ActionRequest(
-                project_id=project_id,
-                agent_id="dev-test-1",
-                action_type=action_type,
-                description=description,
-                payload=result
-            )
-            execution_result = await supervisor.request_execution(action_request)
-            
-            console.print("[bold green]Execution Output Logs Returned to Memory Base:[/bold green]")
-            console.print_json(data=execution_result)
-            
-            if action_type in {"write_file", "write_code"} and execution_result.get("executed"):
-                res_data = execution_result.get("result", {})
-                file_written = res_data.get("path", "")
-                if "test" in file_written:
-                    await task_repo.update_task_status(task_2_id, "COMPLETED")
-                else:
-                    await task_repo.update_task_status(task_1_id, "COMPLETED")
-            
-            console.print("\n[bold yellow]🔍 [SUPERVISOR QUALITY MONITOR]: Running real-time evaluation of checkpoint database states...[/bold yellow]")
-            dod_report = await evaluator.evaluate(project_id, project_dod)
-            
-            console.print(f"[dim]Current Status -> Satisfied: {dod_report.satisfied} | Remaining Gaps: {dod_report.gaps}[/dim]")
-            
-            if dod_report.satisfied:
-                console.print("\n[bold green]🎯 REAL-TIME DOD GATING BREAK: All contract milestones met perfectly! Shutting down loop early to save resources.[/bold green]")
-                console.print_json(data=dod_report.model_dump())
-                break
-            
-            fake_event_id = str(uuid.uuid4())
-            await db.pool.execute(
-                "INSERT INTO events (id, project_id, event_type, topic, payload) VALUES ($1, $2, $3, $4, $5)",
-                uuid.UUID(fake_event_id), uuid.UUID(project_id), "ExecutionFeedback", "Task Progress Tracking",
-                json.dumps({"last_action": action_type, "execution_success": execution_result.get("executed", False), "runtime_response": execution_result.get("result", {})})
-            )
-            
-            current_step += 1
-            await asyncio.sleep(1.0)
-
-        console.print("\n[bold cyan]=== RUNTIME CLOSURE GATING: FINAL STATUS EVALUATION ===[/bold cyan]")
-        final_report = await evaluator.evaluate(project_id, project_dod)
-        
-        if final_report.satisfied:
-            console.print("\n[bold green]🎉 SUCCESS: All multi-file test criteria satisfied successfully! Gating loop closed cleanly.[/bold green]")
-        else:
-            console.print_json(data=final_report.model_dump())
-            console.print("\n[bold red]⚠️ WATCHDOG ALERT TRIGGERED: Project incomplete after maximum loops.[/bold red]")
-
-        await db.disconnect()
-
-    asyncio.run(run_test())
-    console.print("[bold yellow]Advanced Configuration Test Complete.[/bold yellow]")
+if __name__ == "__main__":
+    app()

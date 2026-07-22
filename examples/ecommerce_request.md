@@ -2,14 +2,14 @@ Build a full ecommerce website with:
 - product catalog
 - search and filtering
 - cart
-- checkout with mocked payment for local MVP
+- checkout through a production-shaped payment-provider interface with an explicitly sandboxed local adapter
 - user authentication
 - admin product management
 - admin order management
 - backend API
 - frontend UI
 - PostgreSQL database for the generated app
-- Docker local deployment
+- production-grade Docker local deployment with health checks and resource ceilings
 - tests
 - security review
 - README and setup documentation
