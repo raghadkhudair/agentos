@@ -13,7 +13,7 @@ from agentos.actors.infrastructure import InfrastructureAgentActor, Infrastructu
 from agentos.actors.reviewer import ReviewerAgentActor
 from agentos.actors.safety_reviewer import SafetyReviewerAgentActor
 from agentos.checkpoints.manager import CheckpointManagerActor, SummaryManagerActor
-from agentos.config.loader import team_roles
+from agentos.config.loader import runtime_tuning, team_roles
 from agentos.config.runtime import AgentResourceAllocation, ResourcePlanner, RuntimeConfig
 from agentos.config.settings import Settings
 from agentos.dod.evaluator import DoDEvaluatorActor
@@ -22,6 +22,7 @@ from agentos.memory.broker import MemoryBrokerActor
 from agentos.messaging.events import Event, EventType
 from agentos.messaging.outbox import OutboxDispatcherActor
 from agentos.provider.gateway import ProviderGatewayActor, ProviderRegistry
+from agentos.runtime.planning_context import build_planning_context
 from agentos.runtime.team_plan import AgentRole, AgentSpec, TeamPlan, ValidatedTeamPlan
 from agentos.runtime.trigger_engine import TriggerEngineActor
 from agentos.storage.clients import (
@@ -36,8 +37,7 @@ from agentos.storage.repositories import (
     DoDRepository,
     EventRepository,
     ProjectRepository,
-    ResourcePlanRepository,
-    RuntimeConfigRepository,
+    ProjectState,
     TaskRepository,
 )
 from agentos.watchdogs.runtime_watchdogs import (
@@ -70,6 +70,7 @@ class RuntimeSupervisorActor:
         self.stagnation_watchdog = StagnationWatchdog(self.db)
         self.deadlock_watchdog = DeadlockWatchdog(self.db)
         self.safety_watchdog = SafetyWatchdog(self.db, self.settings)
+        self.tuning = runtime_tuning()
 
     @staticmethod
     def _suffix(project_id: str) -> str:
@@ -128,9 +129,11 @@ class RuntimeSupervisorActor:
             report[name] = (
                 {"service": name, "healthy": False, "error": type(failure).__name__}
                 if failure is not None
-                else {"service": name, "healthy": False, "error": type(result).__name__}
-                if isinstance(result, Exception)
-                else result
+                else (
+                    {"service": name, "healthy": False, "error": type(result).__name__}
+                    if isinstance(result, Exception)
+                    else result
+                )
             )
         await dragonfly.close()
         await mongodb.close()
@@ -308,7 +311,16 @@ class RuntimeSupervisorActor:
             [],
         )
         await self.projects.update_status(project_id, "PLANNING")
-        names, services = await self._start_services(project_id)
+        try:
+            planning_context = build_planning_context(self.settings.source_repository, user_request)
+        except Exception as error:
+            await self._record_planning_blocker(project_id, error)
+            raise
+        try:
+            names, services = await self._start_services(project_id)
+        except Exception as error:
+            await self._record_planning_blocker(project_id, error)
+            raise
         bootstrap_name = f"bootstrap-{self._suffix(project_id)}"
         bootstrap = self._actor(
             BootstrapAgentActor,
@@ -319,42 +331,35 @@ class RuntimeSupervisorActor:
             num_cpus=0.05,
         )
         try:
-            raw_plan = await bootstrap.create_team_plan.remote(
-                user_request, self.settings.max_agents_total
-            )
+            try:
+                raw_plan = await bootstrap.create_team_plan.remote(
+                    user_request, self.settings.max_agents_total, planning_context
+                )
+                plan = TeamPlan.model_validate(raw_plan)
+                validated = self.validate_team_plan(plan)
+                runtime_payload = await services["infrastructure"].determine_resources.remote(
+                    project_id, [spec.model_dump(mode="json") for spec in validated.agents]
+                )
+                runtime_config = RuntimeConfig.model_validate(runtime_payload)
+                validated.resource_allocations = runtime_config.allocations
+                persisted = await self.projects.persist_plan_bundle(
+                    project_id,
+                    plan,
+                    validated.agents,
+                    runtime_config,
+                    self.settings.safe_snapshot(),
+                    planning_context,
+                )
+            except Exception as error:
+                await self._record_planning_blocker(project_id, error)
+                await self._stop_project_runtime(project_id)
+                raise
         finally:
             ray.kill(bootstrap, no_restart=True)
-        plan = TeamPlan.model_validate(raw_plan)
-        validated = self.validate_team_plan(plan)
-        await self.projects.update_plan(
-            project_id,
-            name=plan.project_name,
-            dod=[item.model_dump(mode="json") for item in plan.dod],
-            architecture=plan.high_level_architecture,
-            assumptions=plan.assumptions,
+        resource_plan = {"resource_plan_id": persisted["resource_plan_id"], **runtime_payload}
+        await services["infrastructure"].announce_resources.remote(
+            project_id, persisted["resource_plan_id"], runtime_payload
         )
-        dod_repo = DoDRepository(self.db)
-        for criterion in plan.dod:
-            await dod_repo.add_dod_check(project_id, criterion)
-        await self._seed_backlog(project_id, plan)
-
-        resource_plan = await services["infrastructure"].determine_resources.remote(
-            project_id, [spec.model_dump(mode="json") for spec in validated.agents]
-        )
-        runtime_config = RuntimeConfig.model_validate(
-            {key: value for key, value in resource_plan.items() if key != "resource_plan_id"}
-        )
-        validated.resource_allocations = runtime_config.allocations
-        await RuntimeConfigRepository(self.db).save(
-            {
-                "settings": self.settings.safe_snapshot(),
-                "generated_runtime": runtime_config.model_dump(mode="json"),
-            },
-            project_id,
-        )
-
-        await self._register_planned_agents(project_id, validated.agents, runtime_config)
-        await self._register_infrastructure_agent(project_id, runtime_config)
         self._completion_events[project_id] = asyncio.Event()
         provider_ready = any(health["providers"].values())
         actors: list[dict[str, Any]] = []
@@ -381,6 +386,9 @@ class RuntimeSupervisorActor:
                 "request": user_request,
                 "dod": [item.model_dump(mode="json") for item in plan.dod],
                 "resource_plan_id": resource_plan["resource_plan_id"],
+                "contract_version": plan.contract_version,
+                "contract_hash": plan.contract_hash,
+                "source_revision": plan.source_revision,
             },
         )
         await self.events.save_event(project_id, created)
@@ -396,7 +404,10 @@ class RuntimeSupervisorActor:
         }
         if wait_for_completion and provider_ready:
             await self._completion_events[project_id].wait()
-            result["status"] = "DOD_SATISFIED"
+            final_project = await self.projects.get(project_id)
+            result["status"] = (
+                final_project["status"] if final_project else "BLOCKED_REQUIRES_INPUT"
+            )
         return result
 
     async def plan_project(self, user_request: str) -> dict[str, Any]:
@@ -409,6 +420,11 @@ class RuntimeSupervisorActor:
             self.settings.project_name, user_request, []
         )
         await self.projects.update_status(project_id, "PLANNING")
+        try:
+            planning_context = build_planning_context(self.settings.source_repository, user_request)
+        except Exception as error:
+            await self._record_planning_blocker(project_id, error)
+            raise
         suffix = self._suffix(project_id)
         provider_name = f"plan-provider-{suffix}"
         bootstrap_name = f"plan-bootstrap-{suffix}"
@@ -423,143 +439,53 @@ class RuntimeSupervisorActor:
             num_cpus=0.05,
         )
         try:
-            raw = await bootstrap.create_team_plan.remote(
-                user_request, self.settings.max_agents_total
-            )
-            plan = TeamPlan.model_validate(raw)
-            validated = self.validate_team_plan(plan)
-            runtime = InfrastructurePlanner(self.settings).plan(validated.agents)
-            validated.resource_allocations = runtime.allocations
-            await self.projects.update_plan(
-                project_id,
-                name=plan.project_name,
-                dod=[item.model_dump(mode="json") for item in plan.dod],
-                architecture=plan.high_level_architecture,
-                assumptions=plan.assumptions,
-            )
-            dod_repo = DoDRepository(self.db)
-            for criterion in plan.dod:
-                await dod_repo.add_dod_check(project_id, criterion)
-            await self._seed_backlog(project_id, plan)
-            resource_plan_id = await ResourcePlanRepository(self.db).save(
-                project_id,
-                "infrastructure_agent-1",
-                runtime.model_dump(mode="json"),
-            )
-            runtime_snapshot_id = await RuntimeConfigRepository(self.db).save(
-                {
-                    "settings": self.settings.safe_snapshot(),
-                    "generated_runtime": runtime.model_dump(mode="json"),
-                },
-                project_id,
-            )
-            await self._register_planned_agents(project_id, validated.agents, runtime)
-            await self._register_infrastructure_agent(project_id, runtime)
-            return {
-                "project_id": project_id,
-                "team_plan": validated.model_dump(mode="json"),
-                "runtime_config": runtime.model_dump(mode="json"),
-                "resource_plan_id": resource_plan_id,
-                "runtime_snapshot_id": runtime_snapshot_id,
-            }
+            try:
+                raw = await bootstrap.create_team_plan.remote(
+                    user_request, self.settings.max_agents_total, planning_context
+                )
+                plan = TeamPlan.model_validate(raw)
+                validated = self.validate_team_plan(plan)
+                runtime = InfrastructurePlanner(self.settings).plan(validated.agents)
+                validated.resource_allocations = runtime.allocations
+                persisted = await self.projects.persist_plan_bundle(
+                    project_id,
+                    plan,
+                    validated.agents,
+                    runtime,
+                    self.settings.safe_snapshot(),
+                    planning_context,
+                )
+                return {
+                    "project_id": project_id,
+                    "team_plan": validated.model_dump(mode="json"),
+                    "runtime_config": runtime.model_dump(mode="json"),
+                    "resource_plan_id": persisted["resource_plan_id"],
+                    "runtime_snapshot_id": persisted["runtime_snapshot_id"],
+                    "contract_hash": plan.contract_hash,
+                }
+            except Exception as error:
+                await self._record_planning_blocker(project_id, error)
+                raise
         finally:
             ray.kill(bootstrap, no_restart=True)
             ray.kill(provider, no_restart=True)
 
-    async def _seed_backlog(self, project_id: str, plan: TeamPlan) -> None:
-        repository = TaskRepository(self.db)
-        task_ids: dict[str, str] = {}
-        for index, task in enumerate(plan.initial_backlog, start=1):
-            task_ids[task.title] = await repository.create_task(
-                project_id,
-                task.title,
-                task.description,
-                owner_role=task.owner_role.value if task.owner_role else None,
-                priority=task.priority,
-                acceptance_criteria=task.acceptance_criteria,
-                allowed_paths=task.allowed_paths,
-                blocked_paths=task.blocked_paths,
-                expected_outputs=task.expected_outputs,
-                required_reviewers=task.required_reviewers,
-                dod_criteria=task.dod_criteria,
-                risk_level=task.risk_level,
-                complexity=task.complexity,
-                external_key=f"bootstrap-{index}",
-            )
-        for task in plan.initial_backlog:
-            for dependency_title in task.depends_on:
-                if dependency_title not in task_ids:
-                    raise ValueError(f"unknown backlog dependency: {dependency_title}")
-                await repository.add_dependency(task_ids[task.title], task_ids[dependency_title])
-
-    async def _register_infrastructure_agent(
-        self, project_id: str, runtime_config: RuntimeConfig
-    ) -> None:
-        allocation = next(
-            (
-                item
-                for item in runtime_config.allocations
-                if item.role == AgentRole.INFRASTRUCTURE_AGENT.value
-            ),
-            None,
-        )
-        template = next(
-            item for item in team_roles()["roles"] if item["role"] == "INFRASTRUCTURE_AGENT"
-        )
-        await AgentRepository(self.db).register_agent(
-            "infrastructure_agent-1",
+    async def _record_planning_blocker(self, project_id: str, error: Exception) -> None:
+        await self.projects.update_status(project_id, ProjectState.BLOCKED_REQUIRES_INPUT)
+        await self.events.save_event(
             project_id,
-            AgentRole.INFRASTRUCTURE_AGENT.value,
-            "platform",
-            memory_scopes=template["default_memory_scopes"],
-            permissions={"allowed_actions": template["allowed_action_categories"]},
-            provider_assignment={
-                "provider": allocation.provider,
-                "model": allocation.model,
-                "model_routes": {
-                    key.value: value for key, value in allocation.model_routes.items()
+            Event(
+                project_id=project_id,
+                event_type=EventType.BLOCKER_CREATED,
+                producer_agent_id="runtime_supervisor",
+                payload={
+                    "stage": "planning",
+                    "error_type": type(error).__name__,
+                    "message": str(error)[:4000],
+                    "fail_closed": True,
                 },
-            }
-            if allocation
-            else {},
-            resource_allocation=allocation.model_dump(mode="json") if allocation else {},
+            ),
         )
-
-    async def _register_planned_agents(
-        self,
-        project_id: str,
-        specs: Iterable[AgentSpec],
-        runtime_config: RuntimeConfig,
-    ) -> None:
-        allocations = {item.agent_id: item for item in runtime_config.allocations}
-        repository = AgentRepository(self.db)
-        for spec in specs:
-            if spec.role == AgentRole.INFRASTRUCTURE_AGENT:
-                continue
-            for index in range(1, spec.count + 1):
-                agent_id = f"{spec.role.value}-{index}"
-                allocation = allocations[agent_id]
-                await repository.register_agent(
-                    agent_id,
-                    project_id,
-                    spec.role.value,
-                    spec.role.value.split("_", 1)[0],
-                    status="PLANNED",
-                    memory_scopes=spec.memory_scopes,
-                    permissions={
-                        "allowed_actions": spec.allowed_action_categories,
-                        "ownership_domains": spec.ownership_domains,
-                        "event_subscriptions": spec.event_subscriptions,
-                    },
-                    provider_assignment={
-                        "provider": allocation.provider,
-                        "model": allocation.model,
-                        "model_routes": {
-                            key.value: value for key, value in allocation.model_routes.items()
-                        },
-                    },
-                    resource_allocation=allocation.model_dump(mode="json"),
-                )
 
     def validate_team_plan(self, plan: TeamPlan) -> ValidatedTeamPlan:
         config = team_roles()
@@ -640,6 +566,9 @@ class RuntimeSupervisorActor:
             raise ValueError(
                 f"team reduction removed task-owning roles: {sorted(role.value for role in missing_task_roles)}"
             )
+        hardened_payload = plan.model_dump(mode="json")
+        hardened_payload["agents"] = [spec.model_dump(mode="json") for spec in agents]
+        TeamPlan.model_validate(hardened_payload)
         envelope = ResourcePlanner(self.settings).build_envelope()
         return ValidatedTeamPlan(
             original=plan,
@@ -718,65 +647,46 @@ class RuntimeSupervisorActor:
     async def _watchdog_loop(self, project_id: str) -> None:
         services = self._service_registry[project_id]
         while project_id in self.running_projects:
-            await asyncio.sleep(30)
+            await asyncio.sleep(float(self.tuning["watchdog_loop"]["interval_seconds"]))
             try:
                 health = await self.dependency_health()
                 if not health["healthy"]:
                     await self.projects.update_status(project_id, "BLOCKED_REQUIRES_INPUT")
                     await self._suspend_workers(project_id)
                     self.running_projects.discard(project_id)
+                    self._completion_events[project_id].set()
                     return
                 project = await self.projects.get(project_id)
                 if project and project["status"] == "REPLANNING":
-                    active = await TaskRepository(self.db).get_active_tasks(project_id)
-                    if active:
+                    runnable = await TaskRepository(self.db).get_runnable_tasks(project_id)
+                    if runnable:
                         await self.projects.update_status(project_id, "RUNNING")
                 evaluation = await services["dod"].evaluate.remote(project_id)
-                if evaluation["satisfied"]:
-                    async with self.db.transaction() as connection:
-                        current = await connection.fetchval(
-                            "SELECT status FROM projects WHERE id=$1 FOR UPDATE",
-                            UUID(project_id),
-                        )
-                        unsatisfied = await connection.fetchval(
-                            "SELECT count(*) FROM dod_checks WHERE project_id=$1 AND status<>'SATISFIED'",
-                            UUID(project_id),
-                        )
-                        incomplete = await connection.fetchval(
-                            """
-                            SELECT count(*) FROM tasks
-                            WHERE project_id=$1 AND status NOT IN ('COMPLETED','CANCELLED')
-                            """,
-                            UUID(project_id),
-                        )
-                        if current != "RUNNING" or int(unsatisfied or 0) or int(incomplete or 0):
-                            continue
-                        await connection.execute(
-                            "UPDATE projects SET status='DOD_SATISFIED' WHERE id=$1",
-                            UUID(project_id),
-                        )
-                    self.running_projects.discard(project_id)
-                    self._completion_events[project_id].set()
-                    return
-                dod_action = await self.dod_watchdog.inspect_and_act(
-                    project_id, False, list(evaluation["gaps"])
+                await self.db.execute(
+                    "UPDATE projects SET evaluation_failure_count=0 WHERE id=$1",
+                    UUID(project_id),
                 )
+                dod_action = await self.handle_dod_evaluation(project_id, evaluation)
+                if dod_action.get("finalized") or dod_action.get("action_required") == "BLOCK":
+                    return
                 stagnation = await self.stagnation_watchdog.inspect_and_act(project_id)
                 deadlock = await self.deadlock_watchdog.inspect_and_act(project_id)
                 await self.safety_watchdog.inspect_and_act(project_id)
-                if stagnation.get("action_required") == "REPLAN":
-                    await self.projects.update_status(project_id, "REPLANNING")
-                    event = Event(
-                        project_id=project_id,
-                        event_type=EventType.REPLANNING_TRIGGERED,
-                        producer_agent_id="runtime_supervisor",
-                        payload={"gaps": evaluation["gaps"], "reason": stagnation.get("reason")},
+                if (
+                    stagnation.get("action_required") == "REPLAN"
+                    and dod_action.get("action_required") == "NONE"
+                ):
+                    await self.dod_watchdog.inspect_and_act(
+                        project_id,
+                        False,
+                        list(evaluation["gaps"]),
+                        evaluation_run_id=evaluation["evaluation_run_id"],
                     )
-                    await self.events.save_event(project_id, event)
                 if deadlock.get("action_required") == "RESOLVE_DEADLOCK":
                     await self.projects.update_status(project_id, "BLOCKED_REQUIRES_INPUT")
                     await self._suspend_workers(project_id)
                     self.running_projects.discard(project_id)
+                    self._completion_events[project_id].set()
                     return
                 if dod_action.get("action_required") == "TRIGGER_REPLANNING":
                     await self.projects.update_status(project_id, "REPLANNING")
@@ -784,6 +694,64 @@ class RuntimeSupervisorActor:
                 logger.error(
                     "watchdog_loop_failed", project_id=project_id, error_type=type(error).__name__
                 )
+                failures = await self.db.fetchval(
+                    """
+                    UPDATE projects SET evaluation_failure_count=evaluation_failure_count+1
+                    WHERE id=$1 RETURNING evaluation_failure_count
+                    """,
+                    UUID(project_id),
+                )
+                maximum = int(self.tuning["dod"]["max_replan_attempts"])
+                if int(failures or 0) >= maximum:
+                    await self.projects.update_status(project_id, "BLOCKED_REQUIRES_INPUT")
+                    await self.events.save_event(
+                        project_id,
+                        Event(
+                            project_id=project_id,
+                            event_type=EventType.BLOCKER_CREATED,
+                            producer_agent_id="runtime_supervisor",
+                            payload={
+                                "stage": "dod_evaluation",
+                                "reason": "bounded_evaluation_failures_exhausted",
+                                "attempts": int(failures),
+                                "error_type": type(error).__name__,
+                            },
+                        ),
+                    )
+                    await self._suspend_workers(project_id)
+                    self.running_projects.discard(project_id)
+                    self._completion_events[project_id].set()
+                    return
+
+    async def handle_dod_evaluation(
+        self, project_id: str, evaluation: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply one durable evaluation event; periodic watchdog calls are recovery."""
+
+        if evaluation["satisfied"]:
+            finalized = await DoDRepository(self.db).finalize_project(
+                project_id, evaluation["evaluation_run_id"]
+            )
+            if finalized:
+                await self._suspend_workers(project_id)
+                self.running_projects.discard(project_id)
+                completion = self._completion_events.get(project_id)
+                if completion:
+                    completion.set()
+            return {"finalized": finalized, "action_required": "NONE"}
+        action = await self.dod_watchdog.inspect_and_act(
+            project_id,
+            False,
+            list(evaluation["gaps"]),
+            evaluation_run_id=evaluation["evaluation_run_id"],
+        )
+        if action.get("action_required") == "BLOCK":
+            await self._suspend_workers(project_id)
+            self.running_projects.discard(project_id)
+            completion = self._completion_events.get(project_id)
+            if completion:
+                completion.set()
+        return action
 
     async def _health_loop(self, project_id: str) -> None:
         services = self._service_registry[project_id]
@@ -849,6 +817,7 @@ class RuntimeSupervisorActor:
                     await self.projects.update_status(project_id, "BLOCKED_REQUIRES_INPUT")
                     await self._suspend_workers(project_id)
                     self.running_projects.discard(project_id)
+                    self._completion_events[project_id].set()
                     return
             except Exception as error:
                 logger.error(
@@ -895,7 +864,7 @@ class RuntimeSupervisorActor:
         if not any(health["providers"].values()):
             await self.projects.update_status(project_id, "BLOCKED_REQUIRES_INPUT")
             raise RuntimeError("no configured AI provider is available")
-        names, _ = await self._start_services(project_id)
+        names, services = await self._start_services(project_id)
         rows = await AgentRepository(self.db).list_project_agents(project_id)
         snapshot = await self.db.fetchval(
             "SELECT public_config FROM runtime_config_snapshots WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1",
@@ -959,18 +928,32 @@ class RuntimeSupervisorActor:
         await self.projects.update_status(project_id, "RUNNING")
         self.running_projects.add(project_id)
         self._completion_events[project_id] = asyncio.Event()
-        self._background.append(asyncio.ensure_future(self._watchdog_loop(project_id)))
-        self._background.append(asyncio.ensure_future(self._health_loop(project_id)))
+        recovery_evaluation = await services["dod"].evaluate.remote(project_id)
+        recovery_action = await self.handle_dod_evaluation(project_id, recovery_evaluation)
+        if project_id in self.running_projects:
+            self._background.append(asyncio.ensure_future(self._watchdog_loop(project_id)))
+            self._background.append(asyncio.ensure_future(self._health_loop(project_id)))
         await self.events.save_event(
             project_id,
             Event(
                 project_id=project_id,
-                event_type=EventType.REPLANNING_TRIGGERED,
+                event_type=EventType.AGENT_HEALTH_CHANGED,
                 producer_agent_id="runtime_supervisor",
-                payload={"message": "Project resumed from durable agent and task state."},
+                payload={
+                    "message": "Project resumed from durable agent, task, and DoD generations.",
+                    "evaluation_run_id": recovery_evaluation["evaluation_run_id"],
+                    "recovery_action": recovery_action,
+                },
             ),
         )
-        return {"project_id": project_id, "status": "RUNNING", "agents": created}
+        resumed = await self.projects.get(project_id)
+        return {
+            "project_id": project_id,
+            "status": resumed["status"] if resumed else "BLOCKED_REQUIRES_INPUT",
+            "agents": created,
+            "recovery_evaluation": recovery_evaluation,
+            "recovery_action": recovery_action,
+        }
 
     async def _stop_project_runtime(self, project_id: str) -> None:
         self.running_projects.discard(project_id)
@@ -996,6 +979,113 @@ class RuntimeSupervisorActor:
         await self.projects.update_status(project_id, "PAUSED")
         await self._stop_project_runtime(project_id)
         return {"project_id": project_id, "status": "PAUSED"}
+
+    async def evaluate_project(self, project_id: str) -> dict[str, Any]:
+        """Run the canonical evaluator on demand and finalize only its exact snapshot."""
+
+        await self.db.connect()
+        project = await self.projects.get(project_id)
+        if project is None:
+            raise LookupError("project not found")
+        temporary = False
+        if project_id in self._service_registry:
+            evaluator = self._service_registry[project_id]["dod"]
+        else:
+            name = f"manual-dod-{self._suffix(project_id)}"
+            evaluator = self._actor(
+                DoDEvaluatorActor,
+                name,
+                self.settings.model_dump(mode="python"),
+                num_cpus=0.05,
+            )
+            temporary = True
+        try:
+            evaluation = await evaluator.evaluate.remote(project_id)
+            finalized = False
+            if evaluation["satisfied"]:
+                finalized = await DoDRepository(self.db).finalize_project(
+                    project_id, evaluation["evaluation_run_id"]
+                )
+                if finalized and project_id in self.running_projects:
+                    await self._suspend_workers(project_id)
+                    self.running_projects.discard(project_id)
+                    completion = self._completion_events.get(project_id)
+                    if completion:
+                        completion.set()
+            return {**evaluation, "finalized": finalized}
+        finally:
+            if temporary:
+                ray.kill(evaluator, no_restart=True)
+
+    async def amend_dod_contract(
+        self,
+        project_id: str,
+        plan_payload: dict[str, Any],
+        reason: str,
+        requested_by: str,
+        approval_id: str | None = None,
+    ) -> dict[str, Any]:
+        plan = TeamPlan.model_validate(plan_payload)
+        self.validate_team_plan(plan)
+        if approval_id is None:
+            request_id = await self.projects.request_dod_approval(
+                project_id,
+                "DOD_AMENDMENT",
+                {"contract_hash": plan.contract_hash, "reason": reason},
+                requested_by,
+            )
+            return {"status": "PENDING_APPROVAL", "approval_id": request_id}
+        result = await self.projects.amend_dod_contract(
+            project_id, plan, approval_id, reason, requested_by
+        )
+        await self.events.save_event(
+            project_id,
+            Event(
+                project_id=project_id,
+                event_type=EventType.CONTRACT_CHANGE,
+                producer_agent_id="runtime_supervisor",
+                payload={**result, "reason": reason, "approval_id": approval_id},
+            ),
+        )
+        return {"status": "AMENDED", **result}
+
+    async def waive_dod_criterion(
+        self,
+        project_id: str,
+        criterion_id: str,
+        reason: str,
+        requested_by: str,
+        approval_id: str | None = None,
+    ) -> dict[str, Any]:
+        criterion = await self.db.fetchrow(
+            """
+            SELECT criterion_hash FROM dod_checks
+            WHERE project_id=$1 AND criterion_id=$2 AND active
+            """,
+            UUID(project_id),
+            criterion_id,
+        )
+        if criterion is None:
+            raise LookupError("active criterion not found")
+        if approval_id is None:
+            request_id = await self.projects.request_dod_approval(
+                project_id,
+                "DOD_WAIVER",
+                {
+                    "criterion_id": criterion_id,
+                    "criterion_hash": criterion["criterion_hash"],
+                    "reason": reason,
+                },
+                requested_by,
+            )
+            return {"status": "PENDING_APPROVAL", "approval_id": request_id}
+        await self.projects.waive_dod_criterion(project_id, criterion_id, approval_id, reason)
+        return {
+            "status": "WAIVED_BY_HUMAN",
+            "project_id": project_id,
+            "criterion_id": criterion_id,
+            "approval_id": approval_id,
+        }
 
     async def shutdown(self, project_id: str | None = None) -> None:
         projects = [project_id] if project_id else list(self.running_projects)

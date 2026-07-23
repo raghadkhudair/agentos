@@ -187,15 +187,89 @@ def status(project_id: str | None = typer.Argument(None, help="Optional project 
     """Show safe configuration and durable project state."""
     settings = load_settings()
 
-    async def read_status() -> list[dict[str, Any]]:
+    async def read_status() -> dict[str, Any]:
         db = PostgresClient(settings)
         await db.connect()
+        data: dict[str, Any]
         if project_id:
-            rows = await db.fetch("SELECT * FROM projects WHERE id=$1", UUID(project_id))
+            pid = UUID(project_id)
+            projects = await db.fetch("SELECT * FROM projects WHERE id=$1", pid)
+            criteria = await db.fetch(
+                """
+                SELECT c.*,
+                  COALESCE(array_agg(t.id::text) FILTER (WHERE t.id IS NOT NULL),'{}') mapped_tasks
+                FROM dod_checks c
+                LEFT JOIN tasks t ON t.project_id=c.project_id
+                  AND c.criterion_id=ANY(t.dod_criteria)
+                  AND t.dod_contract_version=c.contract_version
+                WHERE c.project_id=$1 AND c.active GROUP BY c.id ORDER BY c.created_at
+                """,
+                pid,
+            )
+            latest_run = await db.fetchrow(
+                """
+                SELECT * FROM dod_evaluation_runs WHERE project_id=$1
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                pid,
+            )
+            latest_items = (
+                await db.fetch(
+                    """
+                    SELECT * FROM dod_evaluation_items WHERE evaluation_run_id=$1
+                    ORDER BY created_at
+                    """,
+                    latest_run["id"],
+                )
+                if latest_run
+                else []
+            )
+            latest_evidence = await db.fetch(
+                """
+                SELECT DISTINCT ON (criterion_id,evidence_type)
+                  criterion_id,evidence_type,source_agent_id,source_role,task_id,artifact_id,
+                  contract_version,criterion_hash,subject_commit,integration_commit,run_status,
+                  passed,watched_paths,affected_contracts,evidence_generation,created_at
+                FROM dod_evidence WHERE project_id=$1
+                ORDER BY criterion_id,evidence_type,created_at DESC
+                """,
+                pid,
+            )
+            contract_versions = await db.fetch(
+                """
+                SELECT contract_version,contract_hash,source_revision,planning_context_hash,
+                  prompt_version,created_by,amendment_reason,approval_id,created_at
+                FROM dod_contract_versions WHERE project_id=$1 ORDER BY contract_version
+                """,
+                pid,
+            )
+            dod_approvals = await db.fetch(
+                """
+                SELECT id,required_gate,status,requested_by_agent_id,decided_by,decision_reason,
+                  request_payload,expires_at,decided_at,created_at
+                FROM approval_requests WHERE project_id=$1
+                  AND required_gate IN ('DOD_AMENDMENT','DOD_WAIVER')
+                ORDER BY created_at DESC
+                """,
+                pid,
+            )
+            data = {
+                "projects": projects,
+                "dod_contract": criteria,
+                "dod_contract_versions": contract_versions,
+                "dod_approvals": dod_approvals,
+                "latest_evaluation": latest_run,
+                "latest_evaluation_items": latest_items,
+                "latest_evidence_by_type": latest_evidence,
+            }
         else:
-            rows = await db.fetch("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
+            data = {
+                "projects": await db.fetch(
+                    "SELECT * FROM projects ORDER BY created_at DESC LIMIT 10"
+                )
+            }
         await db.disconnect()
-        return [json.loads(json.dumps(dict(row), default=str)) for row in rows]
+        return cast(dict[str, Any], json.loads(json.dumps(data, default=str)))
 
     table = Table(title="AgentOS runtime limits")
     table.add_column("Setting")
@@ -214,7 +288,7 @@ def status(project_id: str | None = typer.Argument(None, help="Optional project 
         "allowed with approval" if settings.allow_destructive_actions else "denied",
     )
     console.print(table)
-    console.print_json(data={"projects": asyncio.run(read_status())})
+    console.print_json(data=asyncio.run(read_status()))
 
 
 @app.command()
@@ -255,8 +329,33 @@ def inspect(project_id: str = typer.Argument(..., help="Project UUID.")) -> None
             "dod": await db.fetch(
                 "SELECT * FROM dod_checks WHERE project_id=$1 ORDER BY created_at", pid
             ),
+            "dod_contract_versions": await db.fetch(
+                """
+                SELECT project_id,contract_version,contract_hash,source_revision,
+                  planning_context_hash,prompt_version,created_by,amendment_reason,
+                  approval_id,created_at
+                FROM dod_contract_versions WHERE project_id=$1 ORDER BY contract_version
+                """,
+                pid,
+            ),
             "evidence": await db.fetch(
                 "SELECT * FROM dod_evidence WHERE project_id=$1 ORDER BY created_at", pid
+            ),
+            "evaluation_runs": await db.fetch(
+                "SELECT * FROM dod_evaluation_runs WHERE project_id=$1 ORDER BY created_at DESC",
+                pid,
+            ),
+            "evaluation_items": await db.fetch(
+                """
+                SELECT i.* FROM dod_evaluation_items i
+                JOIN dod_evaluation_runs r ON r.id=i.evaluation_run_id
+                WHERE r.project_id=$1 ORDER BY i.created_at DESC
+                """,
+                pid,
+            ),
+            "integration_attempts": await db.fetch(
+                "SELECT * FROM integration_attempts WHERE project_id=$1 ORDER BY created_at DESC",
+                pid,
             ),
             "resource_plan": await db.fetchrow(
                 "SELECT * FROM resource_plans WHERE project_id=$1 AND active", pid
@@ -266,6 +365,65 @@ def inspect(project_id: str = typer.Argument(..., help="Project UUID.")) -> None
         return cast(dict[str, Any], json.loads(json.dumps(data, default=str)))
 
     console.print_json(data=asyncio.run(read()))
+
+
+@app.command("re-evaluate")
+def re_evaluate(project_id: str = typer.Argument(..., help="Project UUID.")) -> None:
+    """Run the canonical snapshot-fenced DoD evaluator immediately."""
+
+    settings = load_settings()
+    result = asyncio.run(_await_ref(_supervisor(settings).evaluate_project.remote(project_id)))
+    console.print_json(data=result)
+
+
+@app.command("amend-dod")
+def amend_dod(
+    project_id: Annotated[str, typer.Argument(help="Project UUID.")],
+    contract: Annotated[
+        Path, typer.Option("--contract", help="Complete next-version TeamPlan JSON.")
+    ],
+    reason: str = typer.Option(..., "--reason", help="Auditable amendment reason."),
+    requested_by: str = typer.Option(..., "--requested-by", help="Human/operator identity."),
+    approval_id: str | None = typer.Option(None, "--approval-id", help="Approved decision UUID."),
+) -> None:
+    """Request or apply a governed, version-incrementing DoD amendment."""
+
+    path = contract.expanduser().resolve()
+    if not path.is_file() or path.stat().st_size > 1_048_576:
+        raise typer.BadParameter("contract must be a JSON file no larger than 1 MiB")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("contract JSON root must be an object")
+    settings = load_settings()
+    result = asyncio.run(
+        _await_ref(
+            _supervisor(settings).amend_dod_contract.remote(
+                project_id, payload, reason, requested_by, approval_id
+            )
+        )
+    )
+    console.print_json(data=result)
+
+
+@app.command("waive-dod")
+def waive_dod(
+    project_id: str = typer.Argument(..., help="Project UUID."),
+    criterion_id: str = typer.Argument(..., help="Active DoD criterion ID."),
+    reason: str = typer.Option(..., "--reason", help="Auditable waiver reason."),
+    requested_by: str = typer.Option(..., "--requested-by", help="Human/operator identity."),
+    approval_id: str | None = typer.Option(None, "--approval-id", help="Approved decision UUID."),
+) -> None:
+    """Request or apply a human-approved waiver without weakening other criteria."""
+
+    settings = load_settings()
+    result = asyncio.run(
+        _await_ref(
+            _supervisor(settings).waive_dod_criterion.remote(
+                project_id, criterion_id, reason, requested_by, approval_id
+            )
+        )
+    )
+    console.print_json(data=result)
 
 
 @app.command()
@@ -308,6 +466,13 @@ def approve(
                 approver,
                 reason,
             )
+        if row["required_gate"] in {"DOD_AMENDMENT", "DOD_WAIVER"}:
+            await db.disconnect()
+            return {
+                "approval_id": approval_id,
+                "status": "APPROVED",
+                "required_gate": row["required_gate"],
+            }
         suffix = str(row["project_id"]).replace("-", "")[:12]
         execution = ray.get_actor(f"execution-{suffix}", namespace="agentos")
         action = row["request_payload"]

@@ -89,7 +89,13 @@ def test_every_requested_provider_routes_when_credential_is_present() -> None:
 
 
 def test_team_plan_rejects_unknown_owner_role_and_unknown_dod() -> None:
-    criterion = DoDCriterion(criterion_id="verified", description="A verified result")
+    criterion = DoDCriterion(
+        criterion_id="verified",
+        description="A verified result",
+        verification_command=["pytest", "-q"],
+        required_artifacts=["src/result.py"],
+        required_evidence_types=["artifact", "test", "review", "integration"],
+    )
     agent = AgentSpec(
         role=AgentRole.BACKEND_DEVELOPER,
         count=1,
@@ -99,6 +105,7 @@ def test_team_plan_rejects_unknown_owner_role_and_unknown_dod() -> None:
         TeamPlan(
             project_name="demo-project",
             user_request="Build the demo",
+            high_level_architecture="A bounded backend and frontend delivery.",
             dod=[criterion],
             agents=[agent],
             initial_backlog=[
@@ -106,10 +113,17 @@ def test_team_plan_rejects_unknown_owner_role_and_unknown_dod() -> None:
                     title="Build UI",
                     description="Create the UI",
                     owner_role=AgentRole.FRONTEND_DEVELOPER,
+                    acceptance_criteria=["The result is verified"],
+                    allowed_paths=["src"],
+                    expected_outputs=["src/result.py"],
+                    required_reviewers=["code_reviewer"],
                     dod_criteria=["verified"],
                 )
             ],
             max_requested_agents=1,
+            source_revision="abcdef1234567890",
+            planning_context_hash="a" * 64,
+            prompt_version="test-v1",
         )
 
 

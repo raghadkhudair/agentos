@@ -1,0 +1,16 @@
+{
+  "status_cases": [
+    {"name": "positive_evidence", "codes": [], "expected": "SATISFIED"},
+    {"name": "missing_evidence", "codes": ["EVIDENCE_MISSING"], "expected": "MISSING"},
+    {"name": "negative_evidence", "codes": ["EVIDENCE_FAILED"], "expected": "FAILED"},
+    {"name": "stale_over_failure", "codes": ["EVIDENCE_FAILED", "EVIDENCE_STALE_PATH"], "expected": "STALE"},
+    {"name": "inconclusive_over_failure", "codes": ["EVIDENCE_FAILED", "EVIDENCE_INCONCLUSIVE"], "expected": "INCONCLUSIVE"}
+  ],
+  "freshness_cases": [
+    {"name": "unrelated_document_change", "head": "docs", "watched_paths": ["src"], "expected": null},
+    {"name": "directory_overlap", "head": "source", "watched_paths": ["src"], "expected": "EVIDENCE_STALE_PATH"},
+    {"name": "glob_overlap", "head": "source", "watched_paths": ["src/*.py"], "expected": "EVIDENCE_STALE_PATH"},
+    {"name": "affected_contract_overlap", "head": "docs", "watched_paths": ["src"], "affected_contracts": ["public-api"], "later_contract_change": true, "expected": "EVIDENCE_STALE_CONTRACT"},
+    {"name": "unscoped_conservative_invalidation", "head": "docs", "watched_paths": [], "expected": "EVIDENCE_STALE_UNSCOPED"}
+  ]
+}

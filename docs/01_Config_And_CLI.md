@@ -8,7 +8,7 @@ AgentOS uses three layers:
 2. Versioned YAML policies in `agentos/config/`.
 3. A generated `RuntimeConfig`, persisted per project after host detection and infrastructure planning.
 
-`loader.py` accepts `${NAME}` and `${NAME:-default}` substitutions only, contains config reads to the package directory, and caches parsed results. YAML and `schema.sql` are declared as wheel package data.
+`loader.py` accepts `${NAME}` and `${NAME:-default}` substitutions only, contains config reads to the package directory, and caches parsed results. YAML, `schema.sql`, and the single authoritative versioned bootstrap/worker Markdown prompts under `agentos/config/prompts/` are declared as wheel package data. Root-level shadow prompts are forbidden by contract tests.
 
 ## Environment groups
 
@@ -56,8 +56,8 @@ Review/test requirements, destructive-action policy, provider budgets/concurrenc
 ## YAML responsibilities
 
 - `providers.yaml`: nine providers, models, capabilities, egress, role/purpose routing, circuits.
-- `actor_team.yml`: role catalog, permissions, subscriptions, caps, mandatory roles, deterministic fallback roster.
-- `runtime_tuning.yaml`: inbox, collaboration, memory, provider, Ray, watchdog, execution allowlists.
+- `actor_team.yml`: role catalog, permissions, explicit PM DoD/replanning subscriptions, caps, and mandatory roles. It contains no substitute delivery plan.
+- `runtime_tuning.yaml`: bounded planning repair, DoD replan/backoff/recovery, per-criterion review concurrency/cache, inbox, collaboration, memory, provider, Ray, watchdog, and execution allowlists.
 - `guardrail_policies.yaml`: destructive patterns, gates, action risk groups, protected paths, sanitization.
 
 ## CLI commands
@@ -76,7 +76,7 @@ Creates the local workspace, initializes PostgreSQL schema, MongoDB indexes, Min
 agentos plan "REQUEST"
 ```
 
-Persists the project, plan, DoD, backlog, resource plan, runtime snapshot, and planned agents. It does not launch delivery workers.
+Captures the clean bounded source context, performs bounded fail-closed plan validation, and persists the versioned DoD, backlog/dependencies, resource plan, planning/runtime snapshot, and planned agents in one transaction. It does not launch delivery workers. An invalid provider response leaves a visible planning blocker and no partial contract.
 
 ### Run
 
@@ -107,23 +107,28 @@ Starts or attaches to a bounded Ray runtime and performs live client health chec
 
 ```bash
 agentos status
-agentos status --project-id UUID
+agentos status UUID
 agentos logs UUID --limit 100
 agentos inspect UUID
+agentos re-evaluate UUID
 agentos pause UUID
 agentos resume UUID
 ```
 
-Resume rechecks dependencies/providers and reclaims expired leases before scheduling work.
+`status UUID` includes active criteria/provenance/locks/scopes, mapped tasks, current contract/HEAD/retry generation, latest evaluation and typed gaps, latest evidence revisions, and amendment/waiver decisions. `inspect` retains the complete raw history. `re-evaluate` runs only the canonical snapshot-fenced evaluator. Resume rechecks dependencies/providers, reclaims expired leases, and immediately reconciles the latest durable evaluation generation before periodic recovery.
 
 ### Human gates
 
 ```bash
 agentos approve APPROVAL_UUID --approver OPERATOR
 agentos reject APPROVAL_UUID --approver OPERATOR --reason "reason"
+agentos amend-dod UUID --contract NEXT_TEAM_PLAN.json --reason "reason" --requested-by OPERATOR
+agentos amend-dod UUID --contract NEXT_TEAM_PLAN.json --reason "reason" --requested-by OPERATOR --approval-id APPROVAL_UUID
+agentos waive-dod UUID CRITERION_ID --reason "reason" --requested-by OPERATOR
+agentos waive-dod UUID CRITERION_ID --reason "reason" --requested-by OPERATOR --approval-id APPROVAL_UUID
 ```
 
-Approval/rejection updates only a still-pending, unexpired record and preserves approver identity. Approved execution must match the stored action integrity hash and project.
+The first amendment/waiver call creates an exact contract-hash or criterion-hash-and-reason-bound approval; the second applies only that approved decision. Amendments increment the contract version, retain append-only contract history, invalidate old evidence by version/hash, and atomically replace the active work graph. Waivers change only one active criterion and remain visible in evaluation. Approval/rejection updates only a still-pending, unexpired record and preserves approver identity. Approved execution must match the stored action integrity hash and project.
 
 ### Policy inspection
 

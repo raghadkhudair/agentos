@@ -15,13 +15,14 @@ The runtime supervisor and project actors use deterministic names, namespace `ag
 ## Planning flow
 
 ```text
-health -> project row -> service actors -> bootstrap plan -> model validation
-       -> DoD/backlog persistence -> infrastructure resource plan
-       -> runtime snapshot -> planned agent inventory -> provider readiness
+health -> project row -> clean bounded source snapshot -> service actors
+       -> bounded bootstrap contract repair -> deterministic cross-validation
+       -> infrastructure resource plan -> one atomic contract/backlog/resource/
+          runtime-context/planned-agent transaction -> provider readiness
        -> workers or BLOCKED_REQUIRES_INPUT
 ```
 
-Plan validation enforces unique DoD IDs, required evidence, nonempty mandatory roles, role caps, maximum total agents, unique task titles, valid owner roles, valid dependencies, and bounded ownership paths.
+Plan validation enforces stable unique DoD IDs and normalized semantics, criterion hashes/provenance/locks/severity, at least one mandatory criterion, exactly one executable test/command type, artifact/review/integration baselines for delivered work, explicit evidence scopes, criterion/task/output/contract coverage, reviewer/security unions, nonempty acceptance/paths/outputs, role caps, maximum total agents, unique task titles, valid dependencies, and bounded ownership paths. The complete `TeamPlan` is revalidated after roster hardening/reduction and before persistence.
 
 ## Resource planner algorithm
 
@@ -75,14 +76,14 @@ Transitions are persisted. A CLI process exit does not imply completion.
 
 ## Watchdog loop
 
-The supervisor periodically evaluates:
+Task/artifact/evidence/integration writes advance a durable evaluation generation. A successful integration code-triggers the canonical evaluator and supervisor handler. The supervisor also periodically reconciles:
 
 - evidence-backed DoD and empty-queue gaps;
 - stagnation/repeated checkpoint behavior;
 - task dependency cycles;
 - unsafe audit volume/quarantine signals.
 
-Actions include PM replanning, stream freeze/quarantine, deadlock visibility, lease recovery, and completion. Exceptions are logged with project and error type; they are not swallowed.
+Only one evaluation run per project may be `RUNNING`; exact completed snapshots are reused, duplicates coalesce, changed snapshots supersede older runs, and abandoned same-evaluator runs recover. PM replanning must match that durable run's exact gaps and produces one immutable, graph-validated task batch per evaluation generation; exact delivery coalesces while changed duplicates fail closed. Other actions include stream freeze/quarantine, deadlock visibility, lease recovery, and snapshot-fenced completion. Replan/evaluator failures have bounded attempts/backoff and end in a durable visible blocker.
 
 ## Health loop
 
@@ -96,9 +97,10 @@ Pause stops new task progress and persists state. Resume:
 2. verifies at least one eligible provider;
 3. reclaims expired task leases;
 4. rediscovers/recreates services and missing workers from the stored plan/config;
-5. restarts watchdog/health loops;
-6. returns the project to `RUNNING`.
+5. immediately evaluates the current contract version/hash, integrated HEAD, and evidence generation and applies completion/repair/blocking;
+6. restarts watchdog/health loops only if the project remains active;
+7. returns the durable resulting state.
 
 ## Terminal completion
 
-The waiting CLI observes the project completion event/state. The supervisor sets `DOD_SATISFIED` only after DoD evaluator satisfaction. Provider assertions, task count alone, or an idle actor cannot terminate the project successfully.
+The waiting CLI observes the durable project state plus an in-process convenience event. The supervisor sets `DOD_SATISFIED` only by `DoDRepository.finalize_project`, which locks and compares the exact satisfied evaluation's contract version/hash, integrated HEAD, and evidence generation and checks mandatory active criteria/current-version tasks. Concurrent change returns `false` and schedules a newer generation. On success workers are suspended and task/artifact/evidence/contract writers reject terminal mutation. Provider assertions, task count alone, an idle actor, or a stale evaluation cannot terminate the project successfully.

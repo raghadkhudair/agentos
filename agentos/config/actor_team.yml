@@ -14,7 +14,7 @@ roles:
     description: Owns planning, coordination, replanning, and final delivery gating.
     default_memory_scopes: [project_memory, decision_memory, execution_memory, squad_memory]
     allowed_action_categories: [create_task, publish_event, create_summary, evaluate_dod, wait]
-    default_event_subscriptions: [PROJECT_CREATED, TASK_COMPLETED, CHECKPOINT_CREATED, BLOCKER_CREATED, RESOURCE_PLAN_UPDATED]
+    default_event_subscriptions: [PROJECT_CREATED, TASK_COMPLETED, CHECKPOINT_CREATED, BLOCKER_CREATED, RESOURCE_PLAN_UPDATED, DOD_EVALUATED, REPLANNING_TRIGGERED]
     provider_preferences: [openai, anthropic, gemini]
 
   - role: INFRASTRUCTURE_AGENT
@@ -72,34 +72,3 @@ roles:
     allowed_action_categories: [read_file, publish_event, submit_evidence, quarantine_recommendation, wait]
     default_event_subscriptions: [PROJECT_CREATED, ACTION_REQUESTED, SECURITY_ALERT, REVIEW_REQUEST]
     provider_preferences: [openai, anthropic, deepseek, gemini]
-
-fallback_team:
-  project_name: emergency-fallback-project
-  high_level_architecture: Guarded local delivery runtime using the configured production services.
-  dod:
-    - criterion_id: runtime-health
-      description: All required runtime services pass their health checks.
-      verification_type: composite
-      required_evidence_types: [test, review]
-    - criterion_id: delivery-evidence
-      description: Requested artifacts and verification evidence are present.
-      verification_type: composite
-      required_evidence_types: [artifact, test, review]
-  assumptions: [Provider planning failed; deterministic safety roster activated.]
-  agents:
-    - role: PM_TECH_LEAD
-      count: 1
-      description: Fallback coordinator.
-    - role: INFRASTRUCTURE_AGENT
-      count: 1
-      description: Fallback resource planner.
-    - role: SECURITY_REVIEWER
-      count: 1
-      description: Fallback security gate.
-    - role: CODE_REVIEWER
-      count: 1
-      description: Fallback review gate.
-    - role: QA_ENGINEER
-      count: 1
-      description: Fallback evidence gate.
-  initial_backlog: []

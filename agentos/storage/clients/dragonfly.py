@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,6 +18,12 @@ class DragonflyClient:
     _RELEASE_LOCK = """
     if redis.call('get', KEYS[1]) == ARGV[1] then
       return redis.call('del', KEYS[1])
+    end
+    return 0
+    """
+    _RENEW_LOCK = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+      return redis.call('expire', KEYS[1], ARGV[2])
     end
     return 0
     """
@@ -67,10 +74,26 @@ class DragonflyClient:
             acquired = bool(await lock.acquire())
             if acquired:
                 token = await self.redis.get(key) or token
+        stop_renewal = asyncio.Event()
+
+        async def renew() -> None:
+            interval = max(1.0, ttl_seconds / 3)
+            while not stop_renewal.is_set():
+                try:
+                    await asyncio.wait_for(stop_renewal.wait(), timeout=interval)
+                except TimeoutError:
+                    renewed = await self.redis.eval(self._RENEW_LOCK, 1, key, token, ttl_seconds)
+                    if not renewed:
+                        raise RuntimeError(f"distributed lock ownership was lost: {name}") from None
+
+        renewal = asyncio.create_task(renew()) if acquired else None
         try:
             yield acquired
         finally:
             if acquired:
+                stop_renewal.set()
+                if renewal is not None:
+                    await renewal
                 await self.redis.eval(self._RELEASE_LOCK, 1, key, token)
 
     async def set_json(self, key: str, payload: str, *, ttl_seconds: int | None = None) -> None:

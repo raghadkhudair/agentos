@@ -9,6 +9,7 @@ from typing import Any, cast
 import yaml
 
 _CONFIG_DIR = Path(__file__).resolve().parent
+_PROMPT_DIR = _CONFIG_DIR / "prompts"
 _ENV_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}")
 _MAX_CONFIG_BYTES = 1_048_576
 
@@ -88,3 +89,19 @@ def provider_registry(path: Path | str | None = None) -> dict[str, Any]:
     if path is None:
         return load_config("providers.yaml")
     return load_config_path(path)
+
+
+@lru_cache(maxsize=16)
+def load_prompt(filename: str) -> str:
+    """Load one authoritative packaged prompt without allowing path traversal."""
+
+    path = (_PROMPT_DIR / filename).resolve()
+    if path.parent != _PROMPT_DIR or path.suffix.lower() != ".md":
+        raise ValueError(
+            "prompt filename must resolve to a Markdown file inside agentos/config/prompts"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.stat().st_size > _MAX_CONFIG_BYTES:
+        raise ValueError(f"prompt exceeds {_MAX_CONFIG_BYTES} bytes: {path}")
+    return path.read_text(encoding="utf-8")

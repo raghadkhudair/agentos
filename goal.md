@@ -8,7 +8,7 @@ The system is an autonomous software-delivery runtime, not a chatbot and not a c
 
 ## Required product behavior
 
-1. A bootstrap PM/Tech Lead converts the request into measurable DoD criteria, a dependency-aware backlog, bounded file ownership, required outputs, and a role plan.
+1. A bootstrap PM/Tech Lead captures a clean bounded Git/source-document snapshot, then converts the request into one versioned measurable DoD contract, dependency-aware backlog, bounded file ownership, required outputs, and role plan. Bounded repair failures block planning; no generic substitute DoD is allowed.
 2. The plan always contains PM, infrastructure, QA, code-review, and security-review responsibility. Role caps and total-agent caps are enforced before actor creation.
 3. An infrastructure agent detects available capacity, preserves host headroom, and distributes CPU, memory, concurrency, provider, and model allocations among agents.
 4. Every working agent is an independent Ray actor with its own actor state, database client, event-bus client, memory cursor, heartbeat, inbox, permissions, and task lease.
@@ -16,10 +16,10 @@ The system is an autonomous software-delivery runtime, not a chatbot and not a c
 6. Workers can use different providers/models. Selection responds to role, purpose, capability, and `low`, `standard`, `high`, or `critical` task complexity.
 7. All provider calls pass through one gateway with a durable pre-egress intent, redaction, egress policy, concurrency, budget, retry/fallback, circuit-breaker, and linked append-only audit enforcement.
 8. All writes and commands pass through governance and execution supervisors. An optional real local Git source is cloned into an isolated managed repository, source work occurs in task-specific Git worktrees, commands run in a bounded network-disabled Docker sandbox, and database actions use a physically separate sandbox database.
-9. Code cannot merge without required outputs, checksummed artifacts, independent review, passing tests/commands, and recorded DoD evidence.
-10. Completion is controlled by the evaluator, not by an agent statement. The evaluator uses the latest evidence for each criterion/evidence type, validates object existence/checksum, and rejects missing or failed evidence.
-11. Empty queues with incomplete DoD trigger replanning. Stagnation, deadlocks, expired leases, unhealthy agents, unsafe behavior, and service failures trigger bounded recovery or a visible blocked state.
-12. The operator can initialize, plan, run, detach, inspect, pause, resume, approve, reject, and diagnose the system from the CLI.
+9. Code cannot merge without required outputs, checksummed artifacts, isolated per-criterion independent review, passing branch checks, and canonical evidence. The merge lock is renewable, integration attempts are durable/replayable, and all eligible criterion commands pass on the prospective integrated tree before the merge commit is created.
+10. Completion is controlled by the evaluator, not by an agent statement. Each run is bound to the active contract version/hash, evidence cutoff/generation, and integrated HEAD; evidence is evaluated at criterion, task, or artifact cardinality and may be `MISSING`, `FAILED`, `INCONCLUSIVE`, `STALE`, or `SATISFIED`.
+11. Empty runnable queues with incomplete DoD trigger typed, idempotent, bounded replanning. Stagnation, deadlocks, expired leases, unhealthy agents, unsafe behavior, and repeated evaluator/provider/storage failures trigger bounded recovery or a visible blocked state.
+12. The operator can initialize, plan, run, detach, inspect, re-evaluate, govern DoD amendments/waivers, pause, resume, approve, reject, and diagnose the system from the CLI.
 
 ## Data-system contract
 
@@ -92,15 +92,17 @@ If the requested independent team cannot safely fit, planning fails closed inste
 
 ## Completion contract
 
-A project reaches `DOD_SATISFIED` only when all mandatory criteria pass. For each criterion, the evaluator requires its configured evidence types and artifacts. Evidence may include:
+A project reaches `DOD_SATISFIED` only when one persisted evaluation snapshot proves every mandatory active criterion. The final transaction compares the exact contract version/hash, integrated HEAD, and evidence generation again; any concurrent task/evidence/amendment/integration change forces reevaluation. Terminal projects reject later task, artifact, evidence, and contract writes.
+
+Each criterion declares evidence scope (`criterion`, `task`, or `artifact`), and evidence carries its criterion hash/version, authenticated producer role, task/artifact references, subject/integration commits, command and sandbox digests, watched paths/contracts, and generation. Evidence may include:
 
 - a MinIO artifact whose object exists and whose SHA-256 matches PostgreSQL metadata;
-- a sandbox command with a zero exit code;
-- an independent code/security review with a passing decision;
+- a canonical sandbox command with a zero exit code on the current integrated HEAD;
+- an independent per-criterion code/security review bound to the exact artifact, checksum, acceptance criteria, and subject commit;
 - a required path/output produced by the owning task;
 - task completion after successful Git integration.
 
-When retries occur, the latest evidence for a criterion/type/task supersedes earlier attempts. A stale failed test therefore does not permanently poison a repaired task, and a stale passing test cannot override a newer failure.
+When retries occur, the latest evidence at the declared scope supersedes earlier attempts. Path/glob and affected-contract overlap conservatively invalidates older artifact/review evidence after later merges; unscoped older evidence is invalidated rather than guessed fresh. Operational uncertainty is persisted as `INCONCLUSIVE`, never silently converted to pass or deterministic failure. An approved waiver is criterion/hash/reason-bound and does not weaken any other criterion.
 
 ## Production delivery stance
 
@@ -121,6 +123,11 @@ AgentOS does not autonomously deploy to an external live environment. External p
 | All requested AI providers | `providers.yaml`, `ProviderRegistry`, gateway routing and registry tests |
 | Complexity/model switching | `TaskComplexity`, purpose map, role preference order, per-agent assignments and fallback |
 | Enhanced configuration/models | Typed `Settings`, YAML schema versions, safe expansion, validation, generated runtime config |
+| Versioned DoD authority | `TeamPlan` cross-validation, `dod_contract_versions`, criterion hashes/provenance/locks, atomic `persist_plan_bundle`, governed amendment/waiver |
+| Revision-bound evidence | append-only `dod_evidence`, authenticated producer/task/artifact/commit/digest fields, SQL contract guard, path/contract freshness logic |
+| Integrated-head correctness | durable `integration_attempts`, renewable merge lock, prospective-tree command suite, integration-HEAD command evidence |
+| Race-free completion | coalesced `dod_evaluation_runs/items`, evidence-generation cutoff, atomic `finalize_project`, terminal write barriers |
+| Bounded repair and recovery | typed durable gaps, runnable-work watchdog, exact-gap graph validation, one immutable idempotent replan batch per evaluation generation, exponential backoff, immediate resume reconciliation |
 | Production-safe direct path | fail-closed secrets/dependencies, sandbox, review/test/DoD gates, no canary/staging completion path |
 | Documentation | README, architecture plan, goal contract, and subsystem documents aligned to live code |
 

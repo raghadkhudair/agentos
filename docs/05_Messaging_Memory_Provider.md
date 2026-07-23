@@ -10,6 +10,8 @@
 
 This yields at-least-once delivery. Consumers must be idempotent; event IDs and receipts provide the deduplication identity.
 
+DoD completion does not depend on event delivery alone. After integration the worker invokes the evaluator/supervisor handler and persists `DOD_EVALUATED`; the project evidence generation remains pending for periodic reconciliation if that handoff fails. Replanning task-created events use a deterministic UUID derived from project, causal evaluation run, and task so duplicate PM delivery cannot multiply notifications.
+
 ## Trigger routing
 
 `TriggerEngineActor` consumes the project stream with a consumer group and resolves agent subscriptions from PostgreSQL. It publishes a copy to each matching per-agent inbox. Targeted events route only to their target. Inbox and project streams have configured maximum lengths.
@@ -81,6 +83,8 @@ Purpose can derive complexity—for example, heartbeat compression is low, ordin
 - An append-only `provider_call_intents` row is persisted before external egress; prompt/response hashes, provider/model, usage, cost, latency, redaction status, and error types are then linked in append-only `provider_calls` rows.
 
 No keys or response bodies are stored in provider audit rows.
+
+Per-criterion code/security review remains routed through this gateway. Reviewer actors add a smaller local semaphore and bounded LRU/single-flight cache keyed by review kind, criterion hash, subject commit, artifact checksum, content hash, and risk where applicable. Only successful exact-snapshot decisions are reusable; provider/parse uncertainty becomes append-only `INCONCLUSIVE` evidence and is never cached.
 
 ## Embeddings
 

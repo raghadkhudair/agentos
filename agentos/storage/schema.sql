@@ -32,9 +32,33 @@ CREATE TABLE IF NOT EXISTS projects (
     architecture TEXT NOT NULL DEFAULT '',
     assumptions JSONB NOT NULL DEFAULT '[]'::jsonb,
     dod JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dod_contract_version INTEGER NOT NULL DEFAULT 0 CHECK (dod_contract_version >= 0),
+    dod_contract_hash TEXT,
+    planning_context_hash TEXT,
+    planning_prompt_version TEXT,
+    source_revision TEXT,
+    integration_head TEXT,
+    evidence_generation BIGINT NOT NULL DEFAULT 0 CHECK (evidence_generation >= 0),
+    evaluation_requested_generation BIGINT NOT NULL DEFAULT 0 CHECK (evaluation_requested_generation >= 0),
+    evaluation_failure_count INTEGER NOT NULL DEFAULT 0 CHECK (evaluation_failure_count >= 0),
+    replan_attempts INTEGER NOT NULL DEFAULT 0 CHECK (replan_attempts >= 0),
+    next_replan_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS dod_contract_version INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS dod_contract_hash TEXT,
+    ADD COLUMN IF NOT EXISTS planning_context_hash TEXT,
+    ADD COLUMN IF NOT EXISTS planning_prompt_version TEXT,
+    ADD COLUMN IF NOT EXISTS source_revision TEXT,
+    ADD COLUMN IF NOT EXISTS integration_head TEXT,
+    ADD COLUMN IF NOT EXISTS evidence_generation BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS evaluation_requested_generation BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS evaluation_failure_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS replan_attempts INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS next_replan_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS agents (
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -128,12 +152,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     dod_criteria TEXT[] NOT NULL DEFAULT '{}',
     affected_contracts TEXT[] NOT NULL DEFAULT '{}',
     risk_level TEXT NOT NULL DEFAULT 'LOW' CHECK (risk_level IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+    dod_contract_version INTEGER NOT NULL DEFAULT 1 CHECK (dod_contract_version >= 1),
     lease_expires_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, external_key)
 );
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS dod_contract_version INTEGER NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
     task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -315,6 +342,26 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS dod_contract_versions (
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    contract_version INTEGER NOT NULL CHECK (contract_version >= 1),
+    contract_hash TEXT NOT NULL CHECK (length(contract_hash) = 64),
+    source_revision TEXT NOT NULL,
+    planning_context_hash TEXT NOT NULL CHECK (length(planning_context_hash) = 64),
+    prompt_version TEXT NOT NULL,
+    contract JSONB NOT NULL,
+    created_by TEXT NOT NULL,
+    amendment_reason TEXT,
+    approval_id UUID REFERENCES approval_requests(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (project_id, contract_version),
+    UNIQUE (project_id, contract_hash),
+    CHECK (
+        (contract_version = 1 AND amendment_reason IS NULL)
+        OR (contract_version > 1 AND amendment_reason IS NOT NULL AND approval_id IS NOT NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS dod_checks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -324,9 +371,18 @@ CREATE TABLE IF NOT EXISTS dod_checks (
     verification_command JSONB NOT NULL DEFAULT '[]'::jsonb,
     required_artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
     required_evidence_types TEXT[] NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (status IN (
-        'NOT_STARTED', 'IN_PROGRESS', 'IMPLEMENTED', 'UNDER_REVIEW',
-        'FAILED_VERIFICATION', 'SATISFIED', 'WAIVED_BY_HUMAN'
+    evidence_scopes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    contract_version INTEGER NOT NULL DEFAULT 1,
+    criterion_hash TEXT NOT NULL DEFAULT repeat('0', 64),
+    source TEXT NOT NULL DEFAULT 'system' CHECK (source IN ('user', 'system', 'inferred')),
+    locked BOOLEAN NOT NULL DEFAULT TRUE,
+    mandatory BOOLEAN NOT NULL DEFAULT TRUE,
+    severity TEXT NOT NULL DEFAULT 'required' CHECK (severity IN ('advisory', 'required', 'critical')),
+    affected_contracts TEXT[] NOT NULL DEFAULT '{}',
+    waiver_approval_id UUID REFERENCES approval_requests(id),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'MISSING' CHECK (status IN (
+        'MISSING', 'FAILED', 'INCONCLUSIVE', 'STALE', 'SATISFIED', 'WAIVED_BY_HUMAN'
     )),
     verified_by_agent_id TEXT,
     evidence_summary TEXT,
@@ -335,22 +391,235 @@ CREATE TABLE IF NOT EXISTS dod_checks (
     UNIQUE (project_id, criterion_id)
 );
 
+ALTER TABLE dod_checks
+    ADD COLUMN IF NOT EXISTS evidence_scopes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS contract_version INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS criterion_hash TEXT NOT NULL DEFAULT repeat('0', 64),
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'system',
+    ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS mandatory BOOLEAN NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'required',
+    ADD COLUMN IF NOT EXISTS affected_contracts TEXT[] NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS waiver_approval_id UUID REFERENCES approval_requests(id),
+    ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE dod_checks DROP CONSTRAINT IF EXISTS dod_checks_status_check;
+ALTER TABLE dod_checks ADD CONSTRAINT dod_checks_status_check CHECK (status IN (
+    'NOT_STARTED', 'IN_PROGRESS', 'IMPLEMENTED', 'UNDER_REVIEW', 'FAILED_VERIFICATION',
+    'MISSING', 'FAILED', 'INCONCLUSIVE', 'STALE', 'SATISFIED', 'WAIVED_BY_HUMAN'
+)) NOT VALID;
+ALTER TABLE dod_checks VALIDATE CONSTRAINT dod_checks_status_check;
+
 CREATE TABLE IF NOT EXISTS dod_evidence (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     criterion_id TEXT NOT NULL,
     evidence_type TEXT NOT NULL,
     source_agent_id TEXT NOT NULL,
+    source_role TEXT NOT NULL DEFAULT 'unknown',
+    task_id UUID REFERENCES tasks(id),
     artifact_id UUID REFERENCES artifacts(id),
     command TEXT,
     exit_code INTEGER,
     checksum_sha256 TEXT,
     summary TEXT NOT NULL,
     passed BOOLEAN NOT NULL,
+    run_status TEXT NOT NULL DEFAULT 'OK' CHECK (run_status IN ('OK', 'INCONCLUSIVE')),
+    contract_version INTEGER NOT NULL DEFAULT 1,
+    criterion_hash TEXT NOT NULL DEFAULT repeat('0', 64),
+    subject_commit TEXT,
+    integration_commit TEXT,
+    command_digest TEXT,
+    sandbox_digest TEXT,
+    watched_paths TEXT[] NOT NULL DEFAULT '{}',
+    affected_contracts TEXT[] NOT NULL DEFAULT '{}',
+    evidence_generation BIGINT NOT NULL DEFAULT 0,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     FOREIGN KEY (project_id, criterion_id) REFERENCES dod_checks(project_id, criterion_id) ON DELETE CASCADE
 );
+
+ALTER TABLE dod_evidence
+    ADD COLUMN IF NOT EXISTS source_role TEXT NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS task_id UUID REFERENCES tasks(id),
+    ADD COLUMN IF NOT EXISTS run_status TEXT NOT NULL DEFAULT 'OK',
+    ADD COLUMN IF NOT EXISTS contract_version INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS criterion_hash TEXT NOT NULL DEFAULT repeat('0', 64),
+    ADD COLUMN IF NOT EXISTS subject_commit TEXT,
+    ADD COLUMN IF NOT EXISTS integration_commit TEXT,
+    ADD COLUMN IF NOT EXISTS command_digest TEXT,
+    ADD COLUMN IF NOT EXISTS sandbox_digest TEXT,
+    ADD COLUMN IF NOT EXISTS watched_paths TEXT[] NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS affected_contracts TEXT[] NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS evidence_generation BIGINT NOT NULL DEFAULT 0;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname='dod_evidence_type_check'
+          AND conrelid='dod_evidence'::regclass
+    ) THEN
+        ALTER TABLE dod_evidence ADD CONSTRAINT dod_evidence_type_check CHECK (
+            evidence_type IN ('artifact','test','command','review','security_review','integration')
+        ) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname='dod_evidence_run_status_check'
+          AND conrelid='dod_evidence'::regclass
+    ) THEN
+        ALTER TABLE dod_evidence ADD CONSTRAINT dod_evidence_run_status_check CHECK (
+            run_status IN ('OK','INCONCLUSIVE')
+        ) NOT VALID;
+    END IF;
+END;
+$$;
+
+ALTER TABLE dod_evidence VALIDATE CONSTRAINT dod_evidence_type_check;
+ALTER TABLE dod_evidence VALIDATE CONSTRAINT dod_evidence_run_status_check;
+
+CREATE OR REPLACE FUNCTION agentos_validate_dod_evidence() RETURNS trigger AS $$
+DECLARE
+    criterion_record dod_checks%ROWTYPE;
+    task_record tasks%ROWTYPE;
+    artifact_record artifacts%ROWTYPE;
+    authenticated_role TEXT;
+BEGIN
+    SELECT * INTO criterion_record FROM dod_checks
+    WHERE project_id=NEW.project_id AND criterion_id=NEW.criterion_id AND active;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'evidence criterion must be active in the same project';
+    END IF;
+    IF NEW.contract_version IS DISTINCT FROM criterion_record.contract_version
+       OR NEW.criterion_hash IS DISTINCT FROM criterion_record.criterion_hash THEN
+        RAISE EXCEPTION 'evidence must target the active criterion revision';
+    END IF;
+    IF NOT (NEW.evidence_type = ANY(criterion_record.required_evidence_types)) THEN
+        RAISE EXCEPTION 'evidence type is not authorized by the criterion contract';
+    END IF;
+
+    IF NEW.source_agent_id = 'integration_supervisor' THEN
+        authenticated_role := 'integration_supervisor';
+    ELSE
+        SELECT role INTO authenticated_role FROM agents
+        WHERE project_id=NEW.project_id AND id=NEW.source_agent_id;
+    END IF;
+    IF authenticated_role IS NULL OR NEW.source_role IS DISTINCT FROM authenticated_role THEN
+        RAISE EXCEPTION 'evidence producer role must match an authenticated project identity';
+    END IF;
+
+    IF NEW.task_id IS NOT NULL THEN
+        SELECT * INTO task_record FROM tasks WHERE id=NEW.task_id AND project_id=NEW.project_id;
+        IF NOT FOUND OR NOT (NEW.criterion_id = ANY(task_record.dod_criteria))
+           OR task_record.dod_contract_version IS DISTINCT FROM NEW.contract_version THEN
+            RAISE EXCEPTION 'evidence task must map to the active criterion revision';
+        END IF;
+    END IF;
+    IF NEW.evidence_type IN ('artifact','review','security_review','integration')
+       AND NEW.task_id IS NULL THEN
+        RAISE EXCEPTION '% evidence requires a task reference', NEW.evidence_type;
+    END IF;
+    IF NEW.evidence_type IN ('artifact','test','command') AND NEW.task_id IS NOT NULL
+       AND NEW.source_agent_id IS DISTINCT FROM task_record.owner_agent_id THEN
+        RAISE EXCEPTION 'task evidence must be produced by the assigned task owner';
+    END IF;
+
+    IF NEW.artifact_id IS NOT NULL THEN
+        SELECT * INTO artifact_record FROM artifacts
+        WHERE id=NEW.artifact_id AND project_id=NEW.project_id;
+        IF NOT FOUND OR NEW.task_id IS NULL OR artifact_record.task_id IS DISTINCT FROM NEW.task_id THEN
+            RAISE EXCEPTION 'evidence artifact must belong to its referenced task';
+        END IF;
+    END IF;
+    IF NEW.evidence_type IN ('artifact','review','security_review')
+       AND NEW.artifact_id IS NULL THEN
+        RAISE EXCEPTION '% evidence requires an artifact reference', NEW.evidence_type;
+    END IF;
+    IF NEW.evidence_type IN ('artifact','review','security_review')
+       AND NEW.subject_commit IS NULL THEN
+        RAISE EXCEPTION '% evidence requires a subject commit', NEW.evidence_type;
+    END IF;
+    IF NEW.evidence_type = 'artifact'
+       AND NEW.checksum_sha256 IS DISTINCT FROM artifact_record.checksum_sha256 THEN
+        RAISE EXCEPTION 'artifact evidence checksum must match the durable artifact';
+    END IF;
+
+    IF NEW.evidence_type = 'review' THEN
+        IF authenticated_role <> 'code_reviewer' OR NEW.source_agent_id = task_record.owner_agent_id THEN
+            RAISE EXCEPTION 'review evidence requires an independent code reviewer';
+        END IF;
+    ELSIF NEW.evidence_type = 'security_review' THEN
+        IF authenticated_role <> 'security_reviewer'
+           OR NEW.source_agent_id = task_record.owner_agent_id THEN
+            RAISE EXCEPTION 'security evidence requires an independent security reviewer';
+        END IF;
+    ELSIF NEW.evidence_type IN ('test','command') THEN
+        IF NEW.command IS NULL OR NEW.exit_code IS NULL OR NEW.subject_commit IS NULL
+           OR NEW.passed IS DISTINCT FROM (NEW.exit_code = 0 AND NEW.run_status = 'OK') THEN
+            RAISE EXCEPTION 'test and command evidence must match its execution result';
+        END IF;
+    ELSIF NEW.evidence_type = 'integration' THEN
+        IF NEW.source_agent_id <> 'integration_supervisor' OR NEW.integration_commit IS NULL THEN
+            RAISE EXCEPTION 'integration evidence requires the integration supervisor and commit';
+        END IF;
+    END IF;
+    IF NEW.run_status = 'INCONCLUSIVE' AND NEW.passed THEN
+        RAISE EXCEPTION 'inconclusive evidence cannot pass';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS dod_evidence_contract_guard ON dod_evidence;
+CREATE TRIGGER dod_evidence_contract_guard BEFORE INSERT ON dod_evidence
+FOR EACH ROW EXECUTE FUNCTION agentos_validate_dod_evidence();
+
+CREATE TABLE IF NOT EXISTS dod_evaluation_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    contract_version INTEGER NOT NULL,
+    contract_hash TEXT NOT NULL CHECK (length(contract_hash) = 64),
+    integration_head TEXT,
+    evidence_generation BIGINT NOT NULL,
+    evidence_cutoff TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status TEXT NOT NULL DEFAULT 'RUNNING' CHECK (status IN (
+        'RUNNING', 'SATISFIED', 'UNSATISFIED', 'INCONCLUSIVE', 'STALE', 'ERROR'
+    )),
+    requested_by TEXT NOT NULL,
+    failure_summary JSONB NOT NULL DEFAULT '[]'::jsonb,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS dod_evaluation_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    evaluation_run_id UUID NOT NULL REFERENCES dod_evaluation_runs(id) ON DELETE CASCADE,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    criterion_id TEXT NOT NULL,
+    criterion_hash TEXT NOT NULL CHECK (length(criterion_hash) = 64),
+    status TEXT NOT NULL CHECK (status IN (
+        'MISSING', 'FAILED', 'INCONCLUSIVE', 'STALE', 'SATISFIED', 'WAIVED_BY_HUMAN'
+    )),
+    reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    evidence_ids UUID[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (evaluation_run_id, criterion_id)
+);
+
+CREATE TABLE IF NOT EXISTS integration_attempts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    pre_head TEXT NOT NULL,
+    branch_head TEXT NOT NULL,
+    result_head TEXT,
+    status TEXT NOT NULL DEFAULT 'PREPARED' CHECK (status IN ('PREPARED','COMMITTED','ABORTED')),
+    failure_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_prepared_integration_per_project
+ON integration_attempts(project_id) WHERE status='PREPARED';
 
 CREATE TABLE IF NOT EXISTS resource_plans (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -390,6 +659,19 @@ ON provider_call_intents(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_project_time_idx ON audit_events(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS dod_checks_project_status_idx ON dod_checks(project_id, status);
 CREATE INDEX IF NOT EXISTS dod_evidence_criterion_idx ON dod_evidence(project_id, criterion_id, passed, evidence_type);
+CREATE INDEX IF NOT EXISTS dod_evidence_snapshot_idx
+ON dod_evidence(project_id, contract_version, evidence_generation, created_at DESC);
+CREATE INDEX IF NOT EXISTS dod_evaluation_runs_project_idx
+ON dod_evaluation_runs(project_id, created_at DESC);
+WITH duplicate_running AS (
+    SELECT id,row_number() OVER (PARTITION BY project_id ORDER BY created_at DESC,id DESC) rank
+    FROM dod_evaluation_runs WHERE status='RUNNING'
+)
+UPDATE dod_evaluation_runs SET status='ERROR',completed_at=now(),
+  failure_summary='[{"code":"DUPLICATE_RUNNING_EVALUATION_MIGRATED"}]'::jsonb
+WHERE id IN (SELECT id FROM duplicate_running WHERE rank > 1);
+CREATE UNIQUE INDEX IF NOT EXISTS one_running_dod_evaluation_per_project
+ON dod_evaluation_runs(project_id) WHERE status='RUNNING';
 
 CREATE OR REPLACE FUNCTION agentos_enforce_project_isolation() RETURNS trigger AS $$
 DECLARE
@@ -442,6 +724,12 @@ BEGIN
             END IF;
         END IF;
     ELSIF TG_TABLE_NAME = 'dod_evidence' THEN
+        IF NEW.task_id IS NOT NULL THEN
+            SELECT project_id INTO referenced_project FROM tasks WHERE id=NEW.task_id;
+            IF referenced_project IS NULL OR referenced_project IS DISTINCT FROM NEW.project_id THEN
+                RAISE EXCEPTION 'evidence task must belong to the same project';
+            END IF;
+        END IF;
         IF NEW.artifact_id IS NOT NULL THEN
             SELECT project_id INTO referenced_project FROM artifacts WHERE id=NEW.artifact_id;
             IF referenced_project IS NULL OR referenced_project IS DISTINCT FROM NEW.project_id THEN
@@ -523,10 +811,26 @@ DROP TRIGGER IF EXISTS provider_call_intents_append_only ON provider_call_intent
 CREATE TRIGGER provider_call_intents_append_only BEFORE UPDATE OR DELETE ON provider_call_intents
 FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
 
+DROP TRIGGER IF EXISTS dod_evidence_append_only ON dod_evidence;
+CREATE TRIGGER dod_evidence_append_only BEFORE UPDATE OR DELETE ON dod_evidence
+FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
+
+DROP TRIGGER IF EXISTS dod_contract_versions_append_only ON dod_contract_versions;
+CREATE TRIGGER dod_contract_versions_append_only BEFORE UPDATE OR DELETE ON dod_contract_versions
+FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
+
+DROP TRIGGER IF EXISTS dod_evaluation_items_append_only ON dod_evaluation_items;
+CREATE TRIGGER dod_evaluation_items_append_only BEFORE UPDATE OR DELETE ON dod_evaluation_items
+FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
+
 INSERT INTO schema_migrations(version, description)
 VALUES (2, 'Milvus-MongoDB-MinIO production architecture')
 ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_migrations(version, description)
 VALUES (3, 'Reliable messaging, lossless memory, provider intents, and project isolation')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_migrations(version, description)
+VALUES (4, 'Versioned DoD contracts, append-only provenance, and fenced evaluations')
 ON CONFLICT (version) DO NOTHING;

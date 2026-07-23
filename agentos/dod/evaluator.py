@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
+from collections import defaultdict
 from typing import Any
 from urllib.parse import parse_qs, urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import ray
 import structlog
+from git import Repo
 from pydantic import BaseModel, Field
 
+from agentos.config.loader import runtime_tuning
 from agentos.config.settings import Settings
 from agentos.messaging.events import Event, EventType
+from agentos.runtime.team_plan import EvidenceScope, EvidenceType
 from agentos.storage.clients.minio import MinioObjectClient
 from agentos.storage.clients.postgres import PostgresClient
 from agentos.storage.repositories import DoDRepository, EventRepository
@@ -19,23 +24,203 @@ from agentos.storage.repositories import DoDRepository, EventRepository
 logger = structlog.get_logger()
 
 
+def _path_dependency_overlap(path: str, dependency: str) -> bool:
+    """Conservatively match concrete changed paths to files, directories, or globs."""
+
+    changed = path.replace("\\", "/").strip("/")
+    pattern = dependency.replace("\\", "/").strip("/")
+    literal_prefix = pattern.split("*", 1)[0].split("?", 1)[0].split("[", 1)[0]
+    return bool(
+        changed == pattern
+        or changed.startswith(f"{pattern}/")
+        or fnmatch.fnmatch(changed, pattern)
+        or (literal_prefix and changed.startswith(literal_prefix))
+    )
+
+
+def _revision_freshness_reason(
+    repository: Repo,
+    row: dict[str, Any],
+    integration_head: str | None,
+    evidence: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    """Return a typed reason when revision-bound artifact/review evidence is not fresh."""
+
+    subject_commit = row.get("subject_commit")
+    if not subject_commit or not integration_head:
+        return (
+            "EVIDENCE_FRESHNESS_INCONCLUSIVE",
+            "evidence or evaluation snapshot lacks a resolvable subject revision",
+        )
+    if subject_commit == integration_head:
+        return None
+    try:
+        subject = repository.commit(str(subject_commit))
+        head = repository.commit(str(integration_head))
+        if not repository.is_ancestor(subject, head):
+            return (
+                "EVIDENCE_STALE_REVISION",
+                "evidence subject commit is not an ancestor of the integrated HEAD",
+            )
+        changed_paths = [
+            item.replace("\\", "/")
+            for item in repository.git.diff(
+                "--name-only", subject.hexsha, head.hexsha, "--"
+            ).splitlines()
+            if item
+        ]
+    except Exception:
+        return (
+            "EVIDENCE_FRESHNESS_INCONCLUSIVE",
+            "the evidence revision could not be compared with the integrated HEAD",
+        )
+
+    watched_paths = [str(item) for item in row.get("watched_paths") or []]
+    touched = sorted(
+        path
+        for path in changed_paths
+        if any(_path_dependency_overlap(path, dependency) for dependency in watched_paths)
+    )
+    if touched:
+        return (
+            "EVIDENCE_STALE_PATH",
+            f"later integrated changes overlap watched paths: {', '.join(touched[:20])}",
+        )
+
+    affected_contracts = set(row.get("affected_contracts") or [])
+    if affected_contracts:
+        for candidate in evidence:
+            if candidate.get("evidence_type") != EvidenceType.INTEGRATION.value:
+                continue
+            if candidate.get("task_id") == row.get("task_id"):
+                continue
+            if not affected_contracts.intersection(candidate.get("affected_contracts") or []):
+                continue
+            candidate_commit = candidate.get("integration_commit")
+            if not candidate_commit:
+                continue
+            try:
+                integrated = repository.commit(str(candidate_commit))
+                if (
+                    integrated.hexsha != subject.hexsha
+                    and repository.is_ancestor(subject, integrated)
+                    and repository.is_ancestor(integrated, head)
+                ):
+                    return (
+                        "EVIDENCE_STALE_CONTRACT",
+                        "a later task changed an affected contract used by this evidence",
+                    )
+            except Exception:
+                return (
+                    "EVIDENCE_FRESHNESS_INCONCLUSIVE",
+                    "an affected-contract revision could not be resolved",
+                )
+
+    if changed_paths and not watched_paths and not affected_contracts:
+        return (
+            "EVIDENCE_STALE_UNSCOPED",
+            "unscoped evidence predates later integrated changes and was invalidated conservatively",
+        )
+    return None
+
+
+def _classify_item_status(reason_codes: set[str]) -> str:
+    """Apply the fail-closed precedence used by every persisted criterion verdict."""
+
+    if any(code.endswith("INCONCLUSIVE") for code in reason_codes):
+        return "INCONCLUSIVE"
+    if any("STALE" in code for code in reason_codes):
+        return "STALE"
+    if reason_codes.intersection(
+        {
+            "EVIDENCE_FAILED",
+            "ARTIFACT_LENGTH_MISMATCH",
+            "ARTIFACT_CHECKSUM_MISMATCH",
+            "ARTIFACT_URI_INVALID",
+            "COMMAND_CONTRACT_MISMATCH",
+            "WAIVER_INVALID",
+        }
+    ):
+        return "FAILED"
+    if reason_codes:
+        return "MISSING"
+    return "SATISFIED"
+
+
+class DoDGap(BaseModel):
+    criterion_id: str | None = None
+    code: str
+    message: str
+    evidence_type: str | None = None
+    scope: str | None = None
+    task_id: str | None = None
+    artifact_id: str | None = None
+    retryable: bool = True
+    suggested_owner_role: str = "pm_tech_lead"
+
+
 class DoDItemStatus(BaseModel):
     criterion_id: str
+    criterion_hash: str
     description: str
-    status: str = "NOT_STARTED"
-    evidence_summary: str = ""
+    status: str
+    reasons: list[DoDGap] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class DoDEvaluation(BaseModel):
     project_id: str
+    evaluation_run_id: str
+    contract_version: int
+    contract_hash: str
+    integration_head: str | None
+    evidence_generation: int
     satisfied: bool
+    status: str
     items: list[DoDItemStatus]
-    gaps: list[str] = Field(default_factory=list)
+    gaps: list[DoDGap] = Field(default_factory=list)
 
 
-@ray.remote(num_cpus=0.1, max_concurrency=4)  # type: ignore[call-overload]
+def _gap(
+    code: str,
+    message: str,
+    *,
+    evidence_type: str | None = None,
+    scope: str | None = None,
+    task_id: str | None = None,
+    artifact_id: str | None = None,
+    retryable: bool | None = None,
+    suggested_owner_role: str | None = None,
+) -> DoDGap:
+    if suggested_owner_role is None:
+        if evidence_type == EvidenceType.SECURITY_REVIEW.value:
+            suggested_owner_role = "security_reviewer"
+        elif evidence_type == EvidenceType.REVIEW.value:
+            suggested_owner_role = "code_reviewer"
+        elif evidence_type in {EvidenceType.TEST.value, EvidenceType.COMMAND.value}:
+            suggested_owner_role = "qa_engineer"
+        elif "INCONCLUSIVE" in code or code in {
+            "REPOSITORY_HEAD_DRIFT",
+            "ARTIFACT_URI_INVALID",
+        }:
+            suggested_owner_role = "platform_engineer"
+        else:
+            suggested_owner_role = "pm_tech_lead"
+    return DoDGap(
+        code=code,
+        message=message,
+        evidence_type=evidence_type,
+        scope=scope,
+        task_id=task_id,
+        artifact_id=artifact_id,
+        retryable=(code != "WAIVER_INVALID" if retryable is None else retryable),
+        suggested_owner_role=suggested_owner_role,
+    )
+
+
+@ray.remote(num_cpus=0.1, max_concurrency=1)  # type: ignore[call-overload]
 class DoDEvaluatorActor:
-    """Evidence-only completion gate; model output is never completion evidence."""
+    """Evaluate one immutable contract/evidence/HEAD snapshot and persist every reason."""
 
     def __init__(self, settings_payload: dict[str, Any]):
         self.settings = Settings(**settings_payload)
@@ -43,232 +228,565 @@ class DoDEvaluatorActor:
         self.repo = DoDRepository(self.db)
         self.events = EventRepository(self.db)
         self.minio = MinioObjectClient(self.settings)
+        self.evaluator_instance_id = f"dod_evaluator:{uuid4()}"
 
-    async def _validate_artifact_evidence(self, project_id: str) -> list[tuple[str, str]]:
-        rows = await self.db.fetch(
-            """
-            WITH current_artifacts AS (
-              SELECT DISTINCT ON (
-                e.criterion_id, COALESCE(e.metadata->>'task_id',e.source_agent_id), a.title
-              ) e.*
-              FROM dod_evidence e
-              JOIN artifacts a ON a.id=e.artifact_id AND a.project_id=e.project_id
-              WHERE e.project_id=$1 AND e.evidence_type='artifact'
-              ORDER BY e.criterion_id,COALESCE(e.metadata->>'task_id',e.source_agent_id),
-                       a.title,e.created_at DESC
+    def _is_ancestor(self, project_id: str, commit: str | None, head: str | None) -> bool:
+        if not commit or not head:
+            return False
+        if commit == head:
+            return True
+        try:
+            repository = Repo(self.settings.workspace / project_id / "repository")
+            return bool(repository.is_ancestor(repository.commit(commit), repository.commit(head)))
+        except Exception:
+            return False
+
+    def _revision_gap(
+        self,
+        project_id: str,
+        row: dict[str, Any],
+        integration_head: str | None,
+        evidence: list[dict[str, Any]],
+        *,
+        evidence_type: EvidenceType,
+        scope: EvidenceScope,
+        task_id: str,
+        artifact_id: str,
+    ) -> DoDGap | None:
+        try:
+            repository = Repo(self.settings.workspace / project_id / "repository")
+            result = _revision_freshness_reason(repository, row, integration_head, evidence)
+        except Exception:
+            result = (
+                "EVIDENCE_FRESHNESS_INCONCLUSIVE",
+                "the managed repository is unavailable for evidence freshness validation",
             )
-            SELECT e.criterion_id,a.id,a.object_uri,a.checksum_sha256,a.content_length
-            FROM current_artifacts e
-            JOIN artifacts a ON a.id=e.artifact_id AND a.project_id=e.project_id
-            WHERE e.passed
-            """,
-            UUID(project_id),
+        if result is None:
+            return None
+        code, message = result
+        return _gap(
+            code,
+            message,
+            evidence_type=evidence_type.value,
+            scope=scope.value,
+            task_id=task_id,
+            artifact_id=artifact_id,
         )
-        failures: list[tuple[str, str]] = []
-        for row in rows:
-            parsed = urlparse(row["object_uri"])
-            if parsed.scheme != "minio":
-                failures.append((row["criterion_id"], "artifact URI is not a MinIO object"))
-                continue
-            try:
-                version = parse_qs(parsed.query).get("versionId", [None])[0]
-                metadata = await self.minio.stat(
-                    bucket=parsed.netloc,
-                    object_name=parsed.path.lstrip("/"),
-                    version_id=version,
-                )
-                if metadata.size != row["content_length"]:
-                    failures.append(
-                        (row["criterion_id"], "artifact length does not match durable record")
-                    )
-                if not metadata.sha256 or metadata.sha256 != row["checksum_sha256"]:
-                    failures.append(
-                        (row["criterion_id"], "artifact checksum does not match durable record")
-                    )
-            except Exception as error:
-                failures.append(
-                    (row["criterion_id"], f"artifact unavailable: {type(error).__name__}")
-                )
-        return failures
 
-    async def _validate_criterion_contracts(self, project_id: str) -> list[tuple[str, str]]:
-        checks = await self.repo.get_project_dod_status(project_id)
-        failures: list[tuple[str, str]] = []
-        for check in checks:
-            criterion_id = str(check["criterion_id"])
-            required_artifacts = list(check.get("required_artifacts") or [])
-            if required_artifacts:
-                rows = await self.db.fetch(
-                    """
-                    WITH current_artifacts AS (
-                      SELECT DISTINCT ON (
-                        e.criterion_id,COALESCE(e.metadata->>'task_id',e.source_agent_id),a.title
-                      ) e.*,a.title
-                      FROM dod_evidence e
-                      JOIN artifacts a ON a.id=e.artifact_id AND a.project_id=e.project_id
-                      WHERE e.project_id=$1 AND e.criterion_id=$2
-                        AND e.evidence_type='artifact'
-                      ORDER BY e.criterion_id,COALESCE(e.metadata->>'task_id',e.source_agent_id),
-                               a.title,e.created_at DESC
-                    )
-                    SELECT DISTINCT a.title FROM current_artifacts e
-                    JOIN artifacts a ON a.id=e.artifact_id
-                      AND a.project_id=e.project_id
-                    WHERE e.passed
-                    """,
-                    UUID(project_id),
-                    criterion_id,
+    async def _artifact_health(self, artifact: dict[str, Any]) -> DoDGap | None:
+        parsed = urlparse(str(artifact["object_uri"]))
+        if parsed.scheme != "minio":
+            return _gap(
+                "ARTIFACT_URI_INVALID",
+                "artifact URI is not a versioned MinIO object",
+                evidence_type=EvidenceType.ARTIFACT.value,
+                scope=EvidenceScope.ARTIFACT.value,
+                artifact_id=str(artifact["id"]),
+            )
+        try:
+            version = parse_qs(parsed.query).get("versionId", [None])[0]
+            metadata = await self.minio.stat(
+                bucket=parsed.netloc,
+                object_name=parsed.path.lstrip("/"),
+                version_id=version,
+            )
+        except Exception as error:
+            return _gap(
+                "ARTIFACT_STORE_INCONCLUSIVE",
+                f"artifact store could not be verified: {type(error).__name__}",
+                evidence_type=EvidenceType.ARTIFACT.value,
+                scope=EvidenceScope.ARTIFACT.value,
+                artifact_id=str(artifact["id"]),
+            )
+        if metadata.size != artifact["content_length"]:
+            return _gap(
+                "ARTIFACT_LENGTH_MISMATCH",
+                "artifact length does not match the durable record",
+                evidence_type=EvidenceType.ARTIFACT.value,
+                scope=EvidenceScope.ARTIFACT.value,
+                artifact_id=str(artifact["id"]),
+            )
+        if not metadata.sha256 or metadata.sha256 != artifact["checksum_sha256"]:
+            return _gap(
+                "ARTIFACT_CHECKSUM_MISMATCH",
+                "artifact checksum does not match the durable record",
+                evidence_type=EvidenceType.ARTIFACT.value,
+                scope=EvidenceScope.ARTIFACT.value,
+                artifact_id=str(artifact["id"]),
+            )
+        return None
+
+    @staticmethod
+    def _latest(
+        evidence: list[dict[str, Any]],
+        evidence_type: str,
+        task_id: str | None = None,
+        artifact_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        matches = [
+            row
+            for row in evidence
+            if row["evidence_type"] == evidence_type
+            and (task_id is None or str(row.get("task_id")) == task_id)
+            and (artifact_id is None or str(row.get("artifact_id")) == artifact_id)
+        ]
+        return (
+            max(matches, key=lambda row: (row["created_at"], str(row["id"]))) if matches else None
+        )
+
+    async def _evaluate_criterion(
+        self,
+        project_id: str,
+        run: dict[str, Any],
+        check: dict[str, Any],
+        tasks: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        artifacts: list[dict[str, Any]],
+        all_evidence: list[dict[str, Any]],
+    ) -> DoDItemStatus:
+        criterion_id = str(check["criterion_id"])
+        reasons: list[DoDGap] = []
+        used: set[str] = set()
+        required = [EvidenceType(item) for item in check["required_evidence_types"] or []]
+        scopes = dict(check.get("evidence_scopes") or {})
+        mapped_tasks = [task for task in tasks if criterion_id in (task["dod_criteria"] or [])]
+        if check["status"] == "WAIVED_BY_HUMAN":
+            approval = await self.db.fetchval(
+                "SELECT status FROM approval_requests WHERE id=$1",
+                check["waiver_approval_id"],
+            )
+            if approval == "APPROVED":
+                return DoDItemStatus(
+                    criterion_id=criterion_id,
+                    criterion_hash=str(check["criterion_hash"]),
+                    description=str(check["description"]),
+                    status="WAIVED_BY_HUMAN",
                 )
-                titles = [str(row["title"]).replace("\\", "/") for row in rows]
-                missing = [
-                    pattern
-                    for pattern in required_artifacts
-                    if not any(
-                        fnmatch.fnmatch(title, str(pattern).replace("\\", "/")) for title in titles
+            reasons.append(_gap("WAIVER_INVALID", "waiver lacks a current approved decision"))
+        if check["mandatory"] and not mapped_tasks:
+            reasons.append(_gap("TASK_MAPPING_MISSING", "mandatory criterion has no mapped tasks"))
+        for task in mapped_tasks:
+            task_id = str(task["id"])
+            if task["status"] != "COMPLETED":
+                reasons.append(
+                    _gap(
+                        "TASK_INCOMPLETE",
+                        f"mapped task is {task['status']}",
+                        scope=EvidenceScope.TASK.value,
+                        task_id=task_id,
                     )
-                ]
-                if missing:
-                    failures.append(
-                        (criterion_id, f"required artifacts missing: {', '.join(missing)}")
-                    )
-            required_command = list(check.get("verification_command") or [])
-            if required_command:
-                command_row = await self.db.fetchrow(
-                    """
-                    SELECT command,passed FROM dod_evidence
-                    WHERE project_id=$1 AND criterion_id=$2 AND evidence_type IN ('test','command')
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    UUID(project_id),
-                    criterion_id,
                 )
-                actual_command: list[str] = []
-                if command_row and command_row["command"]:
+
+        criterion_artifacts = [
+            artifact
+            for artifact in artifacts
+            if any(artifact["task_id"] == task["id"] for task in mapped_tasks)
+        ]
+        required_patterns = list(check.get("required_artifacts") or [])
+        for pattern in required_patterns:
+            matches = [
+                artifact
+                for artifact in criterion_artifacts
+                if fnmatch.fnmatch(
+                    str(artifact["title"]).replace("\\", "/"), str(pattern).replace("\\", "/")
+                )
+            ]
+            if not matches:
+                reasons.append(
+                    _gap(
+                        "ARTIFACT_PATTERN_MISSING",
+                        f"required artifact pattern has no durable match: {pattern}",
+                        evidence_type=EvidenceType.ARTIFACT.value,
+                        scope=EvidenceScope.ARTIFACT.value,
+                    )
+                )
+
+        for evidence_type in required:
+            scope = EvidenceScope(scopes.get(evidence_type.value, EvidenceScope.CRITERION.value))
+            if scope == EvidenceScope.CRITERION:
+                row = self._latest(evidence, evidence_type.value)
+                if row is None:
+                    reasons.append(
+                        _gap(
+                            "EVIDENCE_MISSING",
+                            f"criterion-scoped {evidence_type.value} evidence is missing",
+                            evidence_type=evidence_type.value,
+                            scope=scope.value,
+                        )
+                    )
+                    continue
+                used.add(str(row["id"]))
+                if row["run_status"] == "INCONCLUSIVE":
+                    reasons.append(
+                        _gap(
+                            "EVIDENCE_INCONCLUSIVE",
+                            row["summary"],
+                            evidence_type=evidence_type.value,
+                            scope=scope.value,
+                        )
+                    )
+                elif not row["passed"]:
+                    reasons.append(
+                        _gap(
+                            "EVIDENCE_FAILED",
+                            row["summary"],
+                            evidence_type=evidence_type.value,
+                            scope=scope.value,
+                        )
+                    )
+                if evidence_type in {EvidenceType.TEST, EvidenceType.COMMAND}:
                     try:
-                        parsed = json.loads(command_row["command"])
-                        if isinstance(parsed, list):
-                            actual_command = [str(item) for item in parsed]
+                        actual_command = json.loads(row["command"] or "[]")
                     except json.JSONDecodeError:
                         actual_command = []
-                if (
-                    not command_row
-                    or not command_row["passed"]
-                    or actual_command != required_command
-                ):
-                    failures.append((criterion_id, "required verification command has not passed"))
-        return failures
+                    if actual_command != list(check["verification_command"] or []):
+                        reasons.append(
+                            _gap(
+                                "COMMAND_CONTRACT_MISMATCH",
+                                "executed command differs from the criterion contract",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                            )
+                        )
+                    if row["subject_commit"] != run["integration_head"]:
+                        reasons.append(
+                            _gap(
+                                "EVIDENCE_STALE_HEAD",
+                                "verification did not run against the current integrated HEAD",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                            )
+                        )
+            elif scope == EvidenceScope.TASK:
+                for task in mapped_tasks:
+                    task_id = str(task["id"])
+                    row = self._latest(evidence, evidence_type.value, task_id=task_id)
+                    if row is None:
+                        reasons.append(
+                            _gap(
+                                "EVIDENCE_MISSING",
+                                f"task-scoped {evidence_type.value} evidence is missing",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                                task_id=task_id,
+                            )
+                        )
+                        continue
+                    used.add(str(row["id"]))
+                    if row["run_status"] == "INCONCLUSIVE":
+                        reasons.append(
+                            _gap(
+                                "EVIDENCE_INCONCLUSIVE",
+                                row["summary"],
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                                task_id=task_id,
+                            )
+                        )
+                    elif not row["passed"]:
+                        reasons.append(
+                            _gap(
+                                "EVIDENCE_FAILED",
+                                row["summary"],
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                                task_id=task_id,
+                            )
+                        )
+                    if evidence_type == EvidenceType.INTEGRATION and not self._is_ancestor(
+                        project_id, row["integration_commit"], run["integration_head"]
+                    ):
+                        reasons.append(
+                            _gap(
+                                "INTEGRATION_STALE_HEAD",
+                                "task integration commit is not an ancestor of current HEAD",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                                task_id=task_id,
+                            )
+                        )
+            else:
+                for task in mapped_tasks:
+                    task_id = str(task["id"])
+                    task_artifacts = [
+                        artifact
+                        for artifact in criterion_artifacts
+                        if artifact["task_id"] == task["id"]
+                    ]
+                    if not task_artifacts:
+                        reasons.append(
+                            _gap(
+                                "TASK_ARTIFACT_MISSING",
+                                "mapped task has no durable artifact",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                                task_id=task_id,
+                            )
+                        )
+                    for artifact in task_artifacts:
+                        artifact_id = str(artifact["id"])
+                        row = self._latest(
+                            evidence,
+                            evidence_type.value,
+                            task_id=task_id,
+                            artifact_id=artifact_id,
+                        )
+                        if row is None:
+                            reasons.append(
+                                _gap(
+                                    "EVIDENCE_MISSING",
+                                    f"artifact-scoped {evidence_type.value} evidence is missing",
+                                    evidence_type=evidence_type.value,
+                                    scope=scope.value,
+                                    task_id=task_id,
+                                    artifact_id=artifact_id,
+                                )
+                            )
+                            continue
+                        used.add(str(row["id"]))
+                        if row["run_status"] == "INCONCLUSIVE":
+                            reasons.append(
+                                _gap(
+                                    "EVIDENCE_INCONCLUSIVE",
+                                    row["summary"],
+                                    evidence_type=evidence_type.value,
+                                    scope=scope.value,
+                                    task_id=task_id,
+                                    artifact_id=artifact_id,
+                                )
+                            )
+                        elif not row["passed"]:
+                            reasons.append(
+                                _gap(
+                                    "EVIDENCE_FAILED",
+                                    row["summary"],
+                                    evidence_type=evidence_type.value,
+                                    scope=scope.value,
+                                    task_id=task_id,
+                                    artifact_id=artifact_id,
+                                )
+                            )
+                        if evidence_type in {
+                            EvidenceType.ARTIFACT,
+                            EvidenceType.REVIEW,
+                            EvidenceType.SECURITY_REVIEW,
+                        }:
+                            revision_gap = self._revision_gap(
+                                project_id,
+                                row,
+                                run["integration_head"],
+                                all_evidence,
+                                evidence_type=evidence_type,
+                                scope=scope,
+                                task_id=task_id,
+                                artifact_id=artifact_id,
+                            )
+                            if revision_gap:
+                                reasons.append(revision_gap)
+                        if evidence_type == EvidenceType.ARTIFACT:
+                            health_gap = await self._artifact_health(artifact)
+                            if health_gap:
+                                health_gap.task_id = task_id
+                                reasons.append(health_gap)
 
-    async def _validate_current_execution_evidence(self, project_id: str) -> list[tuple[str, str]]:
-        failures: list[tuple[str, str]] = []
-        rows = await self.db.fetch(
-            """
-            WITH latest AS (
-              SELECT DISTINCT ON (
-                project_id,criterion_id,evidence_type,
-                COALESCE(metadata->>'task_id',source_agent_id)
-              ) *
-              FROM dod_evidence
-              WHERE project_id=$1 AND evidence_type IN ('test','command','review','security_review')
-              ORDER BY project_id,criterion_id,evidence_type,
-                       COALESCE(metadata->>'task_id',source_agent_id),created_at DESC
-            )
-            SELECT e.*,t.owner_agent_id,a.role AS reviewer_role
-            FROM latest e
-            LEFT JOIN tasks t
-              ON t.id=(NULLIF(e.metadata->>'task_id',''))::uuid AND t.project_id=e.project_id
-            LEFT JOIN agents a
-              ON a.project_id=e.project_id AND a.id=e.source_agent_id
-            """,
-            UUID(project_id),
-        )
-        for row in rows:
-            criterion_id = str(row["criterion_id"])
-            evidence_type = str(row["evidence_type"])
-            if evidence_type in {"test", "command"} and (
-                not row["passed"] or row["exit_code"] != 0
-            ):
-                failures.append((criterion_id, "latest command evidence did not exit successfully"))
-            if evidence_type in {"review", "security_review"} and row["passed"]:
-                expected_role = (
-                    "security_reviewer" if evidence_type == "security_review" else "code_reviewer"
-                )
-                if row["source_agent_id"] == row["owner_agent_id"]:
-                    failures.append((criterion_id, "review evidence is not independent"))
-                elif row["reviewer_role"] != expected_role:
-                    failures.append((criterion_id, f"{evidence_type} producer role is invalid"))
-        return failures
-
-    async def _validate_mapped_tasks(self, project_id: str) -> list[tuple[str, str]]:
-        rows = await self.db.fetch(
-            """
-            SELECT c.criterion_id,t.id AS task_id,t.status,
-              EXISTS(
-                SELECT 1 FROM dod_evidence e
-                WHERE e.project_id=t.project_id AND e.criterion_id=c.criterion_id
-                  AND e.metadata->>'task_id'=t.id::text
-                  AND e.evidence_type='integration' AND e.passed
-              ) AS integrated
-            FROM dod_checks c
-            JOIN tasks t ON t.project_id=c.project_id AND c.criterion_id=ANY(t.dod_criteria)
-            WHERE c.project_id=$1
-            """,
-            UUID(project_id),
-        )
-        failures: list[tuple[str, str]] = []
-        for row in rows:
-            if row["status"] != "COMPLETED" or not row["integrated"]:
-                failures.append(
-                    (
-                        str(row["criterion_id"]),
-                        f"mapped task {row['task_id']} is not completed and integrated",
+        status = _classify_item_status({reason.code for reason in reasons})
+        for reason in reasons:
+            reason.criterion_id = criterion_id
+            if reason.task_id:
+                responsible_task: dict[str, Any] | None = None
+                for candidate in mapped_tasks:
+                    if str(candidate["id"]) == reason.task_id:
+                        responsible_task = candidate
+                        break
+                if responsible_task and reason.suggested_owner_role == "pm_tech_lead":
+                    reason.suggested_owner_role = str(
+                        responsible_task.get("owner_role") or "pm_tech_lead"
                     )
-                )
-        return failures
+        return DoDItemStatus(
+            criterion_id=criterion_id,
+            criterion_hash=str(check["criterion_hash"]),
+            description=str(check["description"]),
+            status=status,
+            reasons=reasons,
+            evidence_ids=sorted(used),
+        )
 
     async def evaluate(self, project_id: str, dod: list[Any] | None = None) -> dict[str, Any]:
         del dod
-        rows = await self.repo.evaluate_and_persist(project_id)
-        contract_failures = [
-            *await self._validate_artifact_evidence(project_id),
-            *await self._validate_criterion_contracts(project_id),
-            *await self._validate_current_execution_evidence(project_id),
-            *await self._validate_mapped_tasks(project_id),
+        run = await self.repo.start_evaluation(project_id, self.evaluator_instance_id)
+        if run.get("reused_running"):
+            deadline = asyncio.get_running_loop().time() + float(
+                runtime_tuning()["dod"]["recovery_scan_seconds"]
+            )
+            while asyncio.get_running_loop().time() < deadline:
+                current_status = await self.db.fetchval(
+                    "SELECT status FROM dod_evaluation_runs WHERE id=$1", run["id"]
+                )
+                if current_status != "RUNNING":
+                    return await self.evaluate(project_id)
+                await asyncio.sleep(0.5)
+            raise TimeoutError("coalesced DoD evaluation did not reach a durable terminal state")
+        if run.get("reused"):
+            rows = await self.db.fetch(
+                """
+                SELECT i.*,c.description FROM dod_evaluation_items i
+                JOIN dod_checks c ON c.project_id=i.project_id
+                  AND c.criterion_id=i.criterion_id AND c.active
+                WHERE i.evaluation_run_id=$1 ORDER BY i.created_at
+                """,
+                run["id"],
+            )
+            items = [
+                DoDItemStatus(
+                    criterion_id=str(row["criterion_id"]),
+                    criterion_hash=str(row["criterion_hash"]),
+                    description=str(row["description"]),
+                    status=str(row["status"]),
+                    reasons=[DoDGap.model_validate(item) for item in row["reasons"] or []],
+                    evidence_ids=[str(item) for item in row["evidence_ids"] or []],
+                )
+                for row in rows
+            ]
+            gaps = [reason for item in items for reason in item.reasons]
+            return DoDEvaluation(
+                project_id=project_id,
+                evaluation_run_id=str(run["id"]),
+                contract_version=int(run["contract_version"]),
+                contract_hash=str(run["contract_hash"]),
+                integration_head=run["integration_head"],
+                evidence_generation=int(run["evidence_generation"]),
+                satisfied=run["status"] == "SATISFIED",
+                status=str(run["status"]),
+                items=items,
+                gaps=gaps,
+            ).model_dump(mode="json")
+        checks = [
+            dict(row)
+            for row in await self.db.fetch(
+                """
+                SELECT * FROM dod_checks WHERE project_id=$1 AND active AND contract_version=$2
+                ORDER BY created_at
+                """,
+                UUID(project_id),
+                run["contract_version"],
+            )
         ]
-        for criterion_id, reason in contract_failures:
-            await self.repo.update_criterion_status(
+        tasks = [
+            dict(row)
+            for row in await self.db.fetch(
+                "SELECT * FROM tasks WHERE project_id=$1 AND dod_contract_version=$2",
+                UUID(project_id),
+                run["contract_version"],
+            )
+        ]
+        evidence_rows = [
+            dict(row)
+            for row in await self.db.fetch(
+                """
+                SELECT * FROM dod_evidence WHERE project_id=$1 AND contract_version=$2
+                  AND evidence_generation<=$3 AND created_at<=$4 ORDER BY created_at
+                """,
+                UUID(project_id),
+                run["contract_version"],
+                run["evidence_generation"],
+                run["evidence_cutoff"],
+            )
+        ]
+        evidence_by_criterion: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in evidence_rows:
+            evidence_by_criterion[str(row["criterion_id"])].append(row)
+        artifacts = [
+            dict(row)
+            for row in await self.db.fetch(
+                "SELECT * FROM artifacts WHERE project_id=$1", UUID(project_id)
+            )
+        ]
+        items = [
+            await self._evaluate_criterion(
                 project_id,
-                criterion_id,
-                "FAILED_VERIFICATION",
-                "dod_evaluator",
-                reason,
+                run,
+                check,
+                tasks,
+                evidence_by_criterion[str(check["criterion_id"])],
+                artifacts,
+                evidence_rows,
             )
-        failure_map = {criterion: reason for criterion, reason in contract_failures}
-        items: list[DoDItemStatus] = []
-        gaps: list[str] = []
-        for row in rows:
-            status = "FAILED_VERIFICATION" if row["criterion_id"] in failure_map else row["status"]
-            summary = failure_map.get(row["criterion_id"], row.get("evidence_summary", ""))
-            item = DoDItemStatus(
-                criterion_id=row["criterion_id"],
-                description=row["description"],
-                status=status,
-                evidence_summary=summary,
-            )
-            items.append(item)
-            if status != "SATISFIED":
-                gaps.append(row["criterion_id"])
-        satisfied = bool(items) and not gaps
+            for check in checks
+        ]
+        try:
+            observed_head = Repo(
+                self.settings.workspace / project_id / "repository"
+            ).head.commit.hexsha
+        except Exception:
+            observed_head = None
+        if run["integration_head"] and observed_head != run["integration_head"]:
+            for item in items:
+                check = next(row for row in checks if row["criterion_id"] == item.criterion_id)
+                if not check["mandatory"]:
+                    continue
+                item.reasons.append(
+                    _gap(
+                        "REPOSITORY_HEAD_DRIFT",
+                        "managed repository HEAD differs from the fenced integration HEAD",
+                        scope=EvidenceScope.CRITERION.value,
+                    )
+                )
+                item.reasons[-1].criterion_id = item.criterion_id
+                item.status = "STALE"
+        mandatory_ids = {str(check["criterion_id"]) for check in checks if check["mandatory"]}
+        mandatory_items = [item for item in items if item.criterion_id in mandatory_ids]
+        satisfied = bool(mandatory_items) and all(
+            item.status in {"SATISFIED", "WAIVED_BY_HUMAN"} for item in mandatory_items
+        )
+        all_gaps = [reason for item in items for reason in item.reasons]
+        if satisfied:
+            status = "SATISFIED"
+        elif any(item.status == "INCONCLUSIVE" for item in mandatory_items):
+            status = "INCONCLUSIVE"
+        else:
+            status = "UNSATISFIED"
+        persisted = await self.repo.persist_evaluation(
+            str(run["id"]),
+            [item.model_dump(mode="json") for item in items],
+            status,
+            [item.model_dump(mode="json") for item in all_gaps],
+        )
+        if persisted["stale"]:
+            satisfied = False
+            status = "STALE"
+            snapshot_gap = _gap("EVALUATION_SNAPSHOT_STALE", "project changed during evaluation")
+            all_gaps.append(snapshot_gap)
+            for item in items:
+                item.status = "STALE"
+                item_gap = snapshot_gap.model_copy(deep=True)
+                item_gap.criterion_id = item.criterion_id
+                item.reasons.append(item_gap)
         event = Event(
             project_id=project_id,
             event_type=EventType.DOD_EVALUATED,
             producer_agent_id="dod_evaluator",
-            payload={"satisfied": satisfied, "gaps": gaps},
+            payload={
+                "evaluation_run_id": str(run["id"]),
+                "contract_version": run["contract_version"],
+                "contract_hash": run["contract_hash"],
+                "integration_head": run["integration_head"],
+                "evidence_generation": run["evidence_generation"],
+                "satisfied": satisfied,
+                "status": status,
+                "gaps": [item.model_dump(mode="json") for item in all_gaps],
+            },
         )
         await self.events.save_event(project_id, event)
-        logger.info("dod_evaluated", project_id=project_id, satisfied=satisfied, gaps=gaps)
+        logger.info("dod_evaluated", project_id=project_id, satisfied=satisfied, status=status)
         return DoDEvaluation(
             project_id=project_id,
+            evaluation_run_id=str(run["id"]),
+            contract_version=int(run["contract_version"]),
+            contract_hash=str(run["contract_hash"]),
+            integration_head=run["integration_head"],
+            evidence_generation=int(run["evidence_generation"]),
             satisfied=satisfied,
+            status=status,
             items=items,
-            gaps=gaps,
+            gaps=all_gaps,
         ).model_dump(mode="json")

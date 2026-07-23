@@ -6,7 +6,7 @@ from typing import Any
 
 import structlog
 
-from agentos.config.loader import guardrail_policies
+from agentos.config.loader import guardrail_policies, runtime_tuning
 from agentos.config.settings import Settings
 from agentos.messaging.events import Event, EventType
 from agentos.storage.clients.dragonfly import DragonflyClient
@@ -29,7 +29,14 @@ class _Watchdog:
         self.db = database
         self.events = EventRepository(database)
 
-    async def emit(self, project_id: str, event_type: EventType, payload: dict[str, Any]) -> None:
+    async def emit(
+        self,
+        project_id: str,
+        event_type: EventType,
+        payload: dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
         await self.events.save_event(
             project_id,
             Event(
@@ -37,6 +44,7 @@ class _Watchdog:
                 event_type=event_type,
                 producer_agent_id=self.PRODUCER_IDS[self.__class__.__name__],
                 payload=payload,
+                correlation_id=correlation_id,
             ),
         )
 
@@ -49,24 +57,104 @@ class DoDWatchdog(_Watchdog):
         self.projects = ProjectRepository(database)
 
     async def inspect_and_act(
-        self, project_id: str, dod_satisfied: bool, dod_gaps: list[str]
+        self,
+        project_id: str,
+        dod_satisfied: bool,
+        dod_gaps: list[dict[str, Any]],
+        *,
+        evaluation_run_id: str | None = None,
     ) -> dict[str, Any]:
-        active = await self.db.fetchval(
+        counts = await self.db.fetchrow(
             """
-            SELECT count(*) FROM tasks
-            WHERE project_id=$1::uuid AND status NOT IN ('COMPLETED','CANCELLED')
+            SELECT
+              count(*) FILTER(WHERE t.status IN ('CLAIMED','IN_PROGRESS','UNDER_REVIEW')) executing,
+              count(*) FILTER(
+                WHERE t.status='PENDING' AND NOT EXISTS(
+                  SELECT 1 FROM task_dependencies td
+                  JOIN tasks dependency ON dependency.id=td.depends_on_task_id
+                  WHERE td.task_id=t.id AND dependency.status<>'COMPLETED'
+                )
+              ) runnable,
+              count(*) FILTER(WHERE t.status NOT IN ('COMPLETED','CANCELLED')) nonterminal
+            FROM tasks t WHERE t.project_id=$1::uuid
             """,
             project_id,
         )
-        if dod_satisfied or int(active or 0) > 0:
+        assert counts is not None
+        if dod_satisfied or int(counts["executing"] or 0) > 0 or int(counts["runnable"] or 0) > 0:
             return {"action_required": "NONE", "status": "COMPLIANT"}
-        await self.projects.update_status(project_id, "REPLANNING")
+        tuning = runtime_tuning()["dod"]
+        maximum = int(tuning["max_replan_attempts"])
+        delay = int(tuning["replan_backoff_seconds"])
+        async with self.db.transaction() as connection:
+            project = await connection.fetchrow(
+                "SELECT status,replan_attempts,next_replan_at FROM projects WHERE id=$1::uuid FOR UPDATE",
+                project_id,
+            )
+            if project is None:
+                raise LookupError(f"project not found: {project_id}")
+            if project["next_replan_at"] and project["next_replan_at"] > datetime.now(UTC):
+                return {"action_required": "NONE", "status": "BACKOFF"}
+            attempts = int(project["replan_attempts"] or 0)
+            if attempts >= maximum:
+                await connection.execute(
+                    "UPDATE projects SET status='BLOCKED_REQUIRES_INPUT' WHERE id=$1::uuid",
+                    project_id,
+                )
+                exhausted = True
+            else:
+                exhausted = False
+            if not exhausted and evaluation_run_id:
+                duplicate = await connection.fetchval(
+                    """
+                    SELECT 1 FROM events WHERE project_id=$1::uuid
+                      AND event_type='REPLANNING_TRIGGERED' AND correlation_id=$2 LIMIT 1
+                    """,
+                    project_id,
+                    evaluation_run_id,
+                )
+                if duplicate:
+                    return {"action_required": "NONE", "status": "COALESCED"}
+            if not exhausted:
+                attempts += 1
+                await connection.execute(
+                    """
+                    UPDATE projects SET status='REPLANNING',replan_attempts=$2,
+                      next_replan_at=now()+($3*interval '1 second') WHERE id=$1::uuid
+                    """,
+                    project_id,
+                    attempts,
+                    delay * (2 ** (attempts - 1)),
+                )
+        if exhausted:
+            await self.emit(
+                project_id,
+                EventType.BLOCKER_CREATED,
+                {
+                    "reason": "bounded_replanning_exhausted",
+                    "attempts": attempts,
+                    "gaps": dod_gaps,
+                },
+                correlation_id=evaluation_run_id,
+            )
+            return {"action_required": "BLOCK", "attempts": attempts, "gaps": dod_gaps}
         await self.emit(
             project_id,
             EventType.REPLANNING_TRIGGERED,
-            {"reason": "empty_backlog_with_unsatisfied_dod", "gaps": dod_gaps},
+            {
+                "reason": "no_runnable_work_with_unsatisfied_dod",
+                "gaps": dod_gaps,
+                "evaluation_run_id": evaluation_run_id,
+                "attempt": attempts,
+                "nonterminal_tasks": int(counts["nonterminal"] or 0),
+            },
+            correlation_id=evaluation_run_id,
         )
-        return {"action_required": "TRIGGER_REPLANNING", "gaps": dod_gaps}
+        return {
+            "action_required": "TRIGGER_REPLANNING",
+            "gaps": dod_gaps,
+            "attempt": attempts,
+        }
 
 
 class StagnationWatchdog(_Watchdog):

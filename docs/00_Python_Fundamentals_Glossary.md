@@ -36,11 +36,11 @@ Dragonfly Streams consumer groups distribute messages with explicit acknowledgem
 
 ## Definition of Done (DoD)
 
-A DoD criterion is a measurable delivery requirement with configured verification type, required evidence types, required artifacts, and optional command. Completion means all mandatory criteria have current passing evidence, not merely that tasks say `COMPLETED`.
+A DoD criterion is one versioned, hashed, provenance/lock/severity-labeled delivery requirement with exactly one executable test/command contract, required artifacts/evidence, and criterion/task/artifact evidence cardinality. Completion means one fenced evaluation proves all mandatory active criteria at the current integrated HEAD and evidence generation, not merely that tasks say `COMPLETED`.
 
 ## Artifact and evidence
 
-An artifact is a produced file/object with a Git commit, MinIO version, size, and checksum. Evidence links a DoD criterion to an artifact, test command, or independent review. The latest attempt is authoritative.
+An artifact is a produced file/object with a Git commit, MinIO version, size, and checksum. Append-only evidence links the exact criterion version/hash to an authenticated producer, task, artifact, subject/integration commit, command/sandbox digest, and watched paths/contracts. The latest matching attempt at the criterion's declared scope is considered only if it is fresh for the fenced HEAD.
 
 ## Memory tiers
 

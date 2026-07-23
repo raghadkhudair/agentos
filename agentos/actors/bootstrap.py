@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+from string import Template
 from typing import Any
 from uuid import UUID
 
 import ray
 import structlog
 
-from agentos.config.loader import team_roles
+from agentos.config.loader import load_prompt, runtime_tuning, team_roles
 from agentos.config.runtime import TaskComplexity
 from agentos.config.settings import Settings
 from agentos.provider.gateway import ProviderRequest
-from agentos.runtime.team_plan import AgentRole, AgentSpec, DoDCriterion, InitialTask, TeamPlan
+from agentos.runtime.team_plan import AgentRole, AgentSpec, InitialTask, TeamPlan
 
 logger = structlog.get_logger()
+_PROMPT_VERSION = "bootstrap-dod-v1"
 
 
 @ray.remote(num_cpus=0.2, max_restarts=5, max_task_retries=2)
@@ -53,24 +55,12 @@ class BootstrapAgentActor:
             collaboration_interval_seconds=self.settings.collaboration_interval_seconds,
         )
 
-    def _fallback(self, user_request: str, max_agents_total: int) -> TeamPlan:
-        config = team_roles()
-        data = config["fallback_team"]
-        agents = [self._hydrate_agent(item, config) for item in data["agents"]]
-        return TeamPlan(
-            project_name=data["project_name"],
-            user_request=user_request,
-            high_level_architecture=data["high_level_architecture"],
-            dod=[DoDCriterion.model_validate(item) for item in data["dod"]],
-            assumptions=data["assumptions"],
-            agents=agents,
-            initial_backlog=[
-                InitialTask.model_validate(item) for item in data.get("initial_backlog", [])
-            ],
-            max_requested_agents=max_agents_total,
-        )
-
-    async def create_team_plan(self, user_request: str, max_agents_total: int) -> dict[str, Any]:
+    async def create_team_plan(
+        self,
+        user_request: str,
+        max_agents_total: int,
+        planning_context: dict[str, Any],
+    ) -> dict[str, Any]:
         config = team_roles()
         role_catalog = [
             {
@@ -81,76 +71,75 @@ class BootstrapAgentActor:
             }
             for item in config.get("roles", [])
         ]
-        system_prompt = f"""You are the bootstrap PM and principal architect for AgentOS.
-Create a production delivery plan for the user's software request. Use only roles in this catalog:
-{json.dumps(role_catalog, indent=2)}
-
-Mandatory rules:
-- Include exactly one PM_TECH_LEAD and one INFRASTRUCTURE_AGENT.
-- Include SECURITY_REVIEWER, CODE_REVIEWER, and QA_ENGINEER.
-- The total count must be at most {max_agents_total}.
-- Every DoD criterion must be independently verifiable and require explicit evidence.
-- Every initial task must have bounded allowed_paths, blocked_paths, expected_outputs, and review needs.
-- Every initial task must name an owner_role that is present in the planned team.
-- Do not include credentials, deployment secrets, or fabricated evidence.
-
-Return one JSON object with this shape:
-{{
-  "project_name": "safe-name",
-  "high_level_architecture": "architecture",
-  "dod": [{{
-    "criterion_id": "safe-id",
-    "description": "measurable outcome",
-    "verification_type": "test|artifact|review|command|composite",
-    "verification_command": ["executable", "arg"],
-    "required_artifacts": ["path"],
-    "required_evidence_types": ["artifact", "test", "review"]
-  }}],
-  "assumptions": ["assumption"],
-  "agents": [{{"role": "ROLE_NAME", "count": 1, "description": "assignment", "ownership_domains": ["domain"]}}],
-  "initial_backlog": [{{
-    "title": "task", "description": "details", "priority": 1,
-    "risk_level": "LOW|MEDIUM|HIGH|CRITICAL", "complexity": "low|standard|high|critical",
-    "acceptance_criteria": ["criterion"], "allowed_paths": ["path"],
-    "blocked_paths": ["path"], "expected_outputs": ["path"],
-    "required_reviewers": ["role"], "owner_role": "ROLE_NAME",
-    "dod_criteria": ["criterion-id"],
-    "depends_on": ["earlier task title"]
-  }}]
-}}"""
-        request = ProviderRequest(
-            purpose="bootstrap_team_planning",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_request},
-            ],
-            budget_key=UUID(self.project_id),
-            agent_id="pm_tech_lead-bootstrap",
-            agent_role="pm_tech_lead",
-            complexity=TaskComplexity.HIGH,
-            required_capabilities={"chat", "json"},
+        prompt = Template(load_prompt("bootstrap_pm.md")).safe_substitute(
+            ROLE_CATALOG=json.dumps(role_catalog, sort_keys=True),
+            MAX_AGENTS=str(max_agents_total),
+            PLANNING_CONTEXT=json.dumps(planning_context, sort_keys=True),
         )
-        try:
-            response = await self.provider.get_completion.remote(
-                request.model_dump(mode="json"), response_format={"type": "json_object"}
+        attempts = int(runtime_tuning().get("planning", {}).get("max_validation_attempts", 2))
+        validation_error = ""
+        for attempt in range(1, attempts + 1):
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_request},
+            ]
+            if validation_error:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous JSON was rejected by the contract validator. Correct every "
+                            f"reported issue and return a complete replacement object: {validation_error}"
+                        ),
+                    }
+                )
+            request = ProviderRequest(
+                purpose="bootstrap_team_planning",
+                messages=messages,
+                budget_key=UUID(self.project_id),
+                agent_id="pm_tech_lead-bootstrap",
+                agent_role="pm_tech_lead",
+                complexity=TaskComplexity.HIGH,
+                required_capabilities={"chat", "json"},
             )
-            data = json.loads(self._strip_json_fence(response["content"]))
-            agents = [self._hydrate_agent(item, config) for item in data["agents"]]
-            plan = TeamPlan(
-                project_name=data["project_name"],
-                user_request=user_request,
-                high_level_architecture=data["high_level_architecture"],
-                dod=[DoDCriterion.model_validate(item) for item in data["dod"]],
-                assumptions=list(data.get("assumptions", [])),
-                agents=agents,
-                initial_backlog=[
-                    InitialTask.model_validate(item) for item in data.get("initial_backlog", [])
-                ],
-                max_requested_agents=max_agents_total,
-            )
-            return plan.model_dump(mode="json")
-        except Exception as error:
-            logger.error(
-                "bootstrap_plan_failed_using_safe_fallback", error_type=type(error).__name__
-            )
-            return self._fallback(user_request, max_agents_total).model_dump(mode="json")
+            try:
+                response = await self.provider.get_completion.remote(
+                    request.model_dump(mode="json"), response_format={"type": "json_object"}
+                )
+                data = json.loads(self._strip_json_fence(response["content"]))
+                agents = [self._hydrate_agent(item, config) for item in data["agents"]]
+                plan = TeamPlan(
+                    project_name=data["project_name"],
+                    user_request=user_request,
+                    high_level_architecture=data["high_level_architecture"],
+                    dod=data["dod"],
+                    assumptions=list(data.get("assumptions", [])),
+                    agents=agents,
+                    initial_backlog=[
+                        InitialTask.model_validate(item) for item in data["initial_backlog"]
+                    ],
+                    max_requested_agents=max_agents_total,
+                    contract_version=1,
+                    source_revision=data["source_revision"],
+                    planning_context_hash=data["planning_context_hash"],
+                    prompt_version=data["prompt_version"],
+                )
+                if plan.source_revision != planning_context["source_revision"]:
+                    raise ValueError(
+                        "source_revision does not match the immutable planning snapshot"
+                    )
+                if plan.planning_context_hash != planning_context["planning_context_hash"]:
+                    raise ValueError("planning_context_hash does not match the supplied context")
+                if plan.prompt_version != _PROMPT_VERSION:
+                    raise ValueError(f"prompt_version must be {_PROMPT_VERSION}")
+                return plan.model_dump(mode="json")
+            except Exception as error:
+                validation_error = f"{type(error).__name__}: {error}"[:4000]
+                logger.warning(
+                    "bootstrap_plan_validation_failed",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    error=validation_error,
+                )
+        logger.error("bootstrap_plan_failed_closed", attempts=attempts, error=validation_error)
+        raise RuntimeError(f"planning failed after {attempts} bounded attempts: {validation_error}")

@@ -49,16 +49,17 @@ System-service actors are per project, named with the project suffix, and detach
 ### 3.1 Bootstrap
 
 1. Validate production secrets when `AGENTOS_ENV=production`.
-2. Connect PostgreSQL and apply the idempotent v3 schema under an advisory lock.
+2. Connect PostgreSQL and apply the idempotent v4 schema under an advisory lock.
 3. Health-check PostgreSQL, Dragonfly, MongoDB, MinIO, and Milvus.
 4. Create a project in `PLANNING` state.
-5. Start per-project service actors and reliable outbox routing.
-6. Ask the bootstrap PM for a structured plan through the provider gateway.
-7. Validate DoD IDs/evidence, role caps, mandatory roles, task ownership, dependencies, and bounded paths.
-8. Persist project plan, DoD checks, backlog, dependencies, service registrations, and planned agents.
-9. Ask the infrastructure agent for a resource/model allocation and persist both resource plan and generated runtime snapshot.
-10. If no provider is configured, leave the plan durable and set `BLOCKED_REQUIRES_INPUT`; never synthesize credentials or fabricated work.
-11. Otherwise create independent workers, set `RUNNING`, and start health/watchdog loops.
+5. Capture a clean, bounded, Git-tracked planning context with source revision, relevant docs/tree, and canonical hash; block if it cannot be trusted.
+6. Start per-project service actors and reliable outbox routing, then ask the bootstrap PM for a structured versioned contract through the provider gateway.
+7. Retry invalid provider JSON/contracts only within the configured bound; never activate a generic fallback plan.
+8. Validate criterion IDs/hashes/provenance/locks/evidence scopes, mandatory coverage, artifact/output and affected-contract mapping, reviewer/security unions, role caps, task ownership/dependencies, and bounded paths. Re-run the full cross-object validator after roster reduction.
+9. Ask the infrastructure agent for the exact resource/model allocation.
+10. In one PostgreSQL transaction persist the contract version, active criteria, backlog/dependencies, resource plan, safe runtime/planning snapshot, and planned agents. Any late failure rolls back the whole bundle.
+11. If no provider is configured, leave the plan durable and set `BLOCKED_REQUIRES_INPUT`; never synthesize credentials or fabricated work.
+12. Otherwise create independent workers, set `RUNNING`, and start health/watchdog loops.
 
 ### 3.2 Work cycle
 
@@ -71,15 +72,17 @@ Each worker:
 5. Claims one dependency-ready `PENDING` task matching its role under a PostgreSQL row lock and expiring lease.
 6. Selects task complexity and asks the provider gateway for one structured next action.
 7. Seals the `ActionRequest` and submits it to execution.
-8. For writes, records the versioned artifact, obtains independent review for that artifact, checks aggregate expected outputs, runs criterion commands in the sandbox, records evidence, and requests merge.
+8. For writes, records versioned artifact evidence, obtains fresh isolated review per criterion (plus security review where required), checks aggregate expected outputs, runs each canonical criterion command in the task sandbox, records authenticated revision-bound evidence, and requests merge.
 9. Creates a checkpoint, updates mid-term/long-term memory, and broadcasts durable progress.
 10. Returns to idle; no worker is a perpetual busy loop when no work is available.
 
 ### 3.3 Completion and replanning
 
-The DoD evaluator groups the latest evidence by criterion, evidence type, and task. It checks required evidence, exit codes, independent reviews, MinIO object presence/version/checksum, and required artifact names. All mandatory criteria must pass.
+Each evaluation run snapshots the active contract version/hash, integrated HEAD, evidence cutoff, and evidence generation. The evaluator applies each declared evidence scope at criterion, mapped-task, or artifact cardinality; checks authenticated producer/task/artifact/commit provenance, exact commands, independent reviews, MinIO version/length/checksum, integration ancestry, repository HEAD, and conservative watched-path/affected-contract freshness; and persists every typed reason as `MISSING`, `FAILED`, `INCONCLUSIVE`, `STALE`, or `SATISFIED`.
 
-If the queue is empty but gaps remain, the DoD watchdog emits `REPLANNING_TRIGGERED` to the PM. New tasks must map only to existing DoD gaps and must name a present owner role. `DOD_SATISFIED` is written only after the evaluator reports satisfaction.
+Task/evidence/integration changes advance one durable generation. Evaluation requests are serialized/coalesced per project, code-triggered after integration, and periodically reconciled for recovery. `DOD_SATISFIED` is one atomic compare-and-set against the exact satisfied contract/HEAD/generation; terminal writers then fail closed.
+
+If there is no executing or dependency-runnable work but typed gaps remain, the DoD watchdog emits one evaluation-correlated `REPLANNING_TRIGGERED` event. The PM submits a typed `InitialTask` graph covering exactly the durable run's unsatisfied criteria; current roles, reviewers, paths/outputs, required artifacts/contracts, dependency existence/cycles, and security requirements are validated in one transaction. One deterministic immutable task batch is bound to that evaluation generation: exact redelivery is a no-op and a changed duplicate is rejected. Attempts use exponential backoff and end in a visible blocker. Ordinary replanning cannot mutate the DoD; amendments and waivers require exact hash/reason-bound human approval.
 
 ## 4. Agent independence and collaboration
 
@@ -157,7 +160,7 @@ Ray CPU resources are scheduling quantities, so the container/thread layers are 
 
 ### 6.1 PostgreSQL: control-plane truth
 
-Schema version 3 contains:
+Schema version 4 contains:
 
 - `schema_migrations`
 - `projects`, `agents`, `tasks`, `task_dependencies`
@@ -167,7 +170,8 @@ Schema version 3 contains:
 - `memory_items`
 - `provider_call_intents`, `provider_calls`
 - `audit_events`, `approval_requests`
-- `dod_checks`, `dod_evidence`
+- `dod_contract_versions`, active `dod_checks`, append-only `dod_evidence`
+- `dod_evaluation_runs`, append-only `dod_evaluation_items`, `integration_attempts`
 - `resource_plans`, `runtime_config_snapshots`
 
 Important mechanics:
@@ -175,7 +179,9 @@ Important mechanics:
 - foreign keys plus table-specific project-isolation triggers prevent orphan/cross-project references;
 - row locks and `SKIP LOCKED` make task/outbox claims concurrent-safe;
 - task leases are renewable and reclaimable;
-- append-only triggers protect provider/audit rows;
+- append-only triggers protect provider/audit/contract/evidence/evaluation-item rows;
+- SQL evidence guards authenticate producer roles and enforce criterion version, evidence type, task/artifact ownership, self-review, result, checksum, and integration requirements;
+- one running evaluation per project plus generation/HEAD fences coalesce work and prevent stale completion;
 - audit events carry previous/current hashes;
 - updated-at triggers are database-side;
 - indexes follow project/status/time/task access paths;
@@ -287,7 +293,9 @@ Database operations use `SANDBOX_DATABASE_URL`, which production validation requ
 
 ### 8.5 Review and merge
 
-The code reviewer uses a separate provider request and identity from the author. Security-sensitive behavior uses the safety reviewer. Reviews become evidence. Verification commands run in the sandbox and become latest-attempt evidence. Merge requires current passing `review` and `test` evidence, then executes a non-fast-forward merge under a Dragonfly merge lock.
+The code and safety reviewers load the current criterion text/hash, task acceptance criteria, exact artifact/checksum, diff, and affected contracts. Each criterion gets an isolated structured provider decision. Calls are concurrency-bounded and successful results are coalesced only for the exact criterion hash, subject commit, artifact checksum, content hash, and review prompt kind; inconclusive results are never cached. Deterministic findings remain fail-closed, and every appended evidence row retains the exact cache/provenance metadata.
+
+Merge evaluates the active criterion evidence policy rather than a hard-coded evidence trio. It acquires a renewable Dragonfly lock, persists a `PREPARED` integration attempt, creates a no-commit prospective merge, and runs every newly eligible unique criterion command in the read-only/network-disabled sandbox against that tree. Failure aborts without a commit. Success creates the non-fast-forward integration commit, atomically fences PostgreSQL to that HEAD, records integrated-HEAD command and per-task integration evidence, and completes the task. `PREPARED` merge, post-commit/pre-database, and `COMMITTED` pre-evidence crash states are replayable without an ungoverned merge path.
 
 Review/test failure returns the task to `PENDING` for repair. Merge conflict moves it to visible `BLOCKED`; it is never silently resolved.
 
@@ -310,14 +318,15 @@ Long-term memory writes first persist the complete scrubbed body and hash in Pos
 - Dependency health verifies all five required stores and reports configured provider availability.
 - Heartbeat loop renews agent/task leases and records health.
 - Expired task leases return to `PENDING`.
-- DoD watchdog triggers replanning or completion evaluation.
+- DoD watchdog distinguishes executing, runnable, and blocked work; it triggers typed bounded replanning or final evaluation.
 - Stagnation watchdog detects repeated checkpoints and stale work.
 - Deadlock watchdog detects cycles in task dependencies.
 - Safety watchdog correlates denied/quarantine audit outcomes.
 - Actor health loop identifies missed heartbeats and restarts/reassigns within configured limits.
-- Errors are structured-log events; repeated service failure changes project state rather than claiming progress.
+- Evaluator failures are counted and bounded; exhaustion persists a blocker and suspends workers rather than logging forever.
+- DoD evaluation is event-triggered after successful integration, generation-coalesced in PostgreSQL, and periodically polled only for recovery.
 
-Pause stops claims while retaining durable state. Resume health-checks stores/providers, reclaims expired leases, restarts missing services/workers, and continues from cursors/checkpoints.
+Pause stops claims while retaining durable state. Resume health-checks stores/providers, reclaims expired leases, restarts missing services/workers, immediately evaluates the latest durable contract/HEAD/generation, and only then resumes periodic health/recovery loops. It does not depend on a prior process's in-memory completion event.
 
 ## 12. Configuration model
 
@@ -365,7 +374,7 @@ mypy agentos
 python -m compileall -q agentos
 ```
 
-Unit/contract gates cover settings, resource envelopes, all provider profiles, plan role ownership, event validation, policy tamper/cross-project/path checks, Git worktrees, schema shape, Compose service/resource contracts, and packaged config/schema data.
+Unit/contract gates cover settings, resource envelopes, all provider profiles, plan role/criterion/output/reviewer contracts, planning-context immutability, packaged prompt uniqueness/version, golden verdict/freshness cases, exact-snapshot review coalescing, task transitions, watchdog bounds, event validation, policy tamper/cross-project/path checks, Git worktrees, schema shape, Compose service/resource contracts, and packaged config/schema data.
 
 Live integration on a fresh Compose project initializes and round-trips:
 
@@ -376,6 +385,9 @@ Live integration on a fresh Compose project initializes and round-trips:
 - Milvus collection/upsert/strong-consistency filtered search.
 - native PostgreSQL JSON codecs plus transactional event/outbox insertion;
 - project-isolation trigger rejection for a cross-project artifact;
+- atomic initial plan rollback after a late persistence failure;
+- authenticated evidence authority, stale-hash/self-review/forged-integration rejection, and append-only enforcement;
+- one-running evaluation coalescing, generation/HEAD finalization races, and terminal task/evidence write barriers;
 - the lossless PostgreSQL-MinIO-MongoDB memory write/hydration path;
 - a network-disabled, read-only-root, non-root Docker sandbox command.
 
@@ -394,6 +406,9 @@ Live integration on a fresh Compose project initializes and round-trips:
 | Nine AI providers | ProviderRegistry/YAML/LiteLLM gateway |
 | Different workers/models by complexity | role/purpose/complexity routing and per-agent allocation |
 | Enhanced config/runtime/models | typed settings, versioned YAML, generated RuntimeConfig |
+| Versioned source-grounded DoD | planning context, `TeamPlan`, contract versions/hashes, atomic bundle |
+| Current inspectable evidence | authenticated append-only provenance, per-scope evaluator, path/contract invalidation |
+| Race-safe completion and repair | integrated-tree commands, evaluation snapshot fence, typed idempotent replanning |
 | Production safe, no canary/staging | one fail-closed review/test/evidence integration path |
 | Updated documentation | README, goal, this plan, and subsystem documents |
 

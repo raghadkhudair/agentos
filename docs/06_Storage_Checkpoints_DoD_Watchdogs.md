@@ -5,7 +5,7 @@
 Production clients are under `agentos/storage/clients/`:
 
 - `PostgresClient`: bounded asyncpg pool, UTC/statement timeouts, transactions, schema lock/preflight.
-- `DragonflyClient`: namespaced Redis protocol, health, JSON values, compare-and-delete locks.
+- `DragonflyClient`: namespaced Redis protocol, health, JSON values, token-safe compare-and-delete locks with owner-checked automatic lease renewal.
 - `MongoDocumentClient`: `AsyncMongoClient`, indexes, TTL memory, agent state.
 - `MinioObjectClient`: async facade, bucket versioning, safe names, checksums, put/get/stat.
 - `MilvusVectorClient`: typed schema/index, dimension validation, scoped strong-consistency search.
@@ -18,12 +18,16 @@ These classes are instantiated by the supervisor, messaging, memory, execution, 
 
 ### Concurrency-sensitive tables
 
-- `tasks`: owner role/agent, status, lease, complexity/risk, path/output/DoD arrays.
+- `tasks`: owner role/agent, strict status transitions/lease, contract version, complexity/risk, path/output/criterion/affected-contract arrays.
 - `task_dependencies`: directed dependency graph.
 - `event_outbox`: delivery reservation, attempts, next-attempt and error.
 - `event_receipts`: per-agent processing state, retry count, error, and expiring lease.
 - `approval_requests`: gate/hash/expiry/human decision.
-- `dod_evidence`: criterion/type/producer/task/artifact/command/pass metadata.
+- `dod_contract_versions`: append-only normalized contract/hash/source/context/prompt/amendment/approval history.
+- `dod_checks`: authoritative active criterion projection with version/hash/provenance/lock/mandatory/severity/evidence scopes/waiver.
+- `dod_evidence`: append-only authenticated criterion/task/artifact/Git/command/sandbox/dependency/generation provenance.
+- `dod_evaluation_runs` and `dod_evaluation_items`: immutable snapshot header and per-criterion verdict/reasons/evidence IDs.
+- `integration_attempts`: replayable `PREPARED`, `COMMITTED`, or `ABORTED` merge state.
 
 ### Integrity-sensitive tables
 
@@ -31,6 +35,8 @@ These classes are instantiated by the supervisor, messaging, memory, execution, 
 - `provider_call_intents` and `provider_calls`: append-only pre-egress intent plus linked provider accounting.
 - `artifacts`: object URI/version/checksum/length/content type/Git metadata.
 - `runtime_config_snapshots`: safe environment plus generated resource allocation.
+
+The evidence contract is enforced twice: `DoDRepository.add_evidence()` validates the caller before insertion, and `agentos_validate_dod_evidence` independently rejects SQL inserts with an inactive/stale criterion, unauthorized type, unauthenticated/mismatched role, missing or cross-task artifact, self-review, inconsistent checksum/exit state, or forged integration identity. Contract versions, evidence, and evaluation items reject update/delete.
 
 Table-specific project-isolation triggers reject cross-project task parents/owners, dependencies, artifact/checkpoint references, summary sources, DoD artifacts, outbox events, and memory source references.
 
@@ -48,34 +54,41 @@ Summaries are scope/subject/version records derived from durable history. Versio
 
 Every `DoDCriterion` has:
 
-- stable criterion ID and description;
-- mandatory flag;
-- verification type;
-- optional token-array verification command;
-- required artifact names;
-- required evidence types.
+- stable safe ID, normalized description, version-derived hash, and affected contracts;
+- source (`user`, `system`, `inferred`), lock, mandatory flag, and severity;
+- exactly one deterministic `test` or `command` type with a required token-array command;
+- artifact patterns and explicit required evidence types;
+- an evidence scope per type: criterion-global, every mapped task, or every task artifact.
 
-The bootstrap validator rejects duplicate IDs, criteria with no required evidence, invalid commands, and tasks that reference nonexistent criteria.
+Mandatory delivered criteria require artifact, independent review, and task integration evidence; critical criteria require security review. User/system criteria remain locked; inferred criteria must be unlocked advisory candidates until governed promotion. The cross-validator rejects duplicate semantics, no mandatory gate, uncovered criteria/artifacts/contracts, missing reviewer/security unions, unknown owners/dependencies, unbounded tasks, and output/path mismatch. The validated initial contract/backlog/resource/runtime bundle is one transaction.
+
+Contract amendment is explicit and version-incrementing. An exact hash/reason-bound approved request preserves the old contract row, replaces only the active criterion projection and current work graph, and advances the evidence generation. Ordinary replanning cannot edit criteria. A waiver is an approved criterion-hash/reason-bound state consumed by evaluation and invalidated by amendment.
 
 ## Evidence evaluation
 
-The evaluator retrieves latest evidence per criterion, type, and task. For each mandatory criterion it verifies:
+`start_evaluation()` locks the project and snapshots contract version/hash, integration HEAD, evidence generation, and timestamp cutoff. A partial unique index permits one `RUNNING` evaluation per project; exact terminal snapshots are reused, concurrent callers coalesce, newer generations mark old runs stale, and abandoned runs recover visibly.
 
-1. every required evidence type exists and passes;
-2. required artifact records exist;
-3. artifact MinIO objects/versions exist;
-4. object length and SHA-256 match recorded metadata;
-5. command evidence has zero exit code;
-6. review evidence comes from independent reviewer flows;
-7. no newer failed attempt supersedes a prior pass.
+For each active criterion, the evaluator retrieves only evidence within that snapshot and applies the declared cardinality. It verifies:
 
-Only then is the criterion satisfied. All mandatory criteria must be satisfied before project completion.
+1. mandatory task coverage and current-version task completion;
+2. every criterion-, task-, or artifact-scoped evidence instance exists and passes;
+3. required artifact patterns map to durable task artifacts;
+4. artifact MinIO object/version, length, and SHA-256 match PostgreSQL;
+5. command tokens match the contract and the passing final command ran on the exact integrated HEAD;
+6. review/security evidence is artifact-bound and from the authenticated independent role;
+7. task integration commits remain ancestors of the current HEAD;
+8. artifact/review subject commits remain fresh under conservative path/directory/glob and cross-task affected-contract invalidation;
+9. the managed repository HEAD equals the fenced integration HEAD.
+
+Every observed reason is persisted with criterion, evidence type/scope, task/artifact, retryability, and suggested owner. Precedence is `INCONCLUSIVE`, `STALE`, deterministic `FAILED`, `MISSING`, then `SATISFIED`. Object-store/provider/revision uncertainty never passes. `persist_evaluation()` requires exactly one correctly hashed item per active criterion and a summary consistent with mandatory items.
+
+Finalization locks the project and evaluation run, compares contract version/hash, HEAD, and generation, and rechecks active mandatory statuses/current-version tasks in the same short transaction. Any intervening write forces reevaluation. `DOD_SATISFIED` is terminal and later task/artifact/evidence/contract mutation is rejected.
 
 ## Watchdogs
 
 ### DoD watchdog
 
-Runs the strict evaluator. An empty runnable queue with gaps emits PM replanning. A satisfied evaluation permits completion.
+The strict evaluator is triggered after integration and polled periodically for recovery. The watchdog separately counts executing, dependency-runnable, and other nonterminal work. Only no executing/runnable work with mandatory gaps emits one evaluation-correlated typed replan request. The repository compares requested criteria with the run's durable unsatisfied items, validates artifact/contract coverage and an acyclic dependency graph, and binds one immutable task batch to the evaluation generation. Exact duplicate runs/tasks/events coalesce; conflicting duplicates fail closed. Attempts use exponential backoff; exhaustion persists a blocker and suspends work.
 
 ### Stagnation watchdog
 
@@ -111,3 +124,5 @@ docker compose --profile test up --build --abort-on-container-exit --exit-code-f
 docker compose --env-file .env config --quiet
 agentos doctor
 ```
+
+The focused DoD suite includes model/cross-object rejection, fail-closed planning source checks, packaged-prompt uniqueness, golden verdict/freshness data, exact-snapshot review caching, state-machine/watchdog contracts, atomic plan rollback, SQL evidence authority, append-only mutation rejection, evaluation coalescing/staleness, finalization generation races, and terminal write barriers. The full Compose integration additionally exercises every storage client and restricted execution sandbox.

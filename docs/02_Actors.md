@@ -8,7 +8,7 @@
 
 ### Bootstrap PM
 
-`BootstrapAgentActor` requests a structured production plan through the provider gateway. It hydrates permissions/scopes from the role catalog and validates the result through `TeamPlan`. Provider/JSON failure activates a deterministic mandatory safety roster, never a fabricated delivery plan.
+`BootstrapAgentActor` receives the immutable source revision/tree/docs/context hash, requests the one structured versioned production contract through the provider gateway, hydrates permissions/scopes from the role catalog, and validates the result through `TeamPlan`. Invalid JSON or contract output receives only a bounded full-object repair attempt. Exhaustion raises, persists a planning blocker, stops the project runtime, and launches no workers; there is no fallback roster or generic DoD.
 
 ### Infrastructure agent
 
@@ -20,11 +20,11 @@
 
 ### Independent reviewers
 
-`ReviewerAgentActor` and `SafetyReviewerAgentActor` use separate prompts/provider calls and write review evidence. The author cannot self-mark review evidence.
+`ReviewerAgentActor` and `SafetyReviewerAgentActor` load each current criterion description/hash, the task acceptance contract, exact task-bound artifact/checksum, diff, and affected contracts. They make one isolated structured decision per required criterion and append separate revision-bound evidence. Calls are concurrency-bounded; only an exact successful criterion-hash/commit/artifact/content snapshot can be reused, while inconclusive results are retried. The author cannot self-review, and PostgreSQL authenticates the declared reviewer role.
 
 ### Governed system actors
 
-Provider, memory, execution, checkpoint, summary, trigger, outbox, and DoD actors expose narrow governed APIs. A worker can request an action but cannot bypass their enforcement.
+Provider, memory, execution, checkpoint, summary, trigger, outbox, and DoD actors expose narrow governed APIs. The DoD evaluator serializes one run per project and emits a durable `DOD_EVALUATED` snapshot event; the runtime supervisor applies that event immediately while its periodic loop remains recovery. A worker can request an action but cannot bypass enforcement.
 
 ## Mandatory roles
 
@@ -46,6 +46,7 @@ Each task also defines:
 - required reviewers;
 - risk and complexity;
 - explicit dependencies.
+- the active DoD contract version and affected path/contract boundaries.
 
 ## Worker lifecycle
 
@@ -55,8 +56,9 @@ Each task also defines:
 4. Claim a role-compatible runnable task.
 5. Ask the provider gateway for exactly one allowed action.
 6. Submit a sealed action to execution.
-7. For code, perform artifact, expected-output, review, command/test, evidence, and merge gates.
-8. Checkpoint, update memory, emit progress, release capacity, and return to idle.
+7. For code, produce authenticated artifact evidence, perform per-criterion review/security review, expected-output and canonical command gates, validate the declared evidence policy, and request the durable prospective-merge path.
+8. After successful integration, trigger the canonical evaluator and supervisor handler. If that handoff fails, retain task success and let the persisted generation plus periodic reconciliation recover it.
+9. Checkpoint, update memory, emit progress, release capacity, and return to idle.
 
 Errors return retryable work to `PENDING` or a visible blocked/verification state. Exceptions are logged by type; the worker does not report completion from its own exception path.
 
@@ -66,7 +68,7 @@ Workers communicate on every material event and at `AGENTOS_COLLABORATION_INTERV
 
 ## State recovery
 
-Each worker stores its own actor working state through its own MongoDB client, while PostgreSQL retains task/event/checkpoint truth. On restart, a worker restores state and catches up from durable events/memory. Expired task and event-receipt claims are reclaimed. Named detached actors are rediscovered with `get_if_exists`; duplicate creation is avoided.
+Each worker stores its own actor working state through its own MongoDB client, while PostgreSQL retains task/event/checkpoint/contract/evidence truth. On restart, a worker restores state and catches up from durable events/memory. Expired task and event-receipt claims are reclaimed. Resume immediately evaluates the stored contract/HEAD/generation before recovery polling. Named detached actors are rediscovered with `get_if_exists`; duplicate creation is avoided.
 
 ## Resource assignment
 

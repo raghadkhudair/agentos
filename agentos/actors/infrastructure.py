@@ -13,7 +13,7 @@ from agentos.messaging.events import Event, EventType
 from agentos.provider.gateway import ProviderRegistry, ProviderRequest
 from agentos.runtime.team_plan import AgentSpec
 from agentos.storage.clients.postgres import PostgresClient
-from agentos.storage.repositories import EventRepository, ResourcePlanRepository
+from agentos.storage.repositories import EventRepository
 
 logger = structlog.get_logger()
 
@@ -76,13 +76,12 @@ class InfrastructurePlanner:
 
 @ray.remote(num_cpus=0.2, max_concurrency=4)  # type: ignore[call-overload]
 class InfrastructureAgentActor:
-    """System actor that plans and records resources alongside the supervisor."""
+    """System actor that computes resources; the supervisor owns atomic plan persistence."""
 
     def __init__(self, settings_payload: dict[str, Any]):
         self.settings = Settings(**settings_payload)
         self.planner = InfrastructurePlanner(self.settings)
         self.db = PostgresClient(self.settings)
-        self.repository = ResourcePlanRepository(self.db)
         self.events = EventRepository(self.db)
 
     async def determine_resources(
@@ -90,8 +89,11 @@ class InfrastructureAgentActor:
     ) -> dict[str, Any]:
         parsed_specs = [AgentSpec.model_validate(item) for item in specs]
         config = self.planner.plan(parsed_specs)
-        payload = config.model_dump(mode="json")
-        plan_id = await self.repository.save(project_id, "infrastructure_agent-1", payload)
+        return config.model_dump(mode="json")
+
+    async def announce_resources(
+        self, project_id: str, plan_id: str, payload: dict[str, Any]
+    ) -> None:
         event = Event(
             project_id=project_id,
             event_type=EventType.RESOURCE_PLAN_CREATED,
@@ -99,7 +101,6 @@ class InfrastructureAgentActor:
             payload={"resource_plan_id": plan_id, "envelope": payload["envelope"]},
         )
         await self.events.save_event(project_id, event)
-        return {"resource_plan_id": plan_id, **payload}
 
     async def inspect_pressure(self, project_id: str) -> dict[str, Any]:
         snapshot = self.planner.pressure_snapshot()

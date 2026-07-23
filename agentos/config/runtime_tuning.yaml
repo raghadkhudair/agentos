@@ -1,5 +1,17 @@
 schema_version: 2
 
+planning:
+  max_validation_attempts: 2
+
+dod:
+  max_replan_attempts: 3
+  replan_backoff_seconds: 60
+  recovery_scan_seconds: 300
+
+review:
+  max_parallel_criterion_reviews: 2
+  revision_cache_entries: 256
+
 ray:
   dashboard_enabled: false
   health_check_interval_seconds: 15

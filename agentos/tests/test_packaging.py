@@ -39,6 +39,7 @@ def test_project_metadata_uses_requirements_files_as_single_source() -> None:
     assert set(project["tool"]["setuptools"]["package-data"]["agentos.config"]) == {
         "*.yaml",
         "*.yml",
+        "prompts/*.md",
     }
 
 

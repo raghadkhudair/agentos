@@ -14,7 +14,8 @@ This repository contains the implemented runtime, not a starter scaffold.
 - Complexity- and role-aware model selection, provider fallback, concurrency caps, budgets, credential redaction, egress-host validation, audit records, and circuit breakers.
 - Git worktree isolation, atomic file writes, versioned MinIO artifacts, sandboxed commands, a physically separate sandbox database, independent code/security review, and test-before-merge enforcement.
 - Transactional PostgreSQL event outbox, Dragonfly Streams delivery, per-agent consumer groups, durable receipt/lease state, stale-message reclaim, scoped shared memory, and catch-up packets.
-- Strict DoD evaluation based on latest artifact, command/test, review, checksum, and required-output evidence. Text similarity cannot mark work complete.
+- Versioned, source-revision-grounded DoD contracts with stable criterion IDs/hashes, provenance and locks, explicit evidence cardinality, governed amendment/waiver, typed gaps, and append-only task/artifact/Git-bound evidence.
+- Prospective integrated-tree verification, renewable merge locking, durable replayable integration attempts, conservative path/contract freshness invalidation, and an atomic contract/HEAD/evidence-generation finalization fence. Text similarity cannot mark work complete.
 - Pause, resume, approval, rejection, status, logs, inspection, dependency health, runtime configuration, and guardrail CLI surfaces.
 
 ## Architecture
@@ -22,14 +23,14 @@ This repository contains the implemented runtime, not a starter scaffold.
 ```text
 CLI
   -> Runtime Supervisor (lifecycle and policy)
-      -> Bootstrap PM (team, backlog, measurable DoD)
+      -> Bootstrap PM (immutable source snapshot -> versioned DoD -> backlog/team)
       -> Infrastructure Agent (resource and provider allocation)
       -> Independent Ray Workers (role-owned task execution)
       -> Provider Gateway (all model calls, budgets, failover)
       -> Memory Broker (Dragonfly + MongoDB + PostgreSQL + MinIO + Milvus)
       -> Execution Supervisor (policy + Git + Docker sandbox + test DB)
-      -> Reviewer / Security Reviewer / QA evidence
-      -> DoD Evaluator and watchdogs
+      -> Per-criterion Reviewer / Security Reviewer / QA evidence
+      -> Snapshot-fenced DoD Evaluator and bounded repair watchdogs
 ```
 
 The supervisor coordinates; it does not share mutable in-process worker state. PostgreSQL and the durable outbox are the cross-process truth. Dragonfly is disposable coordination state, MongoDB is TTL-bound working memory, MinIO stores large/versioned payloads, and Milvus stores semantic vectors plus references. Milvus is not an authority for completion.
@@ -52,7 +53,9 @@ Prerequisites: Docker with Compose, Git, and enough memory for Milvus. The defau
 cp .env.example .env
 ```
 
-Replace every `CHANGE_ME` value, configure at least one AI provider, and never commit `.env`. Set `AGENTOS_SOURCE_REPOSITORY` to an existing Git worktree visible to the runtime process when a run must begin from real source; the execution service clones that source into its managed repository before creating task worktrees. Under Compose, seed the repository inside the `/workspaces` volume or add an explicit read-only bind mount and use its container path. Then:
+Replace every `CHANGE_ME` value, configure at least one AI provider, and never commit `.env`. Set `AGENTOS_SOURCE_REPOSITORY` to an existing Git worktree visible to the runtime process when a run must begin from real source; the execution service clones that source into its managed repository before creating task worktrees. Under Compose, seed the repository inside the `/workspaces` volume or add an explicit read-only bind mount and use its container path.
+
+Planning captures only Git-tracked paths plus bounded relevant manifests/docs and binds the contract to the clean repository HEAD. A dirty, bare, unreadable, or oversized source snapshot blocks planning instead of producing an ungrounded DoD. Then:
 
 ```bash
 docker compose config --quiet
@@ -113,9 +116,12 @@ agentos plan REQUEST
 agentos run REQUEST [--detach]
 agentos runtime-config [--agent ROLE ...] [--output FILE]
 agentos doctor
-agentos status [--project-id UUID]
+agentos status [PROJECT_ID]
 agentos logs PROJECT_ID [--limit N]
 agentos inspect PROJECT_ID
+agentos re-evaluate PROJECT_ID
+agentos amend-dod PROJECT_ID --contract TEAM_PLAN.json --reason TEXT --requested-by NAME [--approval-id UUID]
+agentos waive-dod PROJECT_ID CRITERION_ID --reason TEXT --requested-by NAME [--approval-id UUID]
 agentos pause PROJECT_ID
 agentos resume PROJECT_ID
 agentos approve APPROVAL_ID --approver NAME
@@ -123,7 +129,7 @@ agentos reject APPROVAL_ID --approver NAME --reason TEXT
 agentos guardrail-check TEXT
 ```
 
-`run` waits for evidence-backed completion by default. `--detach` uses named detached Ray actors; status is persisted in PostgreSQL. `resume` rechecks dependencies and provider availability before worker execution resumes.
+`run` waits for evidence-backed completion by default. `--detach` uses named detached Ray actors; status is persisted in PostgreSQL. `status PROJECT_ID` presents the active contract, mapped tasks, retry state, latest evaluation/gaps, current evidence revisions, and amendment/waiver decisions. `resume` rechecks dependencies/providers and immediately reconciles the latest durable DoD generation before its periodic recovery loops begin.
 
 ## Development and verification
 
@@ -145,7 +151,7 @@ Run the real storage round-trip against Compose:
 RUN_AGENTOS_INTEGRATION=1 pytest -q -m integration
 ```
 
-The integration test initializes and round-trips PostgreSQL, DragonflyDB, MongoDB, MinIO, and Milvus through the production client classes. It also proves native JSON codecs/outbox insertion, cross-project trigger rejection, the lossless PostgreSQL-MinIO-MongoDB memory saga, and a restricted Docker sandbox command. The runtime Docker image excludes development tooling; build the test target with `docker build --target test -t agentos-local:test .`.
+The integration suite initializes and round-trips PostgreSQL, DragonflyDB, MongoDB, MinIO, and Milvus through the production clients. It also proves native JSON/outbox behavior, cross-project and evidence-authority rejection, atomic plan rollback, append-only evidence, exact-gap graph-validated/idempotent replanning, durable evaluation recovery, finalization race fencing, terminal write barriers, the lossless PostgreSQL-MinIO-MongoDB memory saga, and restricted Docker sandboxing. Its live delivery test executes the canonical Git/MinIO artifact, command evidence, independent reviewer identity, prospective merge, integrated-HEAD evaluator, and atomic `DOD_SATISFIED` path end to end. The runtime Docker image excludes development tooling; build the test target with `docker build --target test -t agentos-local:test .`.
 
 ## Operational cautions
 

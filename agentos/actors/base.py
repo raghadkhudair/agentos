@@ -2,23 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import re
 import time
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import ray
 import structlog
 
 from agentos.checkpoints.manager import Checkpoint
-from agentos.config.loader import runtime_tuning
+from agentos.config.loader import load_prompt, runtime_tuning
 from agentos.config.runtime import TaskComplexity
 from agentos.config.settings import Settings
 from agentos.governance.models import ActionRequest, AgentIdentity
 from agentos.messaging.dragonfly_bus import DragonflyBus
 from agentos.messaging.events import Event, EventType
 from agentos.provider.gateway import ProviderRequest
+from agentos.runtime.team_plan import EvidenceType, InitialTask
 from agentos.storage.clients.mongodb import MongoDocumentClient
 from agentos.storage.clients.postgres import PostgresClient
 from agentos.storage.repositories import (
@@ -134,6 +136,7 @@ class AgentWorkerActor:
         self.trigger = ray.get_actor(self.service_names["trigger"], namespace="agentos")
         self.reviewer = ray.get_actor(self.service_names["reviewer"], namespace="agentos")
         self.safety = ray.get_actor(self.service_names["safety"], namespace="agentos")
+        self.dod_evaluator = ray.get_actor(self.service_names["dod"], namespace="agentos")
         await self.mongo.initialize()
         await self.agents.register_agent(
             self.agent_id,
@@ -378,7 +381,11 @@ class AgentWorkerActor:
                     provider_gateway=self.provider,
                     query_text=query_text[:8000],
                 )
-                created = await self._replan_gaps(list(event.payload.get("gaps", [])), packet)
+                created = await self._replan_gaps(
+                    list(event.payload.get("gaps", [])),
+                    packet,
+                    str(event.payload.get("evaluation_run_id") or ""),
+                )
                 self.status = "IDLE"
                 return {"status": "REPLANNED", "created_tasks": created}
             self.status = "IDLE"
@@ -422,7 +429,7 @@ class AgentWorkerActor:
             messages=[
                 {
                     "role": "system",
-                    "content": "Act as the assigned software-delivery worker. Return JSON only.",
+                    "content": load_prompt("agent_worker.md"),
                 },
                 {"role": "user", "content": json.dumps(prompt, default=str)},
             ],
@@ -455,11 +462,25 @@ class AgentWorkerActor:
         self.status = "IDLE"
         return result
 
-    async def _replan_gaps(self, gaps: list[str], packet: dict[str, Any]) -> list[str]:
-        if not gaps:
+    async def _replan_gaps(
+        self,
+        gaps: list[dict[str, Any]],
+        packet: dict[str, Any],
+        evaluation_run_id: str,
+    ) -> list[str]:
+        gap_criteria = sorted(
+            {
+                str(item["criterion_id"])
+                for item in gaps
+                if isinstance(item, dict) and item.get("criterion_id")
+            }
+        )
+        if not gap_criteria:
             return []
+        if not evaluation_run_id:
+            raise ValueError("replanning requires the causal evaluation run ID")
         request = ProviderRequest(
-            purpose="bootstrap_team_planning",
+            purpose="dod_gap_replanning",
             messages=[
                 {
                     "role": "system",
@@ -470,7 +491,11 @@ class AgentWorkerActor:
                         '"low|standard|high|critical","allowed_paths":[str],'
                         '"blocked_paths":[str],"expected_outputs":[str],'
                         '"acceptance_criteria":[str],"owner_role":"ROLE_NAME",'
-                        '"dod_criteria":[str]}]}.'
+                        '"required_reviewers":["code_reviewer","security_reviewer"],'
+                        '"affected_contracts":[str],"dod_criteria":[str],'
+                        '"depends_on":["earlier task title"]}]}.'
+                        " Every task must satisfy the existing typed task contract. Cover every "
+                        "supplied criterion exactly and do not amend the DoD."
                     ),
                 },
                 {
@@ -488,33 +513,30 @@ class AgentWorkerActor:
             request.model_dump(mode="json"), response_format={"type": "json_object"}
         )
         data = self._clean_json(response["content"])
-        created: list[str] = []
-        for item in data.get("tasks", []):
-            criteria = list(item.get("dod_criteria", []))
-            if not criteria or not set(criteria).issubset(set(gaps)):
-                raise ValueError("replanned task must map only to current DoD gaps")
-            task_id = await self.tasks.create_task(
-                self.project_id,
-                str(item["title"]),
-                str(item["description"]),
-                owner_role=str(item.get("owner_role") or self.role),
-                priority=int(item.get("priority", 3)),
-                acceptance_criteria=list(item.get("acceptance_criteria", [])),
-                allowed_paths=list(item.get("allowed_paths", [])),
-                blocked_paths=list(item.get("blocked_paths", [])),
-                expected_outputs=list(item.get("expected_outputs", [])),
-                dod_criteria=criteria,
-                risk_level=str(item.get("risk_level", "LOW")),
-                complexity=str(item.get("complexity", "standard")),
-            )
-            created.append(task_id)
+        proposals = [InitialTask.model_validate(item) for item in data.get("tasks", [])]
+        created = await self.tasks.create_replan_batch(
+            self.project_id,
+            evaluation_run_id,
+            gap_criteria,
+            proposals,
+        )
+        for task_id in created:
             await self.events.save_event(
                 self.project_id,
                 Event(
+                    event_id=uuid5(
+                        NAMESPACE_URL,
+                        f"agentos:{self.project_id}:replan:{evaluation_run_id}:{task_id}",
+                    ),
                     project_id=self.project_id,
                     event_type=EventType.TASK_CREATED,
                     producer_agent_id=self.agent_id,
-                    payload={"task_id": task_id, "source": "replanning"},
+                    payload={
+                        "task_id": task_id,
+                        "source": "replanning",
+                        "evaluation_run_id": evaluation_run_id,
+                    },
+                    causation_id=evaluation_run_id,
                 ),
             )
         return created
@@ -527,20 +549,29 @@ class AgentWorkerActor:
             await self.tasks.update_task_status(task_id, "PENDING")
             return {"status": "WAIT"}
         if action_type == "create_task":
+            proposed = InitialTask.model_validate(
+                {**payload, "owner_role": payload.get("owner_role") or self.role}
+            )
             new_id = await self.tasks.create_task(
                 self.project_id,
-                str(payload["title"]),
-                str(payload["description"]),
-                owner_role=str(payload.get("owner_role") or self.role),
-                priority=int(payload.get("priority", 3)),
-                acceptance_criteria=list(payload.get("acceptance_criteria", [])),
-                allowed_paths=list(payload.get("allowed_paths", [])),
-                blocked_paths=list(payload.get("blocked_paths", [])),
-                expected_outputs=list(payload.get("expected_outputs", [])),
-                required_reviewers=list(payload.get("required_reviewers", [])),
-                dod_criteria=list(payload.get("dod_criteria", [])),
-                risk_level=str(payload.get("risk_level", "LOW")),
-                complexity=str(payload.get("complexity", "standard")),
+                proposed.title,
+                proposed.description,
+                parent_task_id=task_id,
+                owner_role=proposed.owner_role.value,
+                priority=proposed.priority,
+                acceptance_criteria=proposed.acceptance_criteria,
+                allowed_paths=proposed.allowed_paths,
+                blocked_paths=proposed.blocked_paths,
+                expected_outputs=proposed.expected_outputs,
+                required_reviewers=proposed.required_reviewers,
+                dod_criteria=proposed.dod_criteria,
+                affected_contracts=proposed.affected_contracts,
+                risk_level=proposed.risk_level,
+                complexity=proposed.complexity,
+                external_key=(
+                    f"child-{task_id}-{hashlib.sha256(proposed.title.encode()).hexdigest()[:16]}"
+                ),
+                dependency_titles=proposed.depends_on,
             )
             await self.events.save_event(
                 self.project_id,
@@ -562,9 +593,9 @@ class AgentWorkerActor:
             description=description,
             target_paths=[str(payload["file_path"])] if payload.get("file_path") else [],
             command=payload.get("command") if isinstance(payload.get("command"), list) else None,
-            database_operation=payload.get("query")
-            if action_type == "execute_db_operation"
-            else None,
+            database_operation=(
+                payload.get("query") if action_type == "execute_db_operation" else None
+            ),
             payload=payload,
         )
         code_slot = False
@@ -594,7 +625,19 @@ class AgentWorkerActor:
         if not criteria:
             await self.tasks.update_task_status(task_id, "FAILED_VERIFICATION")
             return {"status": "FAILED_VERIFICATION", "reason": "task has no DoD criterion mapping"}
-        for criterion_id in criteria:
+        configured_checks = {
+            str(item["criterion_id"]): item
+            for item in await self.dod.get_checks(self.project_id, criteria)
+        }
+        if set(configured_checks) != set(criteria):
+            await self.tasks.update_task_status(task_id, "FAILED_VERIFICATION")
+            return {"status": "FAILED_VERIFICATION", "reason": "stale DoD criterion mapping"}
+        artifact_criteria = [
+            criterion_id
+            for criterion_id, check in configured_checks.items()
+            if EvidenceType.ARTIFACT.value in (check.get("required_evidence_types") or [])
+        ]
+        for criterion_id in artifact_criteria:
             await self.dod.add_evidence(
                 self.project_id,
                 criterion_id,
@@ -604,7 +647,11 @@ class AgentWorkerActor:
                 passed=True,
                 artifact_id=result["artifact_id"],
                 checksum_sha256=result["checksum_sha256"],
-                metadata={"task_id": task_id},
+                task_id=task_id,
+                source_role=self.role,
+                subject_commit=result["git_commit"],
+                watched_paths=[result["path"]],
+                affected_contracts=list(task.get("affected_contracts") or []),
             )
 
         expected_outputs = [
@@ -634,7 +681,10 @@ class AgentWorkerActor:
         security_required = str(task.get("risk_level")) in {
             "HIGH",
             "CRITICAL",
-        } or "security_reviewer" in set(task.get("required_reviewers") or [])
+        } or any(
+            EvidenceType.SECURITY_REVIEW.value in (check.get("required_evidence_types") or [])
+            for check in configured_checks.values()
+        )
         if security_required:
             security_review = await self.safety.review_code_change.remote(
                 project_id=self.project_id,
@@ -663,10 +713,6 @@ class AgentWorkerActor:
                 "missing_expected_outputs": missing_outputs,
             }
 
-        configured_checks = {
-            str(item["criterion_id"]): item
-            for item in await self.dod.get_checks(self.project_id, criteria)
-        }
         proposed_command = payload.get("test_command")
         default_command = (
             [str(token) for token in proposed_command]
@@ -713,14 +759,21 @@ class AgentWorkerActor:
         for criterion_id in criteria:
             test_command = criterion_commands[criterion_id]
             test = test_results.get(tuple(test_command), {})
-            criterion_passed = bool(
-                test.get("executed") and test.get("result", {}).get("exit_code") == 0
-            )
+            test_result = test.get("result", {}) if test.get("executed") else {}
+            criterion_passed = bool(test.get("executed") and test_result.get("exit_code") == 0)
             passed = passed and criterion_passed
+            required_types = set(
+                configured_checks[criterion_id].get("required_evidence_types") or []
+            )
+            evidence_type = (
+                EvidenceType.COMMAND.value
+                if EvidenceType.COMMAND.value in required_types
+                else EvidenceType.TEST.value
+            )
             await self.dod.add_evidence(
                 self.project_id,
                 criterion_id,
-                "test",
+                evidence_type,
                 self.agent_id,
                 summary=(
                     f"Command {json.dumps(test_command)} "
@@ -728,8 +781,15 @@ class AgentWorkerActor:
                 ),
                 passed=criterion_passed,
                 command=json.dumps(test_command),
-                exit_code=test.get("result", {}).get("exit_code") if test.get("executed") else None,
-                metadata={"task_id": task_id},
+                exit_code=int(test_result.get("exit_code", -1)),
+                task_id=task_id,
+                source_role=self.role,
+                subject_commit=result["git_commit"],
+                sandbox_digest=test_result.get("sandbox_digest"),
+                watched_paths=list(task.get("allowed_paths") or []),
+                affected_contracts=list(task.get("affected_contracts") or []),
+                run_status="OK" if test.get("executed") else "INCONCLUSIVE",
+                metadata={"output_tail": str(test_result.get("output", ""))[-2000:]},
             )
         if not passed:
             await self.tasks.update_task_status(task_id, "PENDING")
@@ -745,6 +805,21 @@ class AgentWorkerActor:
             payload={"task_id": task_id, "artifact_id": result["artifact_id"]},
         )
         await self.events.save_event(self.project_id, completion)
+        evaluation: dict[str, Any] | None = None
+        try:
+            evaluation = await self.dod_evaluator.evaluate.remote(self.project_id)
+            runtime_supervisor = ray.get_actor("runtime-supervisor", namespace="agentos")
+            await runtime_supervisor.handle_dod_evaluation.remote(self.project_id, evaluation)
+        except Exception as error:
+            # The TASK_COMPLETED event and the evaluation request generation are durable.
+            # The periodic supervisor watchdog will recover this handoff without making a
+            # successfully integrated task appear to have failed.
+            logger.warning(
+                "dod_evaluation_handoff_deferred",
+                project_id=self.project_id,
+                task_id=task_id,
+                error_type=type(error).__name__,
+            )
         return {
             "status": "COMPLETED",
             "artifact": result,
@@ -752,6 +827,7 @@ class AgentWorkerActor:
             "security_review": security_review,
             "tests": list(test_results.values()),
             "merge": merge,
+            "dod_evaluation": evaluation or {"status": "DEFERRED_TO_RECOVERY"},
         }
 
     async def _checkpoint_and_share(self, task_id: str, result: dict[str, Any]) -> None:

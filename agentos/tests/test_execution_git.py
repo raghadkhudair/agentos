@@ -9,7 +9,9 @@ from agentos.execution.supervisor import ExecutionService
 
 
 @pytest.mark.asyncio
-async def test_execution_creates_a_valid_isolated_git_worktree(tmp_path) -> None:
+async def test_execution_creates_a_valid_isolated_git_worktree(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = Settings(
         environment="test",
         workspace=tmp_path,
@@ -17,6 +19,12 @@ async def test_execution_creates_a_valid_isolated_git_worktree(tmp_path) -> None
         minio_secret_key="test-secret",
     )
     service = ExecutionService(settings)
+
+    async def accept_test_repository(project_id, repository):
+        del project_id
+        return repository.name
+
+    monkeypatch.setattr(service, "_verify_repository_state", accept_test_repository)
     project_id = str(uuid4())
     task_id = str(uuid4())
     worktree = await service._ensure_worktree(project_id, task_id)
@@ -28,7 +36,9 @@ async def test_execution_creates_a_valid_isolated_git_worktree(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_execution_clones_configured_source_repository(tmp_path) -> None:
+async def test_execution_clones_configured_source_repository(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "source"
     source.mkdir()
     setup_settings = Settings(
@@ -65,6 +75,12 @@ async def test_execution_clones_configured_source_repository(tmp_path) -> None:
             minio_secret_key="test-secret",
         )
     )
+
+    async def accept_test_repository(project_id, repository):
+        del project_id
+        return repository.name
+
+    monkeypatch.setattr(service, "_verify_repository_state", accept_test_repository)
     repository = await service._ensure_repository(str(uuid4()))
     assert (repository / "existing.py").read_text(encoding="utf-8") == "value = 1\n"
     assert repository.resolve() != source.resolve()

@@ -30,7 +30,7 @@ include = ["agentos*"]
 exclude = ["agentos.tests*"]
 
 [tool.setuptools.package-data]
-"agentos.config" = ["*.yaml", "*.yml"]
+"agentos.config" = ["*.yaml", "*.yml", "prompts/*.md"]
 "agentos.storage" = ["schema.sql"]
 
 [tool.setuptools.dynamic]

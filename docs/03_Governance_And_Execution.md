@@ -42,7 +42,7 @@ Known patterns include database/schema/table drops, truncation/deletes, recursiv
 
 ## Audit
 
-Every policy decision creates an `audit_events` record containing actor, action, risk, decision, request hash, previous audit hash, and current hash. Database triggers reject update/delete. Provider calls have a separate append-only table.
+Every policy decision creates an `audit_events` record containing actor, action, risk, decision, request hash, previous audit hash, and current hash. Database triggers reject update/delete. Provider calls have separate append-only intent/result tables. DoD contract versions, evidence, and evaluation items are also append-only; an insertion trigger independently verifies criterion revision/type, authenticated producer role, task/artifact project binding, self-review exclusion, checksum/result consistency, and integration-supervisor authority.
 
 ## File writes
 
@@ -73,22 +73,26 @@ Database actions use a second PostgreSQL instance and a DSN that production vali
 
 ## Review/test/merge gates
 
-For every mapped criterion:
+For every mapped criterion, the execution path reads the active contract rather than assuming a fixed evidence trio:
 
 1. Record checksummed artifact evidence.
-2. Obtain independent code review for every artifact and any required security review.
+2. Obtain an isolated independent code-review verdict for that criterion/artifact and any criterion- or risk-required security verdict. Provider uncertainty is appended as inconclusive evidence and fails the gate.
 3. Confirm all expected-output patterns match recorded artifacts.
 4. Select the configured criterion verification command (or an explicit allowed task command).
 5. Run it in the sandbox and record exit-code evidence.
-6. Require current passing review and test evidence.
-7. Acquire the project merge lock and perform a non-fast-forward Git merge.
-8. Mark the task complete and publish `TASK_COMPLETED`.
+6. Require every configured artifact-, task-, and criterion-scoped pre-merge evidence row to match the active criterion hash, authenticated producer, task/artifact, checksum, and task-branch HEAD.
+7. Acquire the renewable project merge lock and persist a `PREPARED` integration attempt.
+8. Create a no-commit prospective merge and run every newly eligible unique DoD command in the restricted sandbox against that exact tree. Any failure aborts the merge.
+9. Commit only the passing prospective tree, atomically persist its integration HEAD/attempt state, append integrated-HEAD command plus task integration evidence, and transition `UNDER_REVIEW -> COMPLETED`.
+10. Trigger the snapshot-fenced evaluator; periodic reconciliation recovers a failed event handoff.
 
-A review/test failure is repairable and returns to `PENDING`. A merge conflict becomes `BLOCKED` with details. No force merge or silent conflict resolution exists.
+A review/test failure is repairable and returns to `PENDING`. A merge conflict becomes `BLOCKED` with details. Durable `PREPARED`, post-commit/pre-database, and `COMMITTED` pre-evidence states are replayed under the same gate after a crash. A merge lacking a matching durable attempt is rejected; no force merge or silent conflict resolution exists.
 
 ## Human approval lifecycle
 
 Approval requests store required gate, canonical request JSON, hash, requester, status, expiry, approver, and decision reason/time. CLI approval/rejection can update only a live `PENDING` row. Execution then revalidates project, hash, identity, and current policy before dispatch.
+
+DoD changes use this same boundary. `DOD_AMENDMENT` approval binds the complete next-version `TeamPlan` hash and reason; applying it increments the version and atomically replaces active criteria/work while retaining append-only contract history. `DOD_WAIVER` binds one active criterion hash and reason; it cannot edit another criterion or survive a later amendment. Ordinary PM replanning has no criterion-mutation API.
 
 ## Security limitations
 
