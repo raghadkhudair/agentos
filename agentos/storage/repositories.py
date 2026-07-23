@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
 from agentos.config.loader import runtime_tuning
@@ -863,16 +864,38 @@ class TaskRepository:
         embedding: list[float] | None = None,
     ) -> str:
         del embedding  # semantic task records are indexed by MemoryService in Milvus
-        criteria = list(dict.fromkeys(dod_criteria or []))
-        reviewers = list(dict.fromkeys(required_reviewers or []))
-        if not owner_role or not acceptance_criteria or not allowed_paths or not expected_outputs:
-            raise ValueError(
-                "task contract requires owner, acceptance criteria, paths, and outputs"
-            )
-        if not criteria:
-            raise ValueError("task must map to at least one current DoD criterion")
-        if AgentRole.CODE_REVIEWER.value not in reviewers:
-            raise ValueError("task requires an independent code reviewer")
+        proposal = InitialTask.model_validate(
+            {
+                "title": title,
+                "description": description,
+                "priority": priority,
+                "risk_level": risk_level,
+                "acceptance_criteria": acceptance_criteria or [],
+                "allowed_paths": allowed_paths or [],
+                "blocked_paths": blocked_paths or [],
+                "expected_outputs": expected_outputs or [],
+                "required_reviewers": required_reviewers or [],
+                "owner_role": owner_role,
+                "dod_criteria": dod_criteria or [],
+                "depends_on": dependency_titles or [],
+                "affected_contracts": affected_contracts or [],
+                "complexity": complexity,
+            }
+        )
+        title = proposal.title
+        description = proposal.description
+        priority = proposal.priority
+        risk_level = proposal.risk_level
+        acceptance_criteria = proposal.acceptance_criteria
+        allowed_paths = proposal.allowed_paths
+        blocked_paths = proposal.blocked_paths
+        expected_outputs = proposal.expected_outputs
+        reviewers = proposal.required_reviewers
+        owner_role = proposal.owner_role.value
+        criteria = proposal.dod_criteria
+        dependency_titles = proposal.depends_on
+        affected_contracts = proposal.affected_contracts
+        complexity = proposal.complexity
         project_uuid = _uuid(project_id)
         async with self.db.transaction() as connection:
             project = await connection.fetchrow(
@@ -899,12 +922,33 @@ class TaskRepository:
             )
             if {row["criterion_id"] for row in check_rows} != set(criteria):
                 raise ValueError("task references a missing or stale DoD criterion")
+            if not await connection.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE project_id=$1 AND role=$2)",
+                project_uuid,
+                owner_role,
+            ):
+                raise ValueError("task owner role is not present in the current team")
+            if owner_agent_id:
+                assigned_role = await connection.fetchval(
+                    "SELECT role FROM agents WHERE project_id=$1 AND id=$2",
+                    project_uuid,
+                    owner_agent_id,
+                )
+                if assigned_role != owner_role:
+                    raise ValueError("assigned task owner identity does not match the owner role")
             requires_security = risk_level in {"HIGH", "CRITICAL"} or any(
                 EvidenceType.SECURITY_REVIEW.value in (row["required_evidence_types"] or [])
                 for row in check_rows
             )
             if requires_security and AgentRole.SECURITY_REVIEWER.value not in reviewers:
                 raise ValueError("task risk or criterion requires an independent security reviewer")
+            if risk_level in {"HIGH", "CRITICAL"} and any(
+                EvidenceType.SECURITY_REVIEW.value not in (row["required_evidence_types"] or [])
+                for row in check_rows
+            ):
+                raise ValueError(
+                    "high and critical risk tasks require security evidence on every mapped criterion"
+                )
             dependency_rows = await connection.fetch(
                 "SELECT id,title FROM tasks WHERE project_id=$1 AND title=ANY($2::text[])",
                 project_uuid,
@@ -921,17 +965,49 @@ class TaskRepository:
                 )
                 if existing is not None:
                     expected = {
+                        "parent_task_id": _uuid(parent_task_id) if parent_task_id else None,
                         "title": title,
                         "description": description,
+                        "owner_agent_id": owner_agent_id,
                         "owner_role": owner_role,
+                        "priority": priority,
+                        "complexity": complexity,
+                        "acceptance_criteria": acceptance_criteria,
+                        "allowed_paths": allowed_paths,
+                        "blocked_paths": blocked_paths,
+                        "expected_outputs": expected_outputs,
+                        "required_reviewers": reviewers,
                         "dod_contract_version": version,
                         "dod_criteria": criteria,
+                        "affected_contracts": affected_contracts,
+                        "risk_level": risk_level,
                     }
                     if any(existing[key] != value for key, value in expected.items()):
                         raise ValueError(
                             "idempotency key already exists with a different task contract"
                         )
+                    existing_dependencies = {
+                        str(row["title"])
+                        for row in await connection.fetch(
+                            """
+                            SELECT dependency.title FROM task_dependencies td
+                            JOIN tasks dependency ON dependency.id=td.depends_on_task_id
+                            WHERE td.task_id=$1
+                            """,
+                            existing["id"],
+                        )
+                    }
+                    if existing_dependencies != set(dependency_titles):
+                        raise ValueError(
+                            "idempotency key already exists with different dependencies"
+                        )
                     return str(existing["id"])
+            if await connection.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE project_id=$1 AND title=$2)",
+                project_uuid,
+                title,
+            ):
+                raise ValueError("task title already exists in this project")
             row = await connection.fetchrow(
                 """
                 INSERT INTO tasks(
@@ -953,11 +1029,11 @@ class TaskRepository:
                 complexity,
                 json.dumps(acceptance_criteria),
                 allowed_paths,
-                blocked_paths or [],
+                blocked_paths,
                 expected_outputs,
                 reviewers,
                 criteria,
-                affected_contracts or [],
+                affected_contracts,
                 risk_level,
                 version,
             )
@@ -1047,6 +1123,9 @@ class TaskRepository:
                 or project["dod_contract_hash"] != run["contract_hash"]
             ):
                 raise ValueError("replanning evaluation targets a stale DoD contract")
+            snapshot_stale = project["integration_head"] != run["integration_head"] or int(
+                project["evidence_generation"]
+            ) != int(run["evidence_generation"])
             evaluated_items = await connection.fetch(
                 """
                 SELECT criterion_id,status FROM dod_evaluation_items
@@ -1099,6 +1178,8 @@ class TaskRepository:
             canonical_proposals = sorted(proposals, key=lambda item: item.title)
             if existing_batch and len(existing_batch) != len(canonical_proposals):
                 raise ValueError("replanning generation already has a different task batch")
+            if snapshot_stale and not existing_batch:
+                raise ValueError("replanning evaluation targets a stale project snapshot")
             for task in proposals:
                 if task.owner_role.value not in roles:
                     raise ValueError(f"replanned task owner role is not present: {task.owner_role}")
@@ -1117,6 +1198,13 @@ class TaskRepository:
                     and AgentRole.SECURITY_REVIEWER.value not in task.required_reviewers
                 ):
                     raise ValueError("replanned task omits its required security reviewer")
+                if task.risk_level in {"HIGH", "CRITICAL"} and any(
+                    EvidenceType.SECURITY_REVIEW.value not in (row["required_evidence_types"] or [])
+                    for row in relevant
+                ):
+                    raise ValueError(
+                        "high and critical replanned tasks require security evidence on every criterion"
+                    )
             for check in checks:
                 criterion_id = str(check["criterion_id"])
                 mapped_proposals = [task for task in proposals if criterion_id in task.dod_criteria]
@@ -1135,7 +1223,14 @@ class TaskRepository:
                 mapped_contracts = {
                     contract for task in mapped_proposals for contract in task.affected_contracts
                 }
-                missing_contracts = set(check["affected_contracts"] or []) - mapped_contracts
+                missing_contracts = {
+                    str(required_contract)
+                    for required_contract in check["affected_contracts"] or []
+                    if not any(
+                        _patterns_overlap(str(required_contract), task_contract)
+                        for task_contract in mapped_contracts
+                    )
+                }
                 if missing_contracts:
                     raise ValueError(
                         f"replanned criterion {criterion_id!r} omits affected contracts: "
@@ -1168,6 +1263,21 @@ class TaskRepository:
                     if any(existing[key] != value for key, value in expected_contract.items()):
                         raise ValueError(
                             "replanning idempotency key conflicts with another contract"
+                        )
+                    existing_dependencies = {
+                        str(row["title"])
+                        for row in await connection.fetch(
+                            """
+                            SELECT dependency.title FROM task_dependencies td
+                            JOIN tasks dependency ON dependency.id=td.depends_on_task_id
+                            WHERE td.task_id=$1
+                            """,
+                            existing["id"],
+                        )
+                    }
+                    if existing_dependencies != set(task.depends_on):
+                        raise ValueError(
+                            "replanning idempotency key conflicts with another dependency graph"
                         )
                     task_ids[task.title] = existing["id"]
                     continue
@@ -1383,6 +1493,30 @@ class ArtifactRepository:
         summary: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        parsed = urlparse(object_uri)
+        uri_versions = parse_qs(parsed.query).get("versionId", [])
+        if parsed.scheme != "minio" or not parsed.netloc or not parsed.path.lstrip("/"):
+            raise ValueError("artifact must reference a bounded MinIO object URI")
+        if len(uri_versions) != 1 or not uri_versions[0]:
+            raise ValueError("artifact URI must bind one exact MinIO object version")
+        uri_version = uri_versions[0]
+        if object_version_id is not None and object_version_id != uri_version:
+            raise ValueError("artifact URI and object_version_id must identify the same version")
+        object_version_id = uri_version
+        if len(checksum_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in checksum_sha256.lower()
+        ):
+            raise ValueError("artifact checksum must be a 64-character SHA-256 digest")
+        checksum_sha256 = checksum_sha256.lower()
+        artifact_metadata = dict(metadata or {})
+        if task_id:
+            git_commit = artifact_metadata.get("git_commit")
+            if (
+                not isinstance(git_commit, str)
+                or len(git_commit) not in {40, 64}
+                or any(character not in "0123456789abcdef" for character in git_commit.lower())
+            ):
+                raise ValueError("task-bound artifacts require a full Git subject revision")
         project_uuid = _uuid(project_id)
         async with self.db.transaction() as connection:
             project = await connection.fetchrow(
@@ -1410,7 +1544,7 @@ class ArtifactRepository:
                 content_length,
                 content_type,
                 summary,
-                json.dumps(metadata or {}),
+                json.dumps(artifact_metadata),
             )
             generation = int(project["evidence_generation"]) + 1
             await connection.execute(
@@ -1899,6 +2033,25 @@ class DoDRepository:
                 and not subject_commit
             ):
                 raise ValueError(f"{evidence.value} evidence requires a subject commit")
+            if artifact is not None:
+                artifact_metadata = artifact["metadata"] or {}
+                artifact_commit = artifact_metadata.get("git_commit")
+                if not artifact_commit or artifact_commit != subject_commit:
+                    raise ValueError(
+                        "artifact-scoped evidence must target the artifact's exact Git revision"
+                    )
+                if evidence in {EvidenceType.REVIEW, EvidenceType.SECURITY_REVIEW}:
+                    review_digest = artifact_metadata.get("review_diff_sha256")
+                    review_characters = artifact_metadata.get("review_diff_characters")
+                    if (
+                        not isinstance(review_digest, str)
+                        or len(review_digest) != 64
+                        or not isinstance(review_characters, int)
+                        or review_characters < 0
+                    ):
+                        raise ValueError(
+                            "review evidence requires checksum-bound committed diff provenance"
+                        )
             internal_roles = {"integration_supervisor": "integration_supervisor"}
             registered_role = await connection.fetchval(
                 "SELECT role FROM agents WHERE project_id=$1 AND id=$2",
@@ -1943,20 +2096,47 @@ class DoDRepository:
                     raise ValueError(
                         "test/command pass state must match the recorded execution result"
                     )
+                if task is None and source_agent_id != "integration_supervisor":
+                    raise ValueError(
+                        "criterion-global test/command evidence requires the integration supervisor"
+                    )
+                try:
+                    command_tokens = json.loads(command)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        "test/command evidence command must be a JSON token array"
+                    ) from error
+                if (
+                    not isinstance(command_tokens, list)
+                    or not command_tokens
+                    or not all(isinstance(token, str) and token for token in command_tokens)
+                ):
+                    raise ValueError("test/command evidence command must be a JSON token array")
+                command = json.dumps(command_tokens, separators=(",", ":"))
+                computed_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+                if command_digest is not None and command_digest != computed_digest:
+                    raise ValueError("command digest does not match the canonical token array")
+                command_digest = computed_digest
+                if run_status == "OK" and (
+                    not sandbox_digest
+                    or len(sandbox_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef" for character in sandbox_digest.lower()
+                    )
+                ):
+                    raise ValueError("executed test/command evidence requires a sandbox digest")
             if evidence == EvidenceType.ARTIFACT:
                 assert artifact is not None
                 if not checksum_sha256 or checksum_sha256 != artifact["checksum_sha256"]:
                     raise ValueError("artifact evidence checksum must match the durable artifact")
             if evidence == EvidenceType.INTEGRATION:
-                if not integration_commit:
+                if not integration_commit or not subject_commit:
                     raise ValueError(
-                        "integration evidence requires the resulting integration commit"
+                        "integration evidence requires subject and resulting integration commits"
                     )
                 if source_agent_id != "integration_supervisor":
                     raise ValueError("integration evidence requires the integration supervisor")
             digest = command_digest
-            if command and not digest:
-                digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
             generation = int(project["evidence_generation"]) + 1
             row = await connection.fetchrow(
                 """
@@ -2069,7 +2249,7 @@ class DoDRepository:
                 SELECT * FROM dod_evaluation_runs
                 WHERE project_id=$1 AND contract_version=$2 AND contract_hash=$3
                   AND integration_head IS NOT DISTINCT FROM $4 AND evidence_generation=$5
-                  AND status IN ('SATISFIED','UNSATISFIED','INCONCLUSIVE')
+                  AND status IN ('SATISFIED','UNSATISFIED')
                 ORDER BY created_at DESC LIMIT 1
                 """,
                 _uuid(project_id),
@@ -2103,7 +2283,7 @@ class DoDRepository:
         status: str,
         failure_summary: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if status not in {"SATISFIED", "UNSATISFIED", "INCONCLUSIVE", "ERROR"}:
+        if status not in {"SATISFIED", "UNSATISFIED", "INCONCLUSIVE", "STALE", "ERROR"}:
             raise ValueError("invalid evaluation terminal status")
         async with self.db.transaction() as connection:
             run = await connection.fetchrow(

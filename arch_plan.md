@@ -52,10 +52,10 @@ System-service actors are per project, named with the project suffix, and detach
 2. Connect PostgreSQL and apply the idempotent v4 schema under an advisory lock.
 3. Health-check PostgreSQL, Dragonfly, MongoDB, MinIO, and Milvus.
 4. Create a project in `PLANNING` state.
-5. Capture a clean, bounded, Git-tracked planning context with source revision, relevant docs/tree, and canonical hash; block if it cannot be trusted.
+5. Reject an empty or greater-than-100,000-byte request, then capture a clean, bounded, Git-tracked planning context with safe relative paths, source revision, relevant docs/tree, and canonical hash. Tracked symlinks remain visible in the tree but are never followed/read; block if the context cannot be trusted.
 6. Start per-project service actors and reliable outbox routing, then ask the bootstrap PM for a structured versioned contract through the provider gateway.
 7. Retry invalid provider JSON/contracts only within the configured bound; never activate a generic fallback plan.
-8. Validate criterion IDs/hashes/provenance/locks/evidence scopes, mandatory coverage, artifact/output and affected-contract mapping, reviewer/security unions, role caps, task ownership/dependencies, and bounded paths. Re-run the full cross-object validator after roster reduction.
+8. Validate criterion IDs/hashes/provenance/locks/evidence scopes, mandatory coverage, artifact/output and conservative affected-contract glob mapping, reviewer/security unions, role caps, task ownership/dependencies, nonempty unique acceptance/criteria/dependencies, and fail-closed bounded paths/globs. Re-run the full cross-object validator after roster reduction.
 9. Ask the infrastructure agent for the exact resource/model allocation.
 10. In one PostgreSQL transaction persist the contract version, active criteria, backlog/dependencies, resource plan, safe runtime/planning snapshot, and planned agents. Any late failure rolls back the whole bundle.
 11. If no provider is configured, leave the plan durable and set `BLOCKED_REQUIRES_INPUT`; never synthesize credentials or fabricated work.
@@ -78,11 +78,11 @@ Each worker:
 
 ### 3.3 Completion and replanning
 
-Each evaluation run snapshots the active contract version/hash, integrated HEAD, evidence cutoff, and evidence generation. The evaluator applies each declared evidence scope at criterion, mapped-task, or artifact cardinality; checks authenticated producer/task/artifact/commit provenance, exact commands, independent reviews, MinIO version/length/checksum, integration ancestry, repository HEAD, and conservative watched-path/affected-contract freshness; and persists every typed reason as `MISSING`, `FAILED`, `INCONCLUSIVE`, `STALE`, or `SATISFIED`.
+Each evaluation run snapshots the active contract version/hash, integrated HEAD, evidence cutoff, and evidence generation. The evaluator applies each declared evidence scope at criterion, mapped-task, or artifact cardinality; checks authenticated producer/task/artifact/commit provenance, canonical command and sandbox digests, independent reviews bound to the exact committed-diff digest, exact MinIO URI/column version plus length/checksum, integration ancestry, repository HEAD, and conservative watched-path/affected-contract freshness; and persists every typed reason as `MISSING`, `FAILED`, `INCONCLUSIVE`, `STALE`, or `SATISFIED`.
 
 Task/evidence/integration changes advance one durable generation. Evaluation requests are serialized/coalesced per project, code-triggered after integration, and periodically reconciled for recovery. `DOD_SATISFIED` is one atomic compare-and-set against the exact satisfied contract/HEAD/generation; terminal writers then fail closed.
 
-If there is no executing or dependency-runnable work but typed gaps remain, the DoD watchdog emits one evaluation-correlated `REPLANNING_TRIGGERED` event. The PM submits a typed `InitialTask` graph covering exactly the durable run's unsatisfied criteria; current roles, reviewers, paths/outputs, required artifacts/contracts, dependency existence/cycles, and security requirements are validated in one transaction. One deterministic immutable task batch is bound to that evaluation generation: exact redelivery is a no-op and a changed duplicate is rejected. Attempts use exponential backoff and end in a visible blocker. Ordinary replanning cannot mutate the DoD; amendments and waivers require exact hash/reason-bound human approval.
+If there is no executing or dependency-runnable work but typed gaps remain, the DoD watchdog first separates retryable operational uncertainty from delivery repair. Operational-only gaps schedule bounded `VERIFYING` reevaluation without creating tasks. Delivery gaps emit one deterministic evaluation-correlated `REPLANNING_TRIGGERED` event. The PM submits a typed `InitialTask` graph covering exactly the durable run's unsatisfied criteria; the still-current evaluation generation, current roles, reviewers, paths/outputs, required artifacts/contracts, exact dependency-title graph, and security requirements are validated in one transaction. One deterministic immutable task batch is bound to that generation: exact redelivery is a no-op and a changed/stale duplicate is rejected. Attempts use exponential backoff and end in a visible blocker. Ordinary replanning cannot mutate the DoD; amendments and waivers require exact hash/reason-bound human approval.
 
 ## 4. Agent independence and collaboration
 
@@ -165,7 +165,7 @@ Schema version 4 contains:
 - `schema_migrations`
 - `projects`, `agents`, `tasks`, `task_dependencies`
 - `events`, `event_outbox`, `event_receipts`
-- `artifacts`
+- append-only `artifacts` with exact MinIO version and Git/diff provenance
 - `checkpoints`, `summaries`
 - `memory_items`
 - `provider_call_intents`, `provider_calls`
@@ -179,8 +179,8 @@ Important mechanics:
 - foreign keys plus table-specific project-isolation triggers prevent orphan/cross-project references;
 - row locks and `SKIP LOCKED` make task/outbox claims concurrent-safe;
 - task leases are renewable and reclaimable;
-- append-only triggers protect provider/audit/contract/evidence/evaluation-item rows;
-- SQL evidence guards authenticate producer roles and enforce criterion version, evidence type, task/artifact ownership, self-review, result, checksum, and integration requirements;
+- append-only triggers protect provider/audit/artifact/contract/evidence/evaluation-item rows;
+- SQL evidence guards authenticate producer roles and enforce criterion version, evidence type, task/artifact ownership and Git revision, committed-diff provenance, self-review, canonical command/sandbox digests, result/checksum consistency, criterion-global authority, and integration requirements;
 - one running evaluation per project plus generation/HEAD fences coalesce work and prevent stale completion;
 - audit events carry previous/current hashes;
 - updated-at triggers are database-side;
@@ -208,7 +208,7 @@ Mid-term memories expire by policy (default seven days). Recent retrieval filter
 
 ### 6.4 MinIO: object bodies
 
-Buckets for artifacts and memory are created idempotently and versioning is enabled. Object names are normalized and traversal-safe. Writes return bucket/name, ETag, version ID, length, and SHA-256. Large memory bodies are moved to MinIO while PostgreSQL stores the durable reference and checksum.
+Buckets for artifacts and memory are created idempotently and versioning is enabled. Object names are normalized and traversal-safe. Writes return bucket/name, ETag, version ID, length, and SHA-256. Every new artifact URI must contain exactly one nonempty `versionId` matching its PostgreSQL version column, and task artifacts require a full Git revision; artifact rows are immutable. Large memory bodies are moved to MinIO while PostgreSQL stores the durable reference and checksum.
 
 ### 6.5 Milvus: semantic references
 
@@ -274,7 +274,7 @@ Destructive patterns are denied by default. Repeated violations increase a TTL-b
 
 ### 8.3 Git and object flow
 
-When `AGENTOS_SOURCE_REPOSITORY` is set, the execution service first validates and locally clones that Git worktree into the isolated managed repository; otherwise it initializes an empty managed repository. Each task uses branch `agentos/task-{task_id}` in a dedicated worktree. Writes are atomic (`fsync` plus replace), committed with a controlled Git identity, uploaded to versioned MinIO, and recorded as artifacts with checksums and commit metadata.
+When `AGENTOS_SOURCE_REPOSITORY` is set, the execution service first validates and locally clones that Git worktree into the isolated managed repository; otherwise it initializes an empty managed repository. Each task uses branch `agentos/task-{task_id}` in a dedicated worktree. Writes are atomic (`fsync` plus replace), committed with a controlled Git identity, uploaded to versioned MinIO, and recorded as append-only artifacts with exact URI/column versions, checksums, full commit metadata, and the committed-diff hash/length used by review.
 
 Task ownership has allowed and blocked path lists. Every produced artifact is reviewed before a partial-output decision, and expected-output globs must all match recorded artifacts before verification/merge. A task without mapped DoD criteria or a verification command cannot merge.
 
@@ -293,9 +293,9 @@ Database operations use `SANDBOX_DATABASE_URL`, which production validation requ
 
 ### 8.5 Review and merge
 
-The code and safety reviewers load the current criterion text/hash, task acceptance criteria, exact artifact/checksum, diff, and affected contracts. Each criterion gets an isolated structured provider decision. Calls are concurrency-bounded and successful results are coalesced only for the exact criterion hash, subject commit, artifact checksum, content hash, and review prompt kind; inconclusive results are never cached. Deterministic findings remain fail-closed, and every appended evidence row retains the exact cache/provenance metadata.
+The code and safety reviewers load the current criterion text/hash, task acceptance criteria, exact artifact/checksum, committed diff, and affected contracts. Each criterion gets an isolated strict structured provider decision; permissive boolean/string coercion is rejected. The provided review content must match the artifact's diff SHA-256 and character length, while diffs above 100,000 characters become `INCONCLUSIVE` before a positive verdict. Calls are concurrency-bounded and successful results are coalesced only for the exact criterion hash, subject commit, artifact checksum, content hash, and review prompt kind; inconclusive results are never cached and canceling one waiter cannot cancel shared provider work. Deterministic findings remain fail-closed, and every appended evidence row retains the exact prompt/provider/cache/diff provenance metadata.
 
-Merge evaluates the active criterion evidence policy rather than a hard-coded evidence trio. It acquires a renewable Dragonfly lock, persists a `PREPARED` integration attempt, creates a no-commit prospective merge, and runs every newly eligible unique criterion command in the read-only/network-disabled sandbox against that tree. Failure aborts without a commit. Success creates the non-fast-forward integration commit, atomically fences PostgreSQL to that HEAD, records integrated-HEAD command and per-task integration evidence, and completes the task. `PREPARED` merge, post-commit/pre-database, and `COMMITTED` pre-evidence crash states are replayable without an ungoverned merge path.
+Merge evaluates the active criterion evidence policy rather than a hard-coded evidence trio. It acquires an owner-checked renewable Dragonfly lock whose renewal failure cancels the protected operation, persists a `PREPARED` integration attempt, creates a no-commit prospective merge, and runs every newly eligible unique criterion command in the read-only/network-disabled sandbox against that tree. Failure aborts without a commit. Success creates the non-fast-forward integration commit, atomically fences PostgreSQL to that HEAD, records integrated-HEAD command and per-task integration evidence, and completes the task. `PREPARED` merge, post-commit/pre-database, and `COMMITTED` pre-evidence crash states are replayable without an ungoverned merge path.
 
 Review/test failure returns the task to `PENDING` for repair. Merge conflict moves it to visible `BLOCKED`; it is never silently resolved.
 
@@ -318,13 +318,13 @@ Long-term memory writes first persist the complete scrubbed body and hash in Pos
 - Dependency health verifies all five required stores and reports configured provider availability.
 - Heartbeat loop renews agent/task leases and records health.
 - Expired task leases return to `PENDING`.
-- DoD watchdog distinguishes executing, runnable, and blocked work; it triggers typed bounded replanning or final evaluation.
+- DoD watchdog distinguishes executing, runnable, blocked, and transiently unverifiable work; it triggers bounded evaluation retry for operational uncertainty and typed replanning only for delivery gaps.
 - Stagnation watchdog detects repeated checkpoints and stale work.
 - Deadlock watchdog detects cycles in task dependencies.
 - Safety watchdog correlates denied/quarantine audit outcomes.
 - Actor health loop identifies missed heartbeats and restarts/reassigns within configured limits.
 - Evaluator failures are counted and bounded; exhaustion persists a blocker and suspends workers rather than logging forever.
-- DoD evaluation is event-triggered after successful integration, generation-coalesced in PostgreSQL, and periodically polled only for recovery.
+- DoD evaluation is event-triggered after successful integration, generation-coalesced in PostgreSQL, and periodically polled only for recovery. Satisfied/unsatisfied exact snapshots may be reused; inconclusive snapshots are rerunnable after transient recovery.
 
 Pause stops claims while retaining durable state. Resume health-checks stores/providers, reclaims expired leases, restarts missing services/workers, immediately evaluates the latest durable contract/HEAD/generation, and only then resumes periodic health/recovery loops. It does not depend on a prior process's in-memory completion event.
 
@@ -374,7 +374,7 @@ mypy agentos
 python -m compileall -q agentos
 ```
 
-Unit/contract gates cover settings, resource envelopes, all provider profiles, plan role/criterion/output/reviewer contracts, planning-context immutability, packaged prompt uniqueness/version, golden verdict/freshness cases, exact-snapshot review coalescing, task transitions, watchdog bounds, event validation, policy tamper/cross-project/path checks, Git worktrees, schema shape, Compose service/resource contracts, and packaged config/schema data.
+Unit/contract gates cover settings, resource envelopes, all provider profiles, plan role/criterion/output/reviewer contracts, conservative path/glob containment, planning-context request/symlink immutability, packaged prompt uniqueness/version, strict verdict parsing, golden verdict/freshness cases, cancellation-safe exact-snapshot review coalescing, task transitions, watchdog bounds, event validation, policy tamper/cross-project/path checks, Git worktrees, schema shape, Compose service/resource contracts, and packaged config/schema data.
 
 Live integration on a fresh Compose project initializes and round-trips:
 
@@ -386,8 +386,8 @@ Live integration on a fresh Compose project initializes and round-trips:
 - native PostgreSQL JSON codecs plus transactional event/outbox insertion;
 - project-isolation trigger rejection for a cross-project artifact;
 - atomic initial plan rollback after a late persistence failure;
-- authenticated evidence authority, stale-hash/self-review/forged-integration rejection, and append-only enforcement;
-- one-running evaluation coalescing, generation/HEAD finalization races, and terminal task/evidence write barriers;
+- authenticated evidence authority, stale-hash/self-review/criterion-global/forged-integration rejection, exact artifact/diff/command/sandbox provenance, and append-only enforcement;
+- one-running evaluation coalescing, stale-generation replan rejection, generation/HEAD finalization races, and terminal task/artifact/evidence write barriers;
 - the lossless PostgreSQL-MinIO-MongoDB memory write/hydration path;
 - a network-disabled, read-only-root, non-root Docker sandbox command.
 

@@ -9,6 +9,7 @@ from uuid import UUID
 
 import ray
 import structlog
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentos.actors.review_cache import CriterionReviewCache
 from agentos.config.loader import runtime_tuning
@@ -19,6 +20,22 @@ from agentos.storage.clients.postgres import PostgresClient
 from agentos.storage.repositories import DoDRepository
 
 logger = structlog.get_logger()
+_SECURITY_REVIEW_PROMPT_VERSION = "criterion-security-review-v1"
+_MAX_REVIEW_CONTEXT_CHARACTERS = 100_000
+
+
+class _SecurityReviewVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    safe: bool
+    findings: list[str] = Field(default_factory=list, max_length=100)
+
+
+class _BehaviorReviewVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    safe: bool
+    reason: str = Field(min_length=1, max_length=2000)
 
 
 def _json_object(content: str) -> dict[str, Any]:
@@ -66,15 +83,47 @@ class SafetyReviewerAgentActor:
             if re.search(pattern, diff_content):
                 deterministic_findings.append(finding)
 
-        task = await self.db.fetchrow("SELECT * FROM tasks WHERE id=$1", UUID(task_id))
-        artifact = await self.db.fetchrow("SELECT * FROM artifacts WHERE id=$1", UUID(artifact_id))
+        project_uuid = UUID(project_id)
+        task = await self.db.fetchrow(
+            "SELECT * FROM tasks WHERE id=$1 AND project_id=$2", UUID(task_id), project_uuid
+        )
+        artifact = await self.db.fetchrow(
+            "SELECT * FROM artifacts WHERE id=$1 AND project_id=$2",
+            UUID(artifact_id),
+            project_uuid,
+        )
         if task is None or artifact is None or artifact["task_id"] != task["id"]:
             raise ValueError("security review requires a task-bound durable artifact")
+        if str(artifact["title"]).replace("\\", "/") != file_path.replace("\\", "/"):
+            raise ValueError("security-review file path does not identify the durable artifact")
+        artifact_metadata = artifact["metadata"] or {}
+        subject_commit = artifact_metadata.get("git_commit")
+        if not isinstance(subject_commit, str) or not subject_commit:
+            raise ValueError(
+                "security-review artifact lacks its authoritative Git subject revision"
+            )
+        review_digest = artifact_metadata.get("review_diff_sha256")
+        review_characters = artifact_metadata.get("review_diff_characters")
+        if (
+            not isinstance(review_digest, str)
+            or len(review_digest) != 64
+            or not isinstance(review_characters, int)
+            or review_characters < 0
+        ):
+            raise ValueError("security-review artifact lacks its exact diff provenance")
+        context_too_large = review_characters > _MAX_REVIEW_CONTEXT_CHARACTERS
+        content_digest = hashlib.sha256(diff_content.encode("utf-8")).hexdigest()
+        if not context_too_large and (
+            len(diff_content) != review_characters or content_digest != review_digest
+        ):
+            raise ValueError("security-review content does not match the exact committed diff")
         checks = {
             str(item["criterion_id"]): item
             for item in await self.dod.get_checks(project_id, criterion_ids)
             if "security_review" in (item["required_evidence_types"] or [])
         }
+        if not checks:
+            raise ValueError("security review requires at least one criterion-authorized gate")
 
         async def review_one(criterion_id: str, criterion: dict[str, Any]) -> dict[str, Any]:
             request = ProviderRequest(
@@ -96,7 +145,10 @@ class SafetyReviewerAgentActor:
                             f"Criterion ID: {criterion_id}\nCriterion: {criterion['description']}\n"
                             f"Risk: {risk_level}\nTask acceptance: "
                             f"{json.dumps(task['acceptance_criteria'])}\nArtifact: {file_path} "
-                            f"({artifact['checksum_sha256']})\nDiff:\n{diff_content[:100_000]}"
+                            f"({artifact['checksum_sha256']})\nCriterion affected contracts: "
+                            f"{json.dumps(criterion.get('affected_contracts') or [])}\n"
+                            f"Task affected contracts: "
+                            f"{json.dumps(task['affected_contracts'] or [])}\nDiff:\n{diff_content}"
                         ),
                     },
                 ],
@@ -106,7 +158,6 @@ class SafetyReviewerAgentActor:
                 complexity=TaskComplexity.CRITICAL,
                 required_capabilities={"chat", "json"},
             )
-            subject_commit = (artifact["metadata"] or {}).get("git_commit")
             cache_key = hashlib.sha256(
                 json.dumps(
                     {
@@ -114,7 +165,7 @@ class SafetyReviewerAgentActor:
                         "criterion_hash": criterion["criterion_hash"],
                         "subject_commit": subject_commit,
                         "artifact_checksum": artifact["checksum_sha256"],
-                        "content_hash": hashlib.sha256(diff_content.encode()).hexdigest(),
+                        "content_hash": content_digest,
                         "risk_level": risk_level,
                     },
                     sort_keys=True,
@@ -126,27 +177,34 @@ class SafetyReviewerAgentActor:
                 response = await self.provider.get_completion.remote(
                     request.model_dump(mode="json"), response_format={"type": "json_object"}
                 )
-                result = _json_object(response["content"])
-                raw_findings = result.get("findings", [])
+                result = _SecurityReviewVerdict.model_validate(_json_object(response["content"]))
                 return {
-                    "safe": bool(result.get("safe")),
-                    "findings": (
-                        [str(item) for item in raw_findings]
-                        if isinstance(raw_findings, list)
-                        else []
-                    ),
+                    "safe": result.safe,
+                    "findings": result.findings,
                     "run_status": "OK",
+                    "provider": str(response.get("provider") or "unknown"),
+                    "model": str(response.get("model") or "unknown"),
                 }
 
-            try:
-                decision, cache_hit = await self.review_cache.get_or_run(cache_key, invoke_provider)
-                findings = [*deterministic_findings, *decision["findings"]]
-                safe = bool(decision["safe"]) and not deterministic_findings
-            except Exception as error:
+            if context_too_large:
                 safe = False
                 cache_hit = False
                 decision = {"run_status": "INCONCLUSIVE"}
-                findings = [f"independent security review unavailable: {type(error).__name__}"]
+                findings = [
+                    "exact artifact diff exceeds the bounded independent-review context limit"
+                ]
+            else:
+                try:
+                    decision, cache_hit = await self.review_cache.get_or_run(
+                        cache_key, invoke_provider
+                    )
+                    findings = [*deterministic_findings, *decision["findings"]]
+                    safe = bool(decision["safe"]) and not deterministic_findings
+                except Exception as error:
+                    safe = False
+                    cache_hit = False
+                    decision = {"run_status": "INCONCLUSIVE"}
+                    findings = [f"independent security review unavailable: {type(error).__name__}"]
             run_status = str(decision["run_status"])
             summary = (
                 f"Criterion {criterion_id} independently security-reviewed for artifact "
@@ -173,6 +231,9 @@ class SafetyReviewerAgentActor:
                     "risk_level": risk_level,
                     "cache_hit": cache_hit,
                     "review_cache_key": cache_key,
+                    "prompt_version": _SECURITY_REVIEW_PROMPT_VERSION,
+                    "provider": decision.get("provider"),
+                    "model": decision.get("model"),
                 },
             )
             return {
@@ -226,8 +287,8 @@ class SafetyReviewerAgentActor:
             response = await self.provider.get_completion.remote(
                 request.model_dump(mode="json"), response_format={"type": "json_object"}
             )
-            result = _json_object(response["content"])
-            return {"safe": bool(result.get("safe")), "reason": str(result.get("reason", ""))}
+            result = _BehaviorReviewVerdict.model_validate(_json_object(response["content"]))
+            return result.model_dump()
         except Exception as error:
             logger.error("safety_review_failed_closed", error_type=type(error).__name__)
             return {"safe": False, "reason": "safety reviewer unavailable; failed closed"}

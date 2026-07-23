@@ -5,7 +5,7 @@
 Production clients are under `agentos/storage/clients/`:
 
 - `PostgresClient`: bounded asyncpg pool, UTC/statement timeouts, transactions, schema lock/preflight.
-- `DragonflyClient`: namespaced Redis protocol, health, JSON values, token-safe compare-and-delete locks with owner-checked automatic lease renewal.
+- `DragonflyClient`: namespaced Redis protocol, health, JSON values, token-safe compare-and-delete locks with owner-checked automatic lease renewal; renewal/ownership failure cancels the protected caller and fails closed.
 - `MongoDocumentClient`: `AsyncMongoClient`, indexes, TTL memory, agent state.
 - `MinioObjectClient`: async facade, bucket versioning, safe names, checksums, put/get/stat.
 - `MilvusVectorClient`: typed schema/index, dimension validation, scoped strong-consistency search.
@@ -33,10 +33,10 @@ These classes are instantiated by the supervisor, messaging, memory, execution, 
 
 - `audit_events`: append-only chained hashes.
 - `provider_call_intents` and `provider_calls`: append-only pre-egress intent plus linked provider accounting.
-- `artifacts`: object URI/version/checksum/length/content type/Git metadata.
+- `artifacts`: append-only exact object URI/version/checksum/length/content type, full Git revision, and committed-diff provenance.
 - `runtime_config_snapshots`: safe environment plus generated resource allocation.
 
-The evidence contract is enforced twice: `DoDRepository.add_evidence()` validates the caller before insertion, and `agentos_validate_dod_evidence` independently rejects SQL inserts with an inactive/stale criterion, unauthorized type, unauthenticated/mismatched role, missing or cross-task artifact, self-review, inconsistent checksum/exit state, or forged integration identity. Contract versions, evidence, and evaluation items reject update/delete.
+The evidence contract is enforced twice: `DoDRepository.add_evidence()` validates and canonicalizes the caller before insertion, and `agentos_validate_dod_evidence` independently rejects SQL inserts with an inactive/stale criterion, unauthorized type, unauthenticated/mismatched role, missing or cross-task artifact, wrong artifact Git revision, absent committed-diff provenance, self-review, forged criterion-global command authority, mismatched canonical command digest, missing sandbox digest, inconsistent checksum/exit state, or forged integration identity. Artifact rows, contract versions, evidence, and evaluation items reject update/delete. New artifact rows must bind one nonempty MinIO URI `versionId` to the same `object_version_id`; legacy rows remain readable but cannot become current proof without reevaluation.
 
 Table-specific project-isolation triggers reject cross-project task parents/owners, dependencies, artifact/checkpoint references, summary sources, DoD artifacts, outbox events, and memory source references.
 
@@ -66,16 +66,16 @@ Contract amendment is explicit and version-incrementing. An exact hash/reason-bo
 
 ## Evidence evaluation
 
-`start_evaluation()` locks the project and snapshots contract version/hash, integration HEAD, evidence generation, and timestamp cutoff. A partial unique index permits one `RUNNING` evaluation per project; exact terminal snapshots are reused, concurrent callers coalesce, newer generations mark old runs stale, and abandoned runs recover visibly.
+`start_evaluation()` locks the project and snapshots contract version/hash, integration HEAD, evidence generation, and timestamp cutoff. A partial unique index permits one `RUNNING` evaluation per project; exact satisfied/unsatisfied snapshots are reused, inconclusive snapshots may be rerun after transient recovery, concurrent callers coalesce, newer generations mark old runs stale, and abandoned runs recover visibly.
 
 For each active criterion, the evaluator retrieves only evidence within that snapshot and applies the declared cardinality. It verifies:
 
 1. mandatory task coverage and current-version task completion;
 2. every criterion-, task-, or artifact-scoped evidence instance exists and passes;
 3. required artifact patterns map to durable task artifacts;
-4. artifact MinIO object/version, length, and SHA-256 match PostgreSQL;
-5. command tokens match the contract and the passing final command ran on the exact integrated HEAD;
-6. review/security evidence is artifact-bound and from the authenticated independent role;
+4. artifact MinIO URI version, version column, object body, length, and SHA-256 match append-only PostgreSQL metadata;
+5. command tokens and canonical command digest match the contract, a valid sandbox digest exists, and the passing final command ran on the exact integrated HEAD;
+6. review/security evidence is artifact/revision/committed-diff-bound and from the authenticated independent role;
 7. task integration commits remain ancestors of the current HEAD;
 8. artifact/review subject commits remain fresh under conservative path/directory/glob and cross-task affected-contract invalidation;
 9. the managed repository HEAD equals the fenced integration HEAD.
@@ -88,7 +88,7 @@ Finalization locks the project and evaluation run, compares contract version/has
 
 ### DoD watchdog
 
-The strict evaluator is triggered after integration and polled periodically for recovery. The watchdog separately counts executing, dependency-runnable, and other nonterminal work. Only no executing/runnable work with mandatory gaps emits one evaluation-correlated typed replan request. The repository compares requested criteria with the run's durable unsatisfied items, validates artifact/contract coverage and an acyclic dependency graph, and binds one immutable task batch to the evaluation generation. Exact duplicate runs/tasks/events coalesce; conflicting duplicates fail closed. Attempts use exponential backoff; exhaustion persists a blocker and suspends work.
+The strict evaluator is triggered after integration and polled periodically for recovery. The watchdog separately counts executing, dependency-runnable, and other nonterminal work. With no executing/runnable work, wholly retryable operational gaps (`ARTIFACT_STORE_INCONCLUSIVE`, stale snapshot, freshness uncertainty, or ancestry uncertainty) schedule bounded evaluation retry in `VERIFYING`; they do not manufacture code tasks. Repairable delivery gaps emit one deterministic evaluation-correlated typed replan request. The repository compares requested criteria with the run's durable unsatisfied items and current generation, validates the complete `InitialTask` contracts, artifact/contract coverage, security requirements, and an acyclic exact dependency graph, and binds one immutable task batch to that evaluation generation. Exact duplicate runs/tasks/events coalesce; conflicting or stale duplicates fail closed. Attempts use exponential backoff; exhaustion persists a blocker and suspends work.
 
 ### Stagnation watchdog
 
@@ -125,4 +125,4 @@ docker compose --env-file .env config --quiet
 agentos doctor
 ```
 
-The focused DoD suite includes model/cross-object rejection, fail-closed planning source checks, packaged-prompt uniqueness, golden verdict/freshness data, exact-snapshot review caching, state-machine/watchdog contracts, atomic plan rollback, SQL evidence authority, append-only mutation rejection, evaluation coalescing/staleness, finalization generation races, and terminal write barriers. The full Compose integration additionally exercises every storage client and restricted execution sandbox.
+The focused DoD suite includes model/cross-object and conservative glob rejection, fail-closed request/source/symlink planning checks, packaged-prompt uniqueness, strict verdict parsing, golden verdict/freshness data, cancellation-safe exact-snapshot review caching, state-machine/watchdog contracts, atomic plan rollback, exact artifact/diff/command/sandbox provenance, SQL evidence authority, append-only mutation rejection, stale-generation/idempotent replanning, evaluation coalescing/staleness, finalization generation races, and terminal write barriers. The full Compose integration additionally exercises every storage client and restricted execution sandbox.

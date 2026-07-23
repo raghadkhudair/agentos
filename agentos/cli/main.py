@@ -229,7 +229,8 @@ def status(project_id: str | None = typer.Argument(None, help="Optional project 
                 SELECT DISTINCT ON (criterion_id,evidence_type)
                   criterion_id,evidence_type,source_agent_id,source_role,task_id,artifact_id,
                   contract_version,criterion_hash,subject_commit,integration_commit,run_status,
-                  passed,watched_paths,affected_contracts,evidence_generation,created_at
+                  passed,command_digest,sandbox_digest,checksum_sha256,watched_paths,
+                  affected_contracts,evidence_generation,metadata,created_at
                 FROM dod_evidence WHERE project_id=$1
                 ORDER BY criterion_id,evidence_type,created_at DESC
                 """,

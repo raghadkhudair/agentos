@@ -22,7 +22,7 @@ health -> project row -> clean bounded source snapshot -> service actors
        -> workers or BLOCKED_REQUIRES_INPUT
 ```
 
-Plan validation enforces stable unique DoD IDs and normalized semantics, criterion hashes/provenance/locks/severity, at least one mandatory criterion, exactly one executable test/command type, artifact/review/integration baselines for delivered work, explicit evidence scopes, criterion/task/output/contract coverage, reviewer/security unions, nonempty acceptance/paths/outputs, role caps, maximum total agents, unique task titles, valid dependencies, and bounded ownership paths. The complete `TeamPlan` is revalidated after roster hardening/reduction and before persistence.
+Planning bounds the request to 100,000 UTF-8 bytes, permits only safe relative Git-tracked paths, and never follows tracked documentation symlinks. Plan validation then enforces stable unique DoD IDs and normalized semantics, criterion hashes/provenance/locks/severity, at least one mandatory criterion, exactly one executable test/command type, artifact/review/integration baselines for delivered work, explicit evidence scopes, conservative glob/path/contract coverage, reviewer/security unions, nonempty unique acceptance/criteria/dependencies, role caps, maximum total agents, unique task titles, valid dependencies, and bounded ownership paths. The complete `TeamPlan` is revalidated after roster hardening/reduction and before persistence.
 
 ## Resource planner algorithm
 
@@ -83,7 +83,7 @@ Task/artifact/evidence/integration writes advance a durable evaluation generatio
 - task dependency cycles;
 - unsafe audit volume/quarantine signals.
 
-Only one evaluation run per project may be `RUNNING`; exact completed snapshots are reused, duplicates coalesce, changed snapshots supersede older runs, and abandoned same-evaluator runs recover. PM replanning must match that durable run's exact gaps and produces one immutable, graph-validated task batch per evaluation generation; exact delivery coalesces while changed duplicates fail closed. Other actions include stream freeze/quarantine, deadlock visibility, lease recovery, and snapshot-fenced completion. Replan/evaluator failures have bounded attempts/backoff and end in a durable visible blocker.
+Only one evaluation run per project may be `RUNNING`; exact satisfied/unsatisfied snapshots are reused, inconclusive snapshots are re-evaluated, duplicates coalesce, changed snapshots supersede older runs, and abandoned same-evaluator runs recover. Retryable operational gaps take the bounded `VERIFYING`/evaluation-retry path instead of creating code tasks. PM replanning is reserved for repairable delivery gaps, must match that durable run's exact gaps and current generation, and produces one immutable, graph-validated task batch; exact delivery coalesces while changed contracts or dependency graphs fail closed. Other actions include stream freeze/quarantine, deadlock visibility, lease recovery, and snapshot-fenced completion. Replan/evaluator failures have bounded attempts/backoff and end in a durable visible blocker.
 
 ## Health loop
 

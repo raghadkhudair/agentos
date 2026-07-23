@@ -198,7 +198,11 @@ async def test_evidence_authority_and_provenance_are_fail_closed() -> None:
         checksum_sha256=checksum,
         content_length=5,
         task_id=task_id,
-        metadata={"git_commit": "a" * 40},
+        metadata={
+            "git_commit": "a" * 40,
+            "review_diff_sha256": hashlib.sha256(b"proof").hexdigest(),
+            "review_diff_characters": 5,
+        },
     )
     dod = DoDRepository(postgres)
     await dod.add_evidence(
@@ -268,6 +272,37 @@ async def test_evidence_authority_and_provenance_are_fail_closed() -> None:
             source_role="qa_engineer",
             subject_commit="a" * 40,
             integration_commit="b" * 40,
+        )
+    with pytest.raises(ValueError, match="criterion-global"):
+        await dod.add_evidence(
+            project_id,
+            "proof",
+            "test",
+            "qa_engineer-1",
+            "forged criterion-global command",
+            True,
+            source_role="qa_engineer",
+            command=json.dumps(["python", "-c", "print('proof')"]),
+            exit_code=0,
+            subject_commit="a" * 40,
+            sandbox_digest="f" * 64,
+        )
+    with pytest.raises(ValueError, match="exact Git revision"):
+        await dod.add_evidence(
+            project_id,
+            "proof",
+            "review",
+            "code_reviewer-1",
+            "review bound to the wrong revision",
+            True,
+            artifact_id=artifact_id,
+            task_id=task_id,
+            source_role="code_reviewer",
+            subject_commit="b" * 40,
+        )
+    with pytest.raises(asyncpg.RaiseError, match="append-only"):
+        await postgres.execute(
+            "UPDATE artifacts SET summary='mutated' WHERE id=$1", UUID(artifact_id)
         )
     await postgres.disconnect()
 
@@ -352,6 +387,103 @@ async def test_replanning_is_gap_bound_graph_validated_and_generation_idempotent
 
 
 @pytest.mark.asyncio
+async def test_stale_evaluation_cannot_create_a_new_replan_batch() -> None:
+    settings = Settings(environment="test", postgres_pool_min_size=1, postgres_pool_max_size=2)
+    postgres = PostgresClient(settings)
+    await postgres.initialize_schema()
+    project_id, _ = await _create_planned_test_project(
+        postgres,
+        settings,
+        "stale-replan-proof",
+        "Reject replanning after the evaluated project snapshot advances.",
+    )
+    await ProjectRepository(postgres).update_status(project_id, "RUNNING")
+    dod = DoDRepository(postgres)
+    check = await postgres.fetchrow(
+        "SELECT criterion_hash FROM dod_checks WHERE project_id=$1", UUID(project_id)
+    )
+    assert check is not None
+    run = await dod.start_evaluation(project_id, "stale-replan-test")
+    await dod.persist_evaluation(
+        str(run["id"]),
+        [
+            {
+                "criterion_id": "proof",
+                "criterion_hash": check["criterion_hash"],
+                "status": "MISSING",
+                "reasons": [
+                    {"criterion_id": "proof", "code": "EVIDENCE_MISSING", "message": "missing"}
+                ],
+                "evidence_ids": [],
+            }
+        ],
+        "UNSATISFIED",
+        [],
+    )
+    await postgres.execute(
+        "UPDATE projects SET evidence_generation=evidence_generation+1 WHERE id=$1",
+        UUID(project_id),
+    )
+    proposal = InitialTask(
+        title="Recover stale proof",
+        description="Produce a fresh proof for the current project snapshot.",
+        owner_role=AgentRole.QA_ENGINEER,
+        acceptance_criteria=["The exact proof command passes."],
+        allowed_paths=["proof"],
+        expected_outputs=["proof/result.txt"],
+        required_reviewers=["code_reviewer"],
+        dod_criteria=["proof"],
+    )
+    with pytest.raises(ValueError, match="stale project snapshot"):
+        await TaskRepository(postgres).create_replan_batch(
+            project_id, str(run["id"]), ["proof"], [proposal]
+        )
+    await postgres.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_task_creation_reuses_full_contract_only() -> None:
+    settings = Settings(environment="test", postgres_pool_min_size=1, postgres_pool_max_size=2)
+    postgres = PostgresClient(settings)
+    await postgres.initialize_schema()
+    project_id, _ = await _create_planned_test_project(
+        postgres,
+        settings,
+        "dynamic-task-proof",
+        "Validate the complete dynamic task contract.",
+    )
+    await ProjectRepository(postgres).update_status(project_id, "RUNNING")
+    tasks = TaskRepository(postgres)
+    task_arguments = {
+        "project_id": project_id,
+        "title": "Produce supplemental proof",
+        "description": "Produce a bounded supplemental proof artifact.",
+        "owner_role": AgentRole.QA_ENGINEER.value,
+        "acceptance_criteria": ["The supplemental proof is inspectable."],
+        "allowed_paths": ["proof"],
+        "expected_outputs": ["proof/supplemental.txt"],
+        "required_reviewers": ["code_reviewer"],
+        "dod_criteria": ["proof"],
+        "external_key": "dynamic-proof-1",
+    }
+    created = await tasks.create_task(**task_arguments)
+    assert await tasks.create_task(**task_arguments) == created
+    with pytest.raises(ValueError, match="different task contract"):
+        await tasks.create_task(**{**task_arguments, "expected_outputs": ["proof/changed.txt"]})
+    with pytest.raises(ValueError, match="security evidence"):
+        await tasks.create_task(
+            **{
+                **task_arguments,
+                "title": "Unsafe high risk proof",
+                "external_key": "dynamic-proof-high-risk",
+                "risk_level": "HIGH",
+                "required_reviewers": ["code_reviewer", "security_reviewer"],
+            }
+        )
+    await postgres.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_all_storage_clients_round_trip() -> None:
     """Exercise every required data system through the production client classes."""
 
@@ -407,10 +539,11 @@ async def test_all_storage_clients_round_trip() -> None:
                 project_id,
                 "FILE",
                 "cross-project.txt",
-                object_uri="minio://invalid/cross-project.txt",
+                object_uri="minio://invalid/cross-project.txt?versionId=1",
                 checksum_sha256="0" * 64,
                 content_length=0,
                 task_id=other_task_id,
+                metadata={"git_commit": "a" * 40},
             )
 
         assert (await dragonfly.healthcheck())["healthy"] is True
@@ -776,6 +909,7 @@ async def test_dod_evaluation_snapshot_fence_and_terminal_write_barrier() -> Non
         command=json.dumps(["python", "-c", "print('proof')"]),
         exit_code=0,
         subject_commit="c" * 40,
+        sandbox_digest="1" * 64,
     )
     with pytest.raises(asyncpg.RaiseError, match="append-only"):
         await postgres.execute(
@@ -817,6 +951,7 @@ async def test_dod_evaluation_snapshot_fence_and_terminal_write_barrier() -> Non
         command=json.dumps(["python", "-c", "print('proof')"]),
         exit_code=0,
         subject_commit="d" * 40,
+        sandbox_digest="2" * 64,
     )
     assert await dod.finalize_project(project_id, str(satisfied_run["id"])) is False
     final_run = await dod.start_evaluation(project_id, "dod_evaluator")

@@ -32,7 +32,9 @@ class CriterionReviewCache:
                 self._inflight[key] = future
                 owner = True
         if not owner:
-            return copy.deepcopy(await future), True
+            # A cancelled waiter must not cancel the shared provider operation for every
+            # other criterion consumer.
+            return copy.deepcopy(await asyncio.shield(future)), True
         try:
             async with self._semaphore:
                 result = await operation()
@@ -42,12 +44,14 @@ class CriterionReviewCache:
                     self._cache.move_to_end(key)
                     while len(self._cache) > self._max_entries:
                         self._cache.popitem(last=False)
-            future.set_result(copy.deepcopy(result))
+            if not future.done():
+                future.set_result(copy.deepcopy(result))
             return result, False
         except BaseException as error:
-            future.set_exception(error)
-            # Consume the exception when no coalesced waiter exists.
-            future.exception()
+            if not future.done():
+                future.set_exception(error)
+                # Consume the exception when no coalesced waiter exists.
+                future.exception()
             raise
         finally:
             async with self._lock:

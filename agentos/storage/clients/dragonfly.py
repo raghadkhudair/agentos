@@ -75,26 +75,49 @@ class DragonflyClient:
             if acquired:
                 token = await self.redis.get(key) or token
         stop_renewal = asyncio.Event()
+        owner_task = asyncio.current_task()
+        renewal_error: Exception | None = None
 
         async def renew() -> None:
+            nonlocal renewal_error
             interval = max(1.0, ttl_seconds / 3)
             while not stop_renewal.is_set():
                 try:
                     await asyncio.wait_for(stop_renewal.wait(), timeout=interval)
                 except TimeoutError:
-                    renewed = await self.redis.eval(self._RENEW_LOCK, 1, key, token, ttl_seconds)
-                    if not renewed:
-                        raise RuntimeError(f"distributed lock ownership was lost: {name}") from None
+                    try:
+                        renewed = await self.redis.eval(
+                            self._RENEW_LOCK, 1, key, token, ttl_seconds
+                        )
+                        if not renewed:
+                            raise RuntimeError(
+                                f"distributed lock ownership was lost: {name}"
+                            ) from None
+                    except Exception as error:
+                        renewal_error = error
+                        # The protected operation must not continue after its lease can no longer
+                        # be proven. Cancellation reaches the caller at its next async boundary.
+                        if owner_task is not None and not owner_task.done():
+                            owner_task.cancel()
+                        return
 
         renewal = asyncio.create_task(renew()) if acquired else None
         try:
             yield acquired
         finally:
+            release_error: Exception | None = None
             if acquired:
                 stop_renewal.set()
                 if renewal is not None:
                     await renewal
-                await self.redis.eval(self._RELEASE_LOCK, 1, key, token)
+                try:
+                    await self.redis.eval(self._RELEASE_LOCK, 1, key, token)
+                except Exception as error:
+                    release_error = error
+            if renewal_error is not None:
+                raise RuntimeError(f"distributed lock renewal failed: {name}") from renewal_error
+            if release_error is not None:
+                raise RuntimeError(f"distributed lock release failed: {name}") from release_error
 
     async def set_json(self, key: str, payload: str, *, ttl_seconds: int | None = None) -> None:
         await self.redis.set(self.key(key), payload, ex=ttl_seconds)

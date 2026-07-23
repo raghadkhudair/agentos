@@ -12,10 +12,10 @@ This repository contains the implemented runtime, not a starter scaffold.
 - Real client classes for every data system under `agentos/storage/clients/`, used by runtime services rather than merely declared as dependencies.
 - Provider-neutral LiteLLM gateway for OpenAI, Anthropic/Claude, Gemini, DeepSeek, Moonshot/Kimi, Alibaba/Qwen, Z.AI/GLM, MiniMax, and Ollama.
 - Complexity- and role-aware model selection, provider fallback, concurrency caps, budgets, credential redaction, egress-host validation, audit records, and circuit breakers.
-- Git worktree isolation, atomic file writes, versioned MinIO artifacts, sandboxed commands, a physically separate sandbox database, independent code/security review, and test-before-merge enforcement.
+- Git worktree isolation, atomic file writes, append-only exact-version MinIO artifacts, sandboxed commands with canonical command/sandbox digests, a physically separate sandbox database, independent code/security review, and test-before-merge enforcement.
 - Transactional PostgreSQL event outbox, Dragonfly Streams delivery, per-agent consumer groups, durable receipt/lease state, stale-message reclaim, scoped shared memory, and catch-up packets.
-- Versioned, source-revision-grounded DoD contracts with stable criterion IDs/hashes, provenance and locks, explicit evidence cardinality, governed amendment/waiver, typed gaps, and append-only task/artifact/Git-bound evidence.
-- Prospective integrated-tree verification, renewable merge locking, durable replayable integration attempts, conservative path/contract freshness invalidation, and an atomic contract/HEAD/evidence-generation finalization fence. Text similarity cannot mark work complete.
+- Versioned, source-revision-grounded DoD contracts with stable criterion IDs/hashes, provenance and locks, explicit evidence cardinality, governed amendment/waiver, typed gaps, and append-only task/artifact/Git-bound evidence. Glob/path containment and affected-contract overlap are conservative and fail closed.
+- Prospective integrated-tree verification, owner-checked renewable merge locking that cancels work on lease loss, durable replayable integration attempts, conservative path/contract freshness invalidation, and an atomic contract/HEAD/evidence-generation finalization fence. Text similarity cannot mark work complete.
 - Pause, resume, approval, rejection, status, logs, inspection, dependency health, runtime configuration, and guardrail CLI surfaces.
 
 ## Architecture
@@ -55,7 +55,7 @@ cp .env.example .env
 
 Replace every `CHANGE_ME` value, configure at least one AI provider, and never commit `.env`. Set `AGENTOS_SOURCE_REPOSITORY` to an existing Git worktree visible to the runtime process when a run must begin from real source; the execution service clones that source into its managed repository before creating task worktrees. Under Compose, seed the repository inside the `/workspaces` volume or add an explicit read-only bind mount and use its container path.
 
-Planning captures only Git-tracked paths plus bounded relevant manifests/docs and binds the contract to the clean repository HEAD. A dirty, bare, unreadable, or oversized source snapshot blocks planning instead of producing an ungrounded DoD. Then:
+Planning accepts at most 100,000 request bytes, captures only Git-tracked paths plus bounded relevant manifests/docs, and binds the contract to the clean repository HEAD. Tracked symlinks may be listed in the tree but are never followed or read into provider context. A dirty, bare, unreadable, traversal-unsafe, or oversized source snapshot blocks planning instead of producing an ungrounded DoD. Then:
 
 ```bash
 docker compose config --quiet
@@ -151,7 +151,7 @@ Run the real storage round-trip against Compose:
 RUN_AGENTOS_INTEGRATION=1 pytest -q -m integration
 ```
 
-The integration suite initializes and round-trips PostgreSQL, DragonflyDB, MongoDB, MinIO, and Milvus through the production clients. It also proves native JSON/outbox behavior, cross-project and evidence-authority rejection, atomic plan rollback, append-only evidence, exact-gap graph-validated/idempotent replanning, durable evaluation recovery, finalization race fencing, terminal write barriers, the lossless PostgreSQL-MinIO-MongoDB memory saga, and restricted Docker sandboxing. Its live delivery test executes the canonical Git/MinIO artifact, command evidence, independent reviewer identity, prospective merge, integrated-HEAD evaluator, and atomic `DOD_SATISFIED` path end to end. The runtime Docker image excludes development tooling; build the test target with `docker build --target test -t agentos-local:test .`.
+The integration suite initializes and round-trips PostgreSQL, DragonflyDB, MongoDB, MinIO, and Milvus through the production clients. It also proves native JSON/outbox behavior, cross-project and criterion-global evidence-authority rejection, atomic plan rollback, exact-version append-only artifacts/evidence, stale-generation and exact-gap graph-validated/idempotent replanning, durable evaluation recovery, finalization race fencing, terminal write barriers, the lossless PostgreSQL-MinIO-MongoDB memory saga, and restricted Docker sandboxing. Its live delivery test executes the canonical Git/MinIO artifact, checksum-bound committed-diff review, command/sandbox-digest evidence, prospective merge, integrated-HEAD evaluator, and atomic `DOD_SATISFIED` path end to end. The runtime Docker image excludes development tooling; build the test target with `docker build --target test -t agentos-local:test .`.
 
 ## Operational cautions
 

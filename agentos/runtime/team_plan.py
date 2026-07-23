@@ -210,6 +210,26 @@ class InitialTask(BaseModel):
     affected_contracts: list[str] = Field(default_factory=list)
     complexity: str = Field(default="standard", pattern="^(low|standard|high|critical)$")
 
+    @field_validator("acceptance_criteria")
+    @classmethod
+    def _acceptance_criteria_are_concrete(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(len(item) < 3 for item in normalized):
+            raise ValueError("acceptance criteria must contain concrete nonempty statements")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("acceptance criteria must be unique")
+        return normalized
+
+    @field_validator("dod_criteria", "depends_on")
+    @classmethod
+    def _identifier_lists_are_unique_and_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("criterion and dependency identifiers must be nonempty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("criterion and dependency identifiers must be unique")
+        return normalized
+
     @field_validator("allowed_paths", "blocked_paths", "expected_outputs", "affected_contracts")
     @classmethod
     def _task_paths_are_bounded(cls, value: list[str]) -> list[str]:
@@ -247,7 +267,7 @@ class InitialTask(BaseModel):
         ):
             raise ValueError("high and critical risk tasks require a security reviewer")
         for output in self.expected_outputs:
-            if not any(_patterns_overlap(output, allowed) for allowed in self.allowed_paths):
+            if not any(_pattern_within_boundary(output, allowed) for allowed in self.allowed_paths):
                 raise ValueError(
                     f"expected output {output!r} is outside the task's allowed path contract"
                 )
@@ -277,22 +297,79 @@ class AgentSpec(BaseModel):
         return list(dict.fromkeys(value))
 
 
-def _patterns_overlap(left: str, right: str) -> bool:
-    """Conservatively decide whether two bounded path patterns can describe one file."""
+_GLOB_CHARACTERS = "*?["
 
-    a = left.replace("\\", "/").rstrip("/")
-    b = right.replace("\\", "/").rstrip("/")
-    wildcard = "*?["
-    a_prefix = a.split("*", 1)[0].split("?", 1)[0]
-    b_prefix = b.split("*", 1)[0].split("?", 1)[0]
-    return (
-        fnmatch.fnmatch(a, b)
-        or fnmatch.fnmatch(b, a)
-        or a.startswith(b_prefix)
-        or b.startswith(a_prefix)
-        or (not any(char in b for char in wildcard) and a.startswith(f"{b}/"))
-        or (not any(char in a for char in wildcard) and b.startswith(f"{a}/"))
-    )
+
+def _normalized_pattern(value: str) -> str:
+    return PurePosixPath(value.replace("\\", "/")).as_posix().strip("/")
+
+
+def _contains_glob(value: str) -> bool:
+    return any(character in value for character in _GLOB_CHARACTERS)
+
+
+def _literal_prefix(value: str) -> str:
+    indexes = [value.find(character) for character in _GLOB_CHARACTERS]
+    present = [index for index in indexes if index >= 0]
+    return value[: min(present)] if present else value
+
+
+def _literal_suffix(value: str) -> str:
+    indexes = [value.rfind(character) for character in _GLOB_CHARACTERS]
+    present = [index for index in indexes if index >= 0]
+    return value[max(present) + 1 :] if present else value
+
+
+def _literal_boundary_contains(boundary: str, candidate: str) -> bool:
+    boundary = boundary.rstrip("/")
+    candidate = candidate.rstrip("/")
+    return candidate == boundary or candidate.startswith(f"{boundary}/")
+
+
+def _patterns_overlap(left: str, right: str) -> bool:
+    """Fail closed unless two bounded path patterns can demonstrably share a path."""
+
+    a = _normalized_pattern(left)
+    b = _normalized_pattern(right)
+    if not a or not b:
+        return False
+    if a == b or fnmatch.fnmatchcase(a, b) or fnmatch.fnmatchcase(b, a):
+        return True
+    a_prefix = _literal_prefix(a)
+    b_prefix = _literal_prefix(b)
+    if not a_prefix or not b_prefix:
+        return False
+    if not (a_prefix.startswith(b_prefix) or b_prefix.startswith(a_prefix)):
+        return False
+    a_suffix = _literal_suffix(a)
+    b_suffix = _literal_suffix(b)
+    if a_suffix and b_suffix and not (a_suffix.endswith(b_suffix) or b_suffix.endswith(a_suffix)):
+        return False
+    return True
+
+
+def _pattern_within_boundary(pattern: str, boundary: str) -> bool:
+    """Prove that an expected output pattern stays inside one allowed path boundary."""
+
+    expected = _normalized_pattern(pattern)
+    allowed = _normalized_pattern(boundary)
+    if not expected or not allowed:
+        return False
+    if expected == allowed:
+        return True
+    if not _contains_glob(expected):
+        if not _contains_glob(allowed):
+            return _literal_boundary_contains(allowed, expected)
+        return fnmatch.fnmatchcase(expected, allowed)
+    if _contains_glob(allowed):
+        # Proving that one arbitrary glob is a subset of another is not safe here. Plans can
+        # express a literal allowed directory or use the exact same bounded pattern.
+        return False
+    literal_allowed = allowed.rstrip("/")
+    prefix = _literal_prefix(expected)
+    # A textual prefix is not a path boundary: ``src*/file.py`` can also write to
+    # ``src-backup/file.py`` and therefore must not be authorized by literal ``src``.
+    return bool(prefix) and expected.startswith(f"{literal_allowed}/")
 
 
 class TeamPlan(BaseModel):
@@ -428,9 +505,14 @@ class TeamPlan(BaseModel):
                         f"criterion {criterion.criterion_id!r} artifact {pattern!r} "
                         "is not covered by a mapped task output"
                     )
-            missing_contracts = (
-                set(criterion.affected_contracts) - contracts_by_criterion[criterion.criterion_id]
-            )
+            missing_contracts = {
+                required_contract
+                for required_contract in criterion.affected_contracts
+                if not any(
+                    _patterns_overlap(required_contract, task_contract)
+                    for task_contract in contracts_by_criterion[criterion.criterion_id]
+                )
+            }
             if missing_contracts:
                 raise ValueError(
                     f"criterion {criterion.criterion_id!r} affected contracts are not assigned "

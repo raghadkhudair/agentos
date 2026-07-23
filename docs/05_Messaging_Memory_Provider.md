@@ -84,7 +84,7 @@ Purpose can derive complexity—for example, heartbeat compression is low, ordin
 
 No keys or response bodies are stored in provider audit rows.
 
-Per-criterion code/security review remains routed through this gateway. Reviewer actors add a smaller local semaphore and bounded LRU/single-flight cache keyed by review kind, criterion hash, subject commit, artifact checksum, content hash, and risk where applicable. Only successful exact-snapshot decisions are reusable; provider/parse uncertainty becomes append-only `INCONCLUSIVE` evidence and is never cached.
+Per-criterion code/security review remains routed through this gateway. Reviewer actors use strict structured verdict schemas and bind prompt content to the artifact's exact committed-diff SHA-256 and length; oversized, mismatched, provider, and parse uncertainty becomes append-only `INCONCLUSIVE` evidence and is never cached. A smaller local semaphore and bounded LRU/single-flight cache is keyed by review kind, criterion hash, subject commit, artifact checksum, content hash, and risk where applicable. Only successful exact-snapshot decisions are reusable, and canceling one waiting caller cannot cancel the shared provider computation.
 
 ## Embeddings
 

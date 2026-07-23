@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import structlog
 
@@ -37,20 +38,38 @@ class _Watchdog:
         *,
         correlation_id: str | None = None,
     ) -> None:
+        event_id = (
+            uuid5(
+                NAMESPACE_URL,
+                f"agentos:{project_id}:{event_type.value}:{correlation_id}",
+            )
+            if correlation_id
+            else None
+        )
+        event_payload: dict[str, Any] = {
+            "project_id": project_id,
+            "event_type": event_type,
+            "producer_agent_id": self.PRODUCER_IDS[self.__class__.__name__],
+            "payload": payload,
+            "correlation_id": correlation_id,
+        }
+        if event_id is not None:
+            event_payload["event_id"] = event_id
         await self.events.save_event(
             project_id,
-            Event(
-                project_id=project_id,
-                event_type=event_type,
-                producer_agent_id=self.PRODUCER_IDS[self.__class__.__name__],
-                payload=payload,
-                correlation_id=correlation_id,
-            ),
+            Event.model_validate(event_payload),
         )
 
 
 class DoDWatchdog(_Watchdog):
     """Triggers durable replanning when the backlog is empty but DoD is incomplete."""
+
+    TRANSIENT_EVALUATION_CODES = {
+        "ARTIFACT_STORE_INCONCLUSIVE",
+        "EVALUATION_SNAPSHOT_STALE",
+        "EVIDENCE_FRESHNESS_INCONCLUSIVE",
+        "INTEGRATION_ANCESTRY_INCONCLUSIVE",
+    }
 
     def __init__(self, database: PostgresClient):
         super().__init__(database)
@@ -83,6 +102,11 @@ class DoDWatchdog(_Watchdog):
         assert counts is not None
         if dod_satisfied or int(counts["executing"] or 0) > 0 or int(counts["runnable"] or 0) > 0:
             return {"action_required": "NONE", "status": "COMPLIANT"}
+        retry_evaluation = bool(dod_gaps) and all(
+            bool(gap.get("retryable", True))
+            and str(gap.get("code")) in self.TRANSIENT_EVALUATION_CODES
+            for gap in dod_gaps
+        )
         tuning = runtime_tuning()["dod"]
         maximum = int(tuning["max_replan_attempts"])
         delay = int(tuning["replan_backoff_seconds"])
@@ -119,25 +143,37 @@ class DoDWatchdog(_Watchdog):
                 attempts += 1
                 await connection.execute(
                     """
-                    UPDATE projects SET status='REPLANNING',replan_attempts=$2,
+                    UPDATE projects SET status=$4,replan_attempts=$2,
                       next_replan_at=now()+($3*interval '1 second') WHERE id=$1::uuid
                     """,
                     project_id,
                     attempts,
                     delay * (2 ** (attempts - 1)),
+                    "VERIFYING" if retry_evaluation else "REPLANNING",
                 )
         if exhausted:
             await self.emit(
                 project_id,
                 EventType.BLOCKER_CREATED,
                 {
-                    "reason": "bounded_replanning_exhausted",
+                    "reason": (
+                        "bounded_evaluation_retries_exhausted"
+                        if retry_evaluation
+                        else "bounded_replanning_exhausted"
+                    ),
                     "attempts": attempts,
                     "gaps": dod_gaps,
                 },
                 correlation_id=evaluation_run_id,
             )
             return {"action_required": "BLOCK", "attempts": attempts, "gaps": dod_gaps}
+        if retry_evaluation:
+            return {
+                "action_required": "RETRY_EVALUATION",
+                "attempt": attempts,
+                "retry_at_backoff": True,
+                "gaps": dod_gaps,
+            }
         await self.emit(
             project_id,
             EventType.REPLANNING_TRIGGERED,

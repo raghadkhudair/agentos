@@ -9,6 +9,7 @@ from uuid import UUID
 
 import ray
 import structlog
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentos.actors.review_cache import CriterionReviewCache
 from agentos.config.loader import runtime_tuning
@@ -19,6 +20,16 @@ from agentos.storage.clients.postgres import PostgresClient
 from agentos.storage.repositories import DoDRepository
 
 logger = structlog.get_logger()
+_REVIEW_PROMPT_VERSION = "criterion-code-review-v1"
+_MAX_REVIEW_CONTEXT_CHARACTERS = 100_000
+
+
+class _CodeReviewVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    approved: bool
+    score: int = Field(ge=0, le=100)
+    findings: list[str] = Field(default_factory=list, max_length=100)
 
 
 def _json_object(content: str) -> dict[str, Any]:
@@ -68,15 +79,46 @@ class ReviewerAgentActor:
             if re.search(pattern, code_content):
                 deterministic_findings.append(finding)
 
-        task = await self.db.fetchrow("SELECT * FROM tasks WHERE id=$1", UUID(task_id))
-        artifact = await self.db.fetchrow("SELECT * FROM artifacts WHERE id=$1", UUID(artifact_id))
+        project_uuid = UUID(project_id)
+        task = await self.db.fetchrow(
+            "SELECT * FROM tasks WHERE id=$1 AND project_id=$2", UUID(task_id), project_uuid
+        )
+        artifact = await self.db.fetchrow(
+            "SELECT * FROM artifacts WHERE id=$1 AND project_id=$2",
+            UUID(artifact_id),
+            project_uuid,
+        )
         if task is None or artifact is None or artifact["task_id"] != task["id"]:
             raise ValueError("review requires a task-bound durable artifact")
+        if str(artifact["title"]).replace("\\", "/") != file_path.replace("\\", "/"):
+            raise ValueError("review file path does not identify the durable artifact")
+        artifact_metadata = artifact["metadata"] or {}
+        subject_commit = artifact_metadata.get("git_commit")
+        if not isinstance(subject_commit, str) or not subject_commit:
+            raise ValueError("review artifact lacks its authoritative Git subject revision")
+        review_digest = artifact_metadata.get("review_diff_sha256")
+        review_characters = artifact_metadata.get("review_diff_characters")
+        if (
+            not isinstance(review_digest, str)
+            or len(review_digest) != 64
+            or not isinstance(review_characters, int)
+            or review_characters < 0
+        ):
+            raise ValueError("review artifact lacks its exact diff provenance")
+        context_too_large = review_characters > _MAX_REVIEW_CONTEXT_CHARACTERS
+        content_digest = hashlib.sha256(code_content.encode("utf-8")).hexdigest()
+        if not context_too_large and (
+            len(code_content) != review_characters or content_digest != review_digest
+        ):
+            raise ValueError("review content does not match the artifact's exact committed diff")
+        requested_criteria = set(dict.fromkeys(criterion_ids))
         checks = {
             str(item["criterion_id"]): item
             for item in await self.dod.get_checks(project_id, criterion_ids)
             if "review" in (item["required_evidence_types"] or [])
         }
+        if set(checks) != requested_criteria:
+            raise ValueError("every requested criterion must authorize independent review evidence")
 
         async def review_one(criterion_id: str, criterion: dict[str, Any]) -> dict[str, Any]:
             request = ProviderRequest(
@@ -96,8 +138,12 @@ class ReviewerAgentActor:
                         "content": (
                             f"Criterion ID: {criterion_id}\nCriterion: {criterion['description']}\n"
                             f"Task acceptance: {json.dumps(task['acceptance_criteria'])}\n"
+                            f"Criterion affected contracts: "
+                            f"{json.dumps(criterion.get('affected_contracts') or [])}\n"
+                            f"Task affected contracts: "
+                            f"{json.dumps(task['affected_contracts'] or [])}\n"
                             f"Artifact: {file_path} ({artifact['checksum_sha256']})\n"
-                            f"Diff:\n{code_content[:100_000]}"
+                            f"Diff:\n{code_content}"
                         ),
                     },
                 ],
@@ -107,7 +153,6 @@ class ReviewerAgentActor:
                 complexity=TaskComplexity.HIGH,
                 required_capabilities={"chat", "json"},
             )
-            subject_commit = (artifact["metadata"] or {}).get("git_commit")
             cache_key = hashlib.sha256(
                 json.dumps(
                     {
@@ -115,7 +160,7 @@ class ReviewerAgentActor:
                         "criterion_hash": criterion["criterion_hash"],
                         "subject_commit": subject_commit,
                         "artifact_checksum": artifact["checksum_sha256"],
-                        "content_hash": hashlib.sha256(code_content.encode()).hexdigest(),
+                        "content_hash": content_digest,
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -126,31 +171,38 @@ class ReviewerAgentActor:
                 response = await self.provider.get_completion.remote(
                     request.model_dump(mode="json"), response_format={"type": "json_object"}
                 )
-                result = _json_object(response["content"])
-                raw_findings = result.get("findings", [])
+                result = _CodeReviewVerdict.model_validate(_json_object(response["content"]))
                 return {
-                    "approved": bool(result.get("approved")),
-                    "score": result.get("score", 0),
-                    "findings": (
-                        [str(item) for item in raw_findings]
-                        if isinstance(raw_findings, list)
-                        else []
-                    ),
+                    "approved": result.approved,
+                    "score": result.score,
+                    "findings": result.findings,
                     "run_status": "OK",
+                    "provider": str(response.get("provider") or "unknown"),
+                    "model": str(response.get("model") or "unknown"),
                 }
 
-            try:
-                decision, cache_hit = await self.review_cache.get_or_run(cache_key, invoke_provider)
-                findings = [*deterministic_findings, *decision["findings"]]
-                approved = bool(decision["approved"]) and not deterministic_findings
-                raw_score = decision["score"]
-                score = int(raw_score) if isinstance(raw_score, (str, int, float)) else 0
-            except Exception as error:
+            if context_too_large:
+                decision = {"run_status": "INCONCLUSIVE"}
+                cache_hit = False
                 approved = False
                 score = 0
-                cache_hit = False
-                decision = {"run_status": "INCONCLUSIVE"}
-                findings = [f"independent review unavailable: {type(error).__name__}"]
+                findings = [
+                    "exact artifact diff exceeds the bounded independent-review context limit"
+                ]
+            else:
+                try:
+                    decision, cache_hit = await self.review_cache.get_or_run(
+                        cache_key, invoke_provider
+                    )
+                    findings = [*deterministic_findings, *decision["findings"]]
+                    approved = bool(decision["approved"]) and not deterministic_findings
+                    score = int(decision["score"])
+                except Exception as error:
+                    approved = False
+                    score = 0
+                    cache_hit = False
+                    decision = {"run_status": "INCONCLUSIVE"}
+                    findings = [f"independent review unavailable: {type(error).__name__}"]
             run_status = str(decision["run_status"])
             summary = (
                 f"Criterion {criterion_id} independently reviewed for artifact "
@@ -177,6 +229,9 @@ class ReviewerAgentActor:
                     "score": score,
                     "cache_hit": cache_hit,
                     "review_cache_key": cache_key,
+                    "prompt_version": _REVIEW_PROMPT_VERSION,
+                    "provider": decision.get("provider"),
+                    "model": decision.get("model"),
                 },
             )
             return {

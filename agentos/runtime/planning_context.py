@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from git import InvalidGitRepositoryError, NoSuchPathError, Repo
@@ -10,6 +10,7 @@ from git import InvalidGitRepositoryError, NoSuchPathError, Repo
 _MAX_TREE_ENTRIES = 2_000
 _MAX_DOCUMENT_BYTES = 131_072
 _MAX_SINGLE_DOCUMENT_BYTES = 32_768
+_MAX_USER_REQUEST_BYTES = 100_000
 _DOCUMENT_NAMES = {
     "readme.md",
     "goal.md",
@@ -50,6 +51,12 @@ def build_planning_context(source_repository: Path | None, user_request: str) ->
     represented by path, while bounded delivery docs and manifests include their text.
     """
 
+    if not user_request.strip():
+        raise PlanningContextError("planning requires a nonempty user request")
+    if len(user_request.encode("utf-8")) > _MAX_USER_REQUEST_BYTES:
+        raise PlanningContextError(
+            f"user request exceeds the {_MAX_USER_REQUEST_BYTES}-byte planning limit"
+        )
     if source_repository is None:
         tree: list[str] = []
         documents: dict[str, str] = {}
@@ -84,9 +91,17 @@ def build_planning_context(source_repository: Path | None, user_request: str) ->
         documents = {}
         used_bytes = 0
         for relative in tree:
+            relative_path = PurePosixPath(relative)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise PlanningContextError("Git returned an unsafe tracked path")
             if not _relevant_document(relative):
                 continue
             path = root / Path(relative)
+            # A tracked documentation symlink could otherwise disclose a file outside the
+            # repository to the planning provider. Keep the path in the manifest, but never
+            # follow it when assembling document text.
+            if path.is_symlink():
+                continue
             try:
                 raw = path.read_bytes()
                 if len(raw) > _MAX_SINGLE_DOCUMENT_BYTES or b"\x00" in raw:

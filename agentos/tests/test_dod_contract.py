@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,8 @@ from pydantic import ValidationError
 
 from agentos.actors.bootstrap import BootstrapAgentActor
 from agentos.actors.review_cache import CriterionReviewCache
-from agentos.actors.reviewer import ReviewerAgentActor
+from agentos.actors.reviewer import ReviewerAgentActor, _CodeReviewVerdict
+from agentos.actors.safety_reviewer import _SecurityReviewVerdict
 from agentos.config.loader import load_prompt, runtime_tuning
 from agentos.config.settings import Settings
 from agentos.dod.evaluator import _classify_item_status, _revision_freshness_reason
@@ -27,7 +29,10 @@ from agentos.runtime.team_plan import (
     EvidenceType,
     InitialTask,
     TeamPlan,
+    _pattern_within_boundary,
+    _patterns_overlap,
 )
+from agentos.storage.clients.dragonfly import DragonflyClient
 from agentos.storage.repositories import TaskRepository
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -142,6 +147,48 @@ def test_team_plan_rejects_uncovered_criteria_and_artifacts() -> None:
         )
 
 
+def test_path_contract_matching_does_not_treat_empty_glob_prefix_as_unbounded() -> None:
+    assert _pattern_within_boundary("src/result.py", "src") is True
+    assert _pattern_within_boundary("src/*.py", "src") is True
+    assert _pattern_within_boundary("src*/escaped.py", "src") is False
+    assert _pattern_within_boundary("docs/readme.md", "*.py") is False
+    assert _patterns_overlap("src/*.py", "src/result.py") is True
+    assert _patterns_overlap("*.py", "docs/readme.md") is False
+    assert _patterns_overlap("src/*.py", "src/*.md") is False
+    with pytest.raises(ValidationError, match="outside"):
+        task(allowed_paths=["*.py"], expected_outputs=["docs/readme.md"])
+    patterned_contract = criterion(affected_contracts=["public-api/*"])
+    assert plan(
+        dod=[patterned_contract.model_dump(mode="json")],
+        initial_backlog=[task(affected_contracts=["public-api/users"]).model_dump(mode="json")],
+    )
+    with pytest.raises(ValidationError, match="affected contracts"):
+        plan(
+            dod=[patterned_contract.model_dump(mode="json")],
+            initial_backlog=[task(affected_contracts=["internal-jobs"]).model_dump(mode="json")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_lost_distributed_lock_cancels_the_protected_operation() -> None:
+    class RedisWithLostRenewal:
+        async def set(self, *_args: object, **_kwargs: object) -> bool:
+            return True
+
+        async def eval(self, _script: str, _keys: int, *_args: object) -> int:
+            # Renewal includes the TTL argument; release does not.
+            return 0 if len(_args) == 3 else 1
+
+    client = object.__new__(DragonflyClient)
+    client.settings = Settings(AGENTOS_ENV="development")
+    client.redis = RedisWithLostRenewal()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="distributed lock renewal failed"):
+        async with client.lock("test-lost-lease", ttl_seconds=1) as acquired:
+            assert acquired is True
+            await asyncio.sleep(2)
+
+
 def test_task_security_gate_is_union_of_risk_and_criterion() -> None:
     secure = criterion(
         severity="critical",
@@ -188,6 +235,32 @@ def test_planning_context_is_revision_bound_and_rejects_dirty_sources(tmp_path: 
     (tmp_path / "src.py").write_text("value = 2\n", encoding="utf-8")
     with pytest.raises(PlanningContextError, match="uncommitted changes"):
         build_planning_context(tmp_path, "Change the value")
+
+
+def test_planning_context_never_follows_tracked_document_symlinks(tmp_path: Path) -> None:
+    repository = Repo.init(tmp_path, initial_branch="main")
+    with repository.config_writer() as writer:
+        writer.set_value("user", "name", "AgentOS Test")
+        writer.set_value("user", "email", "agentos@example.invalid")
+    outside = tmp_path.parent / f"outside-{uuid4().hex}.md"
+    outside.write_text("provider-secret", encoding="utf-8")
+    link = tmp_path / "README.md"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this host")
+    repository.index.add(["README.md"])
+    repository.index.commit("tracked symlink")
+
+    context = build_planning_context(tmp_path, "Inspect the repository safely.")
+    assert context["tracked_tree"] == ["README.md"]
+    assert context["documents"] == {}
+    outside.unlink()
+
+
+def test_planning_context_rejects_oversized_requests_before_provider_egress() -> None:
+    with pytest.raises(PlanningContextError, match="planning limit"):
+        build_planning_context(None, "x" * 100_001)
 
 
 def test_prompts_are_packaged_versioned_and_have_no_root_shadow() -> None:
@@ -247,6 +320,8 @@ def test_schema_declares_versioned_append_only_fenced_dod() -> None:
         "CREATE TABLE IF NOT EXISTS dod_evaluation_items",
         "CREATE TABLE IF NOT EXISTS integration_attempts",
         "CREATE TRIGGER dod_evidence_append_only",
+        "CREATE TRIGGER artifacts_append_only",
+        "criterion-global command evidence requires the integration supervisor",
         "VALUES (4, 'Versioned DoD contracts",
     ):
         assert contract in schema
@@ -308,6 +383,25 @@ def test_golden_dod_status_and_revision_freshness_dataset(tmp_path: Path) -> Non
             ),
         )
         assert (result[0] if result else None) == case["expected"], case["name"]
+    patterned_contract_result = _revision_freshness_reason(
+        repository,
+        {
+            "subject_commit": base,
+            "watched_paths": [],
+            "affected_contracts": ["public-api/*"],
+            "task_id": "task-a",
+        },
+        docs_head,
+        [
+            {
+                "evidence_type": "integration",
+                "task_id": "task-b",
+                "affected_contracts": ["public-api/users"],
+                "integration_commit": docs_head,
+            }
+        ],
+    )
+    assert patterned_contract_result and patterned_contract_result[0] == "EVIDENCE_STALE_CONTRACT"
 
 
 @pytest.mark.asyncio
@@ -342,10 +436,39 @@ async def test_revision_review_cache_coalesces_only_successful_exact_snapshots()
 
 
 @pytest.mark.asyncio
+async def test_review_cache_waiter_cancellation_does_not_cancel_shared_review() -> None:
+    cache = CriterionReviewCache(max_concurrency=1, max_entries=2)
+    release = asyncio.Event()
+
+    async def operation() -> dict[str, object]:
+        await release.wait()
+        return {"run_status": "OK", "approved": True}
+
+    owner = asyncio.create_task(cache.get_or_run("shared", operation))
+    await asyncio.sleep(0)
+    waiter = asyncio.create_task(cache.get_or_run("shared", operation))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    result, _ = await owner
+    assert result["approved"] is True
+
+
+def test_reviewer_verdicts_reject_truthy_string_booleans() -> None:
+    with pytest.raises(ValidationError):
+        _CodeReviewVerdict.model_validate({"approved": "false", "score": 95, "findings": []})
+    with pytest.raises(ValidationError):
+        _SecurityReviewVerdict.model_validate({"safe": "false", "findings": []})
+
+
+@pytest.mark.asyncio
 async def test_reviewer_isolates_criterion_context_and_persists_distinct_verdicts() -> None:
     project_id = str(uuid4())
     task_id = str(uuid4())
     artifact_id = str(uuid4())
+    patch_content = "VALUE = 1\n"
 
     class FakeDB:
         async def fetchrow(self, query: str, *_: object) -> dict[str, Any]:
@@ -359,8 +482,13 @@ async def test_reviewer_isolates_criterion_context_and_persists_distinct_verdict
             return {
                 "id": artifact_id,
                 "task_id": task_id,
+                "title": "src/result.py",
                 "checksum_sha256": "a" * 64,
-                "metadata": {"git_commit": "b" * 40},
+                "metadata": {
+                    "git_commit": "b" * 40,
+                    "review_diff_sha256": hashlib.sha256(patch_content.encode()).hexdigest(),
+                    "review_diff_characters": len(patch_content),
+                },
             }
 
     class FakeDoD:
@@ -419,7 +547,7 @@ async def test_reviewer_isolates_criterion_context_and_persists_distinct_verdict
         criterion_ids=["first", "second"],
         artifact_id=artifact_id,
         file_path="src/result.py",
-        code_content="VALUE = 1\n",
+        code_content=patch_content,
     )
 
     assert result["approved"] is False
@@ -428,4 +556,5 @@ async def test_reviewer_isolates_criterion_context_and_persists_distinct_verdict
     supplied_contexts = [item["messages"][1]["content"] for item in completion.requests]
     assert any("The first behavior is correct." in context for context in supplied_contexts)
     assert any("The second behavior is correct." in context for context in supplied_contexts)
+    assert all("Task affected contracts" in context for context in supplied_contexts)
     assert [item["passed"] for item in reviewer.dod.evidence] == [True, False]

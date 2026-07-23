@@ -661,6 +661,14 @@ class RuntimeSupervisorActor:
                     runnable = await TaskRepository(self.db).get_runnable_tasks(project_id)
                     if runnable:
                         await self.projects.update_status(project_id, "RUNNING")
+                if project and project["status"] == "VERIFYING":
+                    backing_off = await self.db.fetchval(
+                        "SELECT next_replan_at IS NOT NULL AND next_replan_at>now() "
+                        "FROM projects WHERE id=$1",
+                        UUID(project_id),
+                    )
+                    if backing_off:
+                        continue
                 evaluation = await services["dod"].evaluate.remote(project_id)
                 await self.db.execute(
                     "UPDATE projects SET evaluation_failure_count=0 WHERE id=$1",

@@ -51,7 +51,7 @@ Review/test requirements, destructive-action policy, provider budgets/concurrenc
 - a PostgreSQL connection envelope that exceeds `POSTGRES_CONNECTION_BUDGET`;
 - a missing/non-Git `AGENTOS_SOURCE_REPOSITORY` when configured.
 
-`safe_snapshot()` redacts Pydantic secret fields before runtime configuration is stored.
+`safe_snapshot()` redacts Pydantic secret fields before runtime configuration is stored. The planning boundary separately rejects an empty request, requests above 100,000 UTF-8 bytes, unsafe tracked paths, and source snapshots that cannot be cleanly revision-bound. Tracked symlinks are listed but never followed into provider context.
 
 ## YAML responsibilities
 
@@ -76,7 +76,7 @@ Creates the local workspace, initializes PostgreSQL schema, MongoDB indexes, Min
 agentos plan "REQUEST"
 ```
 
-Captures the clean bounded source context, performs bounded fail-closed plan validation, and persists the versioned DoD, backlog/dependencies, resource plan, planning/runtime snapshot, and planned agents in one transaction. It does not launch delivery workers. An invalid provider response leaves a visible planning blocker and no partial contract.
+Captures the clean bounded source context without following tracked symlinks, performs bounded fail-closed plan validation, and persists the versioned DoD, backlog/dependencies, resource plan, planning/runtime snapshot, and planned agents in one transaction. It does not launch delivery workers. An invalid provider response or unsafe/oversized source context leaves a visible planning blocker and no partial contract.
 
 ### Run
 
@@ -115,7 +115,7 @@ agentos pause UUID
 agentos resume UUID
 ```
 
-`status UUID` includes active criteria/provenance/locks/scopes, mapped tasks, current contract/HEAD/retry generation, latest evaluation and typed gaps, latest evidence revisions, and amendment/waiver decisions. `inspect` retains the complete raw history. `re-evaluate` runs only the canonical snapshot-fenced evaluator. Resume rechecks dependencies/providers, reclaims expired leases, and immediately reconciles the latest durable evaluation generation before periodic recovery.
+`status UUID` includes active criteria/provenance/locks/scopes, mapped tasks, current contract/HEAD/retry generation, latest evaluation and typed gaps, latest evidence revisions plus command/sandbox/checksum provenance, and amendment/waiver decisions. `inspect` retains the complete raw history. `re-evaluate` runs only the canonical snapshot-fenced evaluator; an inconclusive snapshot is rechecked rather than treated as reusable terminal truth. Resume rechecks dependencies/providers, reclaims expired leases, and immediately reconciles the latest durable evaluation generation before periodic recovery.
 
 ### Human gates
 

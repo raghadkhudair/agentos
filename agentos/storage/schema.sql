@@ -185,6 +185,22 @@ CREATE TABLE IF NOT EXISTS artifacts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname='artifacts_version_binding_check'
+          AND conrelid='artifacts'::regclass
+    ) THEN
+        -- NOT VALID preserves readable legacy rows, while PostgreSQL enforces the exact-version
+        -- contract for every new artifact written after this migration.
+        ALTER TABLE artifacts ADD CONSTRAINT artifacts_version_binding_check CHECK (
+          object_version_id IS NOT NULL AND object_version_id <> ''
+          AND object_uri LIKE '%versionId=%'
+        ) NOT VALID;
+    END IF;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS checkpoints (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -410,6 +426,36 @@ ALTER TABLE dod_checks ADD CONSTRAINT dod_checks_status_check CHECK (status IN (
 )) NOT VALID;
 ALTER TABLE dod_checks VALIDATE CONSTRAINT dod_checks_status_check;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname='dod_checks_source_check'
+          AND conrelid='dod_checks'::regclass
+    ) THEN
+        ALTER TABLE dod_checks ADD CONSTRAINT dod_checks_source_check
+          CHECK (source IN ('user','system','inferred')) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname='dod_checks_severity_check'
+          AND conrelid='dod_checks'::regclass
+    ) THEN
+        ALTER TABLE dod_checks ADD CONSTRAINT dod_checks_severity_check
+          CHECK (severity IN ('advisory','required','critical')) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname='dod_checks_revision_check'
+          AND conrelid='dod_checks'::regclass
+    ) THEN
+        ALTER TABLE dod_checks ADD CONSTRAINT dod_checks_revision_check
+          CHECK (contract_version >= 1 AND length(criterion_hash) = 64) NOT VALID;
+    END IF;
+END;
+$$;
+
+ALTER TABLE dod_checks VALIDATE CONSTRAINT dod_checks_source_check;
+ALTER TABLE dod_checks VALIDATE CONSTRAINT dod_checks_severity_check;
+ALTER TABLE dod_checks VALIDATE CONSTRAINT dod_checks_revision_check;
+
 CREATE TABLE IF NOT EXISTS dod_evidence (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -542,6 +588,17 @@ BEGIN
        AND NEW.checksum_sha256 IS DISTINCT FROM artifact_record.checksum_sha256 THEN
         RAISE EXCEPTION 'artifact evidence checksum must match the durable artifact';
     END IF;
+    IF NEW.evidence_type IN ('artifact','review','security_review')
+       AND NEW.subject_commit IS DISTINCT FROM artifact_record.metadata->>'git_commit' THEN
+        RAISE EXCEPTION 'artifact evidence must target the artifact Git revision';
+    END IF;
+    IF NEW.evidence_type IN ('review','security_review') AND (
+       artifact_record.metadata->>'review_diff_sha256' IS NULL
+       OR length(artifact_record.metadata->>'review_diff_sha256') <> 64
+       OR artifact_record.metadata->>'review_diff_characters' IS NULL
+    ) THEN
+        RAISE EXCEPTION 'review evidence requires committed diff provenance';
+    END IF;
 
     IF NEW.evidence_type = 'review' THEN
         IF authenticated_role <> 'code_reviewer' OR NEW.source_agent_id = task_record.owner_agent_id THEN
@@ -557,9 +614,22 @@ BEGIN
            OR NEW.passed IS DISTINCT FROM (NEW.exit_code = 0 AND NEW.run_status = 'OK') THEN
             RAISE EXCEPTION 'test and command evidence must match its execution result';
         END IF;
+        IF NEW.task_id IS NULL AND NEW.source_agent_id <> 'integration_supervisor' THEN
+            RAISE EXCEPTION 'criterion-global command evidence requires the integration supervisor';
+        END IF;
+        IF NEW.command_digest IS NULL
+           OR NEW.command_digest <> encode(digest(NEW.command, 'sha256'), 'hex') THEN
+            RAISE EXCEPTION 'command evidence digest must match its canonical token array';
+        END IF;
+        IF NEW.run_status = 'OK' AND (
+           NEW.sandbox_digest IS NULL OR length(NEW.sandbox_digest) <> 64
+        ) THEN
+            RAISE EXCEPTION 'executed command evidence requires a sandbox digest';
+        END IF;
     ELSIF NEW.evidence_type = 'integration' THEN
-        IF NEW.source_agent_id <> 'integration_supervisor' OR NEW.integration_commit IS NULL THEN
-            RAISE EXCEPTION 'integration evidence requires the integration supervisor and commit';
+        IF NEW.source_agent_id <> 'integration_supervisor' OR NEW.subject_commit IS NULL
+           OR NEW.integration_commit IS NULL THEN
+            RAISE EXCEPTION 'integration evidence requires the integration supervisor and revisions';
         END IF;
     END IF;
     IF NEW.run_status = 'INCONCLUSIVE' AND NEW.passed THEN
@@ -813,6 +883,10 @@ FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
 
 DROP TRIGGER IF EXISTS dod_evidence_append_only ON dod_evidence;
 CREATE TRIGGER dod_evidence_append_only BEFORE UPDATE OR DELETE ON dod_evidence
+FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
+
+DROP TRIGGER IF EXISTS artifacts_append_only ON artifacts;
+CREATE TRIGGER artifacts_append_only BEFORE UPDATE OR DELETE ON artifacts
 FOR EACH ROW EXECUTE FUNCTION agentos_reject_mutation();
 
 DROP TRIGGER IF EXISTS dod_contract_versions_append_only ON dod_contract_versions;

@@ -784,7 +784,7 @@ class AgentWorkerActor:
                 exit_code=int(test_result.get("exit_code", -1)),
                 task_id=task_id,
                 source_role=self.role,
-                subject_commit=result["git_commit"],
+                subject_commit=str(test_result.get("git_commit") or result["git_commit"]),
                 sandbox_digest=test_result.get("sandbox_digest"),
                 watched_paths=list(task.get("allowed_paths") or []),
                 affected_contracts=list(task.get("affected_contracts") or []),

@@ -8,7 +8,7 @@ The system is an autonomous software-delivery runtime, not a chatbot and not a c
 
 ## Required product behavior
 
-1. A bootstrap PM/Tech Lead captures a clean bounded Git/source-document snapshot, then converts the request into one versioned measurable DoD contract, dependency-aware backlog, bounded file ownership, required outputs, and role plan. Bounded repair failures block planning; no generic substitute DoD is allowed.
+1. A bootstrap PM/Tech Lead captures a clean bounded Git/source-document snapshot, then converts the request into one versioned measurable DoD contract, dependency-aware backlog, bounded file ownership, required outputs, and role plan. Request/context size, tracked-path traversal, and symlink egress are bounded before provider access. Bounded repair failures block planning; no generic substitute DoD is allowed.
 2. The plan always contains PM, infrastructure, QA, code-review, and security-review responsibility. Role caps and total-agent caps are enforced before actor creation.
 3. An infrastructure agent detects available capacity, preserves host headroom, and distributes CPU, memory, concurrency, provider, and model allocations among agents.
 4. Every working agent is an independent Ray actor with its own actor state, database client, event-bus client, memory cursor, heartbeat, inbox, permissions, and task lease.
@@ -16,8 +16,8 @@ The system is an autonomous software-delivery runtime, not a chatbot and not a c
 6. Workers can use different providers/models. Selection responds to role, purpose, capability, and `low`, `standard`, `high`, or `critical` task complexity.
 7. All provider calls pass through one gateway with a durable pre-egress intent, redaction, egress policy, concurrency, budget, retry/fallback, circuit-breaker, and linked append-only audit enforcement.
 8. All writes and commands pass through governance and execution supervisors. An optional real local Git source is cloned into an isolated managed repository, source work occurs in task-specific Git worktrees, commands run in a bounded network-disabled Docker sandbox, and database actions use a physically separate sandbox database.
-9. Code cannot merge without required outputs, checksummed artifacts, isolated per-criterion independent review, passing branch checks, and canonical evidence. The merge lock is renewable, integration attempts are durable/replayable, and all eligible criterion commands pass on the prospective integrated tree before the merge commit is created.
-10. Completion is controlled by the evaluator, not by an agent statement. Each run is bound to the active contract version/hash, evidence cutoff/generation, and integrated HEAD; evidence is evaluated at criterion, task, or artifact cardinality and may be `MISSING`, `FAILED`, `INCONCLUSIVE`, `STALE`, or `SATISFIED`.
+9. Code cannot merge without required outputs, append-only exact-version checksummed artifacts, isolated per-criterion independent review bound to the committed diff, passing branch checks, and canonical command/sandbox-digest evidence. The merge lock is renewable and owner-checked, lease loss cancels the protected operation, integration attempts are durable/replayable, and all eligible criterion commands pass on the prospective integrated tree before the merge commit is created.
+10. Completion is controlled by the evaluator, not by an agent statement. Each run is bound to the active contract version/hash, evidence cutoff/generation, and integrated HEAD; evidence is evaluated at criterion, task, or artifact cardinality and may be `MISSING`, `FAILED`, `INCONCLUSIVE`, `STALE`, or `SATISFIED`. Transient uncertainty is retried within bounds and is never reused as a positive terminal snapshot.
 11. Empty runnable queues with incomplete DoD trigger typed, idempotent, bounded replanning. Stagnation, deadlocks, expired leases, unhealthy agents, unsafe behavior, and repeated evaluator/provider/storage failures trigger bounded recovery or a visible blocked state.
 12. The operator can initialize, plan, run, detach, inspect, re-evaluate, govern DoD amendments/waivers, pause, resume, approve, reject, and diagnose the system from the CLI.
 
@@ -81,7 +81,7 @@ If the requested independent team cannot safely fit, planning fails closed inste
 
 - Production credentials must be non-placeholder and injected externally.
 - Requests are sealed with an integrity hash and authenticated against a project-bound `AgentIdentity`.
-- Paths are both task-owned and traversal-safe. Git metadata, environment secrets, provider-key areas, audit stores, and Docker sockets are globally protected.
+- Paths are both task-owned and traversal-safe. Glob authorization must remain inside literal task boundaries, and planning never follows tracked symlinks into provider context. Git metadata, environment secrets, provider-key areas, audit stores, and Docker sockets are globally protected.
 - Shell input is a token array; no shell-string execution is accepted.
 - Executables and sandbox images are allowlisted.
 - Sandboxes have no network, no Linux capabilities, no privilege escalation, bounded PIDs/CPU/memory, a read-only root filesystem, and a bounded temporary filesystem.
@@ -96,13 +96,13 @@ A project reaches `DOD_SATISFIED` only when one persisted evaluation snapshot pr
 
 Each criterion declares evidence scope (`criterion`, `task`, or `artifact`), and evidence carries its criterion hash/version, authenticated producer role, task/artifact references, subject/integration commits, command and sandbox digests, watched paths/contracts, and generation. Evidence may include:
 
-- a MinIO artifact whose object exists and whose SHA-256 matches PostgreSQL metadata;
-- a canonical sandbox command with a zero exit code on the current integrated HEAD;
-- an independent per-criterion code/security review bound to the exact artifact, checksum, acceptance criteria, and subject commit;
+- a MinIO artifact whose exact URI version, version column, object body, length, and SHA-256 all match immutable PostgreSQL metadata;
+- a canonical token-array sandbox command whose command digest, sandbox digest, zero exit code, and current integrated HEAD all match;
+- an independent per-criterion code/security review bound to the exact artifact, checksum, acceptance criteria, subject commit, and checksum of the exact committed diff;
 - a required path/output produced by the owning task;
 - task completion after successful Git integration.
 
-When retries occur, the latest evidence at the declared scope supersedes earlier attempts. Path/glob and affected-contract overlap conservatively invalidates older artifact/review evidence after later merges; unscoped older evidence is invalidated rather than guessed fresh. Operational uncertainty is persisted as `INCONCLUSIVE`, never silently converted to pass or deterministic failure. An approved waiver is criterion/hash/reason-bound and does not weaken any other criterion.
+When retries occur, the latest evidence at the declared scope supersedes earlier attempts. Path/glob and affected-contract overlap conservatively invalidates older artifact/review evidence after later merges; unscoped older evidence is invalidated rather than guessed fresh. Operational uncertainty is persisted as `INCONCLUSIVE`, retried with bounded backoff when retryable, and never silently converted to pass or deterministic failure. An approved waiver is criterion/hash/reason-bound and does not weaken any other criterion.
 
 ## Production delivery stance
 

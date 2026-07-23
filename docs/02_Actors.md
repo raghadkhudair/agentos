@@ -8,7 +8,7 @@
 
 ### Bootstrap PM
 
-`BootstrapAgentActor` receives the immutable source revision/tree/docs/context hash, requests the one structured versioned production contract through the provider gateway, hydrates permissions/scopes from the role catalog, and validates the result through `TeamPlan`. Invalid JSON or contract output receives only a bounded full-object repair attempt. Exhaustion raises, persists a planning blocker, stops the project runtime, and launches no workers; there is no fallback roster or generic DoD.
+`BootstrapAgentActor` receives the immutable source revision/tree/docs/context hash, requests the one structured versioned production contract through the provider gateway, hydrates permissions/scopes from the role catalog, and validates the result through `TeamPlan`. Before egress, planning rejects empty or greater-than-100,000-byte requests, unsafe tracked paths, dirty/unbound revisions, and document symlink traversal. Invalid JSON or contract output receives only a bounded full-object repair attempt. Exhaustion raises, persists a planning blocker, stops the project runtime, and launches no workers; there is no fallback roster or generic DoD.
 
 ### Infrastructure agent
 
@@ -20,7 +20,7 @@
 
 ### Independent reviewers
 
-`ReviewerAgentActor` and `SafetyReviewerAgentActor` load each current criterion description/hash, the task acceptance contract, exact task-bound artifact/checksum, diff, and affected contracts. They make one isolated structured decision per required criterion and append separate revision-bound evidence. Calls are concurrency-bounded; only an exact successful criterion-hash/commit/artifact/content snapshot can be reused, while inconclusive results are retried. The author cannot self-review, and PostgreSQL authenticates the declared reviewer role.
+`ReviewerAgentActor` and `SafetyReviewerAgentActor` load each current criterion description/hash, the task acceptance contract, exact task-bound artifact/checksum, committed diff, and affected contracts. Artifact metadata binds review to that diff's SHA-256 and character length; mismatched supplied content is rejected, while a diff above 100,000 characters is `INCONCLUSIVE` and cannot call or pass review. Strict structured verdicts reject coercions such as string booleans. Calls are concurrency-bounded; only an exact successful criterion-hash/commit/artifact/content snapshot can be reused, inconclusive results are retried, and cancellation of one coalesced waiter cannot cancel shared provider work. The author cannot self-review, and PostgreSQL authenticates the declared reviewer role.
 
 ### Governed system actors
 
@@ -36,7 +36,7 @@ Every worker receives an `AgentIdentity` containing project, agent, role, allowe
 
 ## Task ownership
 
-Initial/replanned tasks name `owner_role`. Claims use one PostgreSQL transaction with dependency checks, role filtering, priority ordering, `FOR UPDATE SKIP LOCKED`, owner assignment, and a lease. This provides independence without duplicate execution.
+Initial/replanned tasks name `owner_role`. Creation reconstructs the complete `InitialTask` contract, validates its role/identity, paths/globs, outputs, criteria/contracts, reviewers/security requirements, and exact dependency-title set, and rejects a new replan batch after its evaluation generation becomes stale. Claims use one PostgreSQL transaction with dependency checks, role filtering, priority ordering, `FOR UPDATE SKIP LOCKED`, owner assignment, and a lease. This provides independence without duplicate execution.
 
 Each task also defines:
 

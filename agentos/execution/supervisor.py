@@ -341,6 +341,19 @@ class ExecutionService:
             f"Task {action.task_id}: {action.description}",
             [normalized_relative := relative.replace("\\", "/")],
         )
+        review_code, review_content, review_error = await self._run_host(
+            "git",
+            "show",
+            "--format=",
+            "--no-ext-diff",
+            commit,
+            "--",
+            normalized_relative,
+            cwd=worktree,
+        )
+        if review_code:
+            raise RuntimeError(f"committed artifact diff is unavailable: {review_error[:500]}")
+        review_digest = hashlib.sha256(review_content.encode("utf-8")).hexdigest()
         data = content.encode("utf-8")
         object_name = f"{action.project_id}/tasks/{action.task_id}/{normalized_relative}"
         object_metadata = await self.minio.put_bytes(
@@ -361,26 +374,23 @@ class ExecutionService:
             content_type="text/plain; charset=utf-8",
             task_id=action.task_id,
             summary=action.description,
-            metadata={"git_commit": commit, "agent_id": action.agent_id},
+            metadata={
+                "git_commit": commit,
+                "agent_id": action.agent_id,
+                "review_diff_sha256": review_digest,
+                "review_diff_characters": len(review_content),
+            },
         )
         await self.tasks.update_task_status(action.task_id, "UNDER_REVIEW")
-        _, review_content, _ = await self._run_host(
-            "git",
-            "show",
-            "--format=",
-            "--no-ext-diff",
-            "HEAD",
-            "--",
-            normalized_relative,
-            cwd=worktree,
-        )
         return {
             "path": relative,
             "git_commit": commit,
             "artifact_id": artifact_id,
             "object_uri": object_metadata.uri,
             "checksum_sha256": object_metadata.sha256,
-            "review_content": review_content[:200_000],
+            # One extra character lets the review actor distinguish an exact bounded diff
+            # from a context that must be recorded as INCONCLUSIVE.
+            "review_content": review_content[:100_001],
         }
 
     async def _read_file(self, action: ActionRequest) -> dict[str, Any]:
@@ -709,7 +719,7 @@ class ExecutionService:
             return False, "task reviewer gates do not cover its criterion evidence contract"
         artifact_rows = await self.db.fetch(
             """
-            SELECT id,object_uri,checksum_sha256,content_length
+            SELECT id,object_uri,object_version_id,checksum_sha256,content_length,metadata
             FROM artifacts WHERE project_id=$1 AND task_id=$2 ORDER BY created_at
             """,
             UUID(project_id),
@@ -750,7 +760,10 @@ class ExecutionService:
             parsed = urlparse(artifact["object_uri"])
             if parsed.scheme != "minio":
                 return False, f"artifact {artifact_id} is not stored in MinIO"
-            version = parse_qs(parsed.query).get("versionId", [None])[0]
+            versions = parse_qs(parsed.query).get("versionId", [])
+            if len(versions) != 1 or versions[0] != artifact["object_version_id"]:
+                return False, f"artifact {artifact_id} is not bound to its exact object version"
+            version = versions[0]
             metadata = await self.minio.stat(
                 bucket=parsed.netloc,
                 object_name=parsed.path.lstrip("/"),
@@ -760,6 +773,7 @@ class ExecutionService:
                 not metadata.sha256
                 or metadata.sha256 != artifact["checksum_sha256"]
                 or metadata.size != artifact["content_length"]
+                or metadata.version_id != version
             ):
                 return False, f"artifact {artifact_id} integrity check failed"
             for criterion_id in criteria:
@@ -777,6 +791,7 @@ class ExecutionService:
                         or not row["passed"]
                         or row["run_status"] != "OK"
                         or row["criterion_hash"] != check["criterion_hash"]
+                        or row["subject_commit"] != (artifact["metadata"] or {}).get("git_commit")
                     ):
                         return (
                             False,
@@ -827,6 +842,11 @@ class ExecutionService:
                 executed = []
             if executed != list(check["verification_command"] or []):
                 return False, f"criterion {criterion_id} command differs from its contract"
+            canonical_command = json.dumps(executed, separators=(",", ":"))
+            if row["command_digest"] != hashlib.sha256(canonical_command.encode()).hexdigest():
+                return False, f"criterion {criterion_id} command digest is invalid"
+            if not row["sandbox_digest"]:
+                return False, f"criterion {criterion_id} sandbox digest is missing"
 
         expected_outputs = [
             str(item).replace("\\", "/") for item in task.get("expected_outputs") or []

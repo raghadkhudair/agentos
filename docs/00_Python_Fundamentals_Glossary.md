@@ -40,7 +40,7 @@ A DoD criterion is one versioned, hashed, provenance/lock/severity-labeled deliv
 
 ## Artifact and evidence
 
-An artifact is a produced file/object with a Git commit, MinIO version, size, and checksum. Append-only evidence links the exact criterion version/hash to an authenticated producer, task, artifact, subject/integration commit, command/sandbox digest, and watched paths/contracts. The latest matching attempt at the criterion's declared scope is considered only if it is fresh for the fenced HEAD.
+An artifact is a produced file/object with a full Git commit, one exact MinIO URI `versionId`, matching version column, size, and SHA-256. Artifact rows are append-only. Append-only evidence links the exact criterion version/hash to an authenticated producer, task, artifact, subject/integration commit, canonical command/sandbox digest, and watched paths/contracts. Review evidence also requires a checksum and length for the exact committed diff. The latest matching attempt at the criterion's declared scope is considered only if it is fresh for the fenced HEAD.
 
 ## Memory tiers
 
@@ -97,4 +97,4 @@ The sandbox executes an allowlisted token-array command in an allowlisted image 
 
 ## Fail closed
 
-Fail closed means missing credentials, unhealthy required stores, invalid plans, failed reviews/tests, unsafe paths, or unknown actions block progress. AgentOS does not replace these failures with an in-memory mock or a success claim.
+Fail closed means missing credentials, unhealthy required stores, invalid plans, failed or uncertain reviews/tests, unsafe paths/globs/symlinks, unverifiable revisions, or unknown actions block progress. AgentOS does not replace these failures with an in-memory mock or a success claim.

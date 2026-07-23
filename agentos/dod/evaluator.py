@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 from collections import defaultdict
 from typing import Any
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field
 from agentos.config.loader import runtime_tuning
 from agentos.config.settings import Settings
 from agentos.messaging.events import Event, EventType
-from agentos.runtime.team_plan import EvidenceScope, EvidenceType
+from agentos.runtime.team_plan import EvidenceScope, EvidenceType, _patterns_overlap
 from agentos.storage.clients.minio import MinioObjectClient
 from agentos.storage.clients.postgres import PostgresClient
 from agentos.storage.repositories import DoDRepository, EventRepository
@@ -87,14 +88,19 @@ def _revision_freshness_reason(
             f"later integrated changes overlap watched paths: {', '.join(touched[:20])}",
         )
 
-    affected_contracts = set(row.get("affected_contracts") or [])
+    affected_contracts = [str(item) for item in row.get("affected_contracts") or []]
     if affected_contracts:
         for candidate in evidence:
             if candidate.get("evidence_type") != EvidenceType.INTEGRATION.value:
                 continue
             if candidate.get("task_id") == row.get("task_id"):
                 continue
-            if not affected_contracts.intersection(candidate.get("affected_contracts") or []):
+            candidate_contracts = [str(item) for item in candidate.get("affected_contracts") or []]
+            if not any(
+                _patterns_overlap(expected, changed)
+                for expected in affected_contracts
+                for changed in candidate_contracts
+            ):
                 continue
             candidate_commit = candidate.get("integration_commit")
             if not candidate_commit:
@@ -137,7 +143,12 @@ def _classify_item_status(reason_codes: set[str]) -> str:
             "ARTIFACT_LENGTH_MISMATCH",
             "ARTIFACT_CHECKSUM_MISMATCH",
             "ARTIFACT_URI_INVALID",
+            "ARTIFACT_VERSION_MISMATCH",
+            "ARTIFACT_REVISION_MISMATCH",
             "COMMAND_CONTRACT_MISMATCH",
+            "COMMAND_DIGEST_MISMATCH",
+            "SANDBOX_DIGEST_MISSING",
+            "REVIEW_DIFF_PROVENANCE_MISSING",
             "WAIVER_INVALID",
         }
     ):
@@ -230,16 +241,16 @@ class DoDEvaluatorActor:
         self.minio = MinioObjectClient(self.settings)
         self.evaluator_instance_id = f"dod_evaluator:{uuid4()}"
 
-    def _is_ancestor(self, project_id: str, commit: str | None, head: str | None) -> bool:
+    def _is_ancestor(self, project_id: str, commit: str | None, head: str | None) -> bool | None:
         if not commit or not head:
-            return False
+            return None
         if commit == head:
             return True
         try:
             repository = Repo(self.settings.workspace / project_id / "repository")
             return bool(repository.is_ancestor(repository.commit(commit), repository.commit(head)))
         except Exception:
-            return False
+            return None
 
     def _revision_gap(
         self,
@@ -284,7 +295,16 @@ class DoDEvaluatorActor:
                 artifact_id=str(artifact["id"]),
             )
         try:
-            version = parse_qs(parsed.query).get("versionId", [None])[0]
+            versions = parse_qs(parsed.query).get("versionId", [])
+            if len(versions) != 1 or versions[0] != artifact.get("object_version_id"):
+                return _gap(
+                    "ARTIFACT_VERSION_MISMATCH",
+                    "artifact URI and durable record do not identify one exact object version",
+                    evidence_type=EvidenceType.ARTIFACT.value,
+                    scope=EvidenceScope.ARTIFACT.value,
+                    artifact_id=str(artifact["id"]),
+                )
+            version = versions[0]
             metadata = await self.minio.stat(
                 bucket=parsed.netloc,
                 object_name=parsed.path.lstrip("/"),
@@ -310,6 +330,14 @@ class DoDEvaluatorActor:
             return _gap(
                 "ARTIFACT_CHECKSUM_MISMATCH",
                 "artifact checksum does not match the durable record",
+                evidence_type=EvidenceType.ARTIFACT.value,
+                scope=EvidenceScope.ARTIFACT.value,
+                artifact_id=str(artifact["id"]),
+            )
+        if metadata.version_id != version:
+            return _gap(
+                "ARTIFACT_VERSION_MISMATCH",
+                "artifact store returned a different object version",
                 evidence_type=EvidenceType.ARTIFACT.value,
                 scope=EvidenceScope.ARTIFACT.value,
                 artifact_id=str(artifact["id"]),
@@ -448,6 +476,29 @@ class DoDEvaluatorActor:
                                 scope=scope.value,
                             )
                         )
+                    canonical_command = json.dumps(actual_command, separators=(",", ":"))
+                    expected_digest = hashlib.sha256(canonical_command.encode("utf-8")).hexdigest()
+                    if row.get("command_digest") != expected_digest:
+                        reasons.append(
+                            _gap(
+                                "COMMAND_DIGEST_MISMATCH",
+                                "recorded command digest does not match the executed token array",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                            )
+                        )
+                    sandbox_digest = str(row.get("sandbox_digest") or "")
+                    if len(sandbox_digest) != 64 or any(
+                        character not in "0123456789abcdef" for character in sandbox_digest.lower()
+                    ):
+                        reasons.append(
+                            _gap(
+                                "SANDBOX_DIGEST_MISSING",
+                                "verification lacks a valid governed sandbox configuration digest",
+                                evidence_type=evidence_type.value,
+                                scope=scope.value,
+                            )
+                        )
                     if row["subject_commit"] != run["integration_head"]:
                         reasons.append(
                             _gap(
@@ -493,18 +544,33 @@ class DoDEvaluatorActor:
                                 task_id=task_id,
                             )
                         )
-                    if evidence_type == EvidenceType.INTEGRATION and not self._is_ancestor(
-                        project_id, row["integration_commit"], run["integration_head"]
-                    ):
-                        reasons.append(
-                            _gap(
-                                "INTEGRATION_STALE_HEAD",
-                                "task integration commit is not an ancestor of current HEAD",
-                                evidence_type=evidence_type.value,
-                                scope=scope.value,
-                                task_id=task_id,
-                            )
+                    if evidence_type == EvidenceType.INTEGRATION:
+                        integration_ancestry = self._is_ancestor(
+                            project_id, row["integration_commit"], run["integration_head"]
                         )
+                        subject_ancestry = self._is_ancestor(
+                            project_id, row["subject_commit"], row["integration_commit"]
+                        )
+                        if integration_ancestry is None or subject_ancestry is None:
+                            reasons.append(
+                                _gap(
+                                    "INTEGRATION_ANCESTRY_INCONCLUSIVE",
+                                    "integration or task subject ancestry could not be verified",
+                                    evidence_type=evidence_type.value,
+                                    scope=scope.value,
+                                    task_id=task_id,
+                                )
+                            )
+                        elif not integration_ancestry or not subject_ancestry:
+                            reasons.append(
+                                _gap(
+                                    "INTEGRATION_STALE_HEAD",
+                                    "task subject and integration commits are not ancestors of current HEAD",
+                                    evidence_type=evidence_type.value,
+                                    scope=scope.value,
+                                    task_id=task_id,
+                                )
+                            )
             else:
                 for task in mapped_tasks:
                     task_id = str(task["id"])
@@ -583,6 +649,41 @@ class DoDEvaluatorActor:
                             )
                             if revision_gap:
                                 reasons.append(revision_gap)
+                            artifact_commit = (artifact.get("metadata") or {}).get("git_commit")
+                            if not artifact_commit or row.get("subject_commit") != artifact_commit:
+                                reasons.append(
+                                    _gap(
+                                        "ARTIFACT_REVISION_MISMATCH",
+                                        "artifact evidence does not target the artifact's Git revision",
+                                        evidence_type=evidence_type.value,
+                                        scope=scope.value,
+                                        task_id=task_id,
+                                        artifact_id=artifact_id,
+                                    )
+                                )
+                            if evidence_type in {
+                                EvidenceType.REVIEW,
+                                EvidenceType.SECURITY_REVIEW,
+                            }:
+                                artifact_metadata = artifact.get("metadata") or {}
+                                review_digest = artifact_metadata.get("review_diff_sha256")
+                                review_characters = artifact_metadata.get("review_diff_characters")
+                                if (
+                                    not isinstance(review_digest, str)
+                                    or len(review_digest) != 64
+                                    or not isinstance(review_characters, int)
+                                    or review_characters < 0
+                                ):
+                                    reasons.append(
+                                        _gap(
+                                            "REVIEW_DIFF_PROVENANCE_MISSING",
+                                            "review evidence lacks checksum-bound committed diff provenance",
+                                            evidence_type=evidence_type.value,
+                                            scope=scope.value,
+                                            task_id=task_id,
+                                            artifact_id=artifact_id,
+                                        )
+                                    )
                         if evidence_type == EvidenceType.ARTIFACT:
                             health_gap = await self._artifact_health(artifact)
                             if health_gap:
@@ -743,6 +844,8 @@ class DoDEvaluatorActor:
             status = "SATISFIED"
         elif any(item.status == "INCONCLUSIVE" for item in mandatory_items):
             status = "INCONCLUSIVE"
+        elif any(item.status == "STALE" for item in mandatory_items):
+            status = "STALE"
         else:
             status = "UNSATISFIED"
         persisted = await self.repo.persist_evaluation(

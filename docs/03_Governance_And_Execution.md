@@ -42,11 +42,11 @@ Known patterns include database/schema/table drops, truncation/deletes, recursiv
 
 ## Audit
 
-Every policy decision creates an `audit_events` record containing actor, action, risk, decision, request hash, previous audit hash, and current hash. Database triggers reject update/delete. Provider calls have separate append-only intent/result tables. DoD contract versions, evidence, and evaluation items are also append-only; an insertion trigger independently verifies criterion revision/type, authenticated producer role, task/artifact project binding, self-review exclusion, checksum/result consistency, and integration-supervisor authority.
+Every policy decision creates an `audit_events` record containing actor, action, risk, decision, request hash, previous audit hash, and current hash. Database triggers reject update/delete. Provider calls have separate append-only intent/result tables. Artifacts, DoD contract versions, evidence, and evaluation items are also append-only; insertion constraints independently verify exact object-version binding, criterion revision/type, authenticated producer role, task/artifact project and Git-revision binding, committed-diff provenance, self-review exclusion, canonical command/sandbox digests, result consistency, and integration-supervisor authority.
 
 ## File writes
 
-Execution validates the active task lease and path ownership, creates/reuses the task worktree, writes via a temporary file, flushes and `fsync`s, atomically replaces the target, commits Git, uploads the exact bytes to versioned MinIO, and records artifact metadata/checksum in PostgreSQL. A configured `AGENTOS_SOURCE_REPOSITORY` is validated as Git and cloned locally into the managed integration repository before task branches are created.
+Execution validates the active task lease and path ownership, creates/reuses the task worktree, writes via a temporary file, flushes and `fsync`s, atomically replaces the target, commits Git, uploads the exact bytes to versioned MinIO, verifies the exact committed diff, and records an append-only artifact whose URI `versionId`, version column, full Git revision, byte length, checksum, and diff digest agree. A configured `AGENTOS_SOURCE_REPOSITORY` is validated as Git and cloned locally into the managed integration repository before task branches are created.
 
 The task enters review state. Every produced artifact receives independent review (and security review when required) before missing aggregate expected outputs return it to `PENDING` for more work.
 
@@ -76,12 +76,12 @@ Database actions use a second PostgreSQL instance and a DSN that production vali
 For every mapped criterion, the execution path reads the active contract rather than assuming a fixed evidence trio:
 
 1. Record checksummed artifact evidence.
-2. Obtain an isolated independent code-review verdict for that criterion/artifact and any criterion- or risk-required security verdict. Provider uncertainty is appended as inconclusive evidence and fails the gate.
+2. Obtain an isolated independent code-review verdict for that criterion/artifact and any criterion- or risk-required security verdict. The verdict schema is strict and the reviewed content must match the checksum-bound committed diff; provider, parsing, size, or provenance uncertainty is appended as inconclusive evidence and fails the gate.
 3. Confirm all expected-output patterns match recorded artifacts.
 4. Select the configured criterion verification command (or an explicit allowed task command).
-5. Run it in the sandbox and record exit-code evidence.
-6. Require every configured artifact-, task-, and criterion-scoped pre-merge evidence row to match the active criterion hash, authenticated producer, task/artifact, checksum, and task-branch HEAD.
-7. Acquire the renewable project merge lock and persist a `PREPARED` integration attempt.
+5. Run it in the sandbox and record the canonical token-array command, SHA-256 command digest, sandbox-configuration digest, exit code, and subject revision.
+6. Require every configured artifact-, task-, and criterion-scoped pre-merge evidence row to match the active criterion hash, authenticated producer, task/artifact, checksum, task-branch HEAD, and applicable command/sandbox/diff digests. Criterion-global command evidence is accepted only from the integration supervisor.
+7. Acquire the owner-checked renewable project merge lock; loss/renewal failure cancels the protected operation. Then persist a `PREPARED` integration attempt.
 8. Create a no-commit prospective merge and run every newly eligible unique DoD command in the restricted sandbox against that exact tree. Any failure aborts the merge.
 9. Commit only the passing prospective tree, atomically persist its integration HEAD/attempt state, append integrated-HEAD command plus task integration evidence, and transition `UNDER_REVIEW -> COMPLETED`.
 10. Trigger the snapshot-fenced evaluator; periodic reconciliation recovers a failed event handoff.
